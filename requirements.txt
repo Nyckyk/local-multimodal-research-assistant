@@ -1,0 +1,9 @@
+chromadb
+ollama
+pymupdf
+pypdf
+sentence-transformers
+streamlit
+pytest
+PyYAML
+requests

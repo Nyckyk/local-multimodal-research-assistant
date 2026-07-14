@@ -1,0 +1,124 @@
+# PROTECTED SCIENTIFIC BASELINE
+# Codex must not change expected values merely to obtain passing tests.
+# Changing scientific expectations requires explicit user approval.
+# Production code must never import this fixture.
+cases:
+  - case_id: hallmarks_document_summary
+    pdf_filename: hall marks of aging.pdf
+    pdf_page: null
+    question: Summarise the main findings of this paper.
+    expected_response_type: rag_summary
+    required_facts:
+      - review
+      - nine hallmarks
+      - Genomic instability
+      - Telomere attrition
+      - Epigenetic alterations
+      - Loss of proteostasis
+      - Deregulated nutrient-sensing
+      - Mitochondrial dysfunction
+      - Cellular senescence
+      - Stem cell exhaustion
+      - Altered intercellular communication
+    prohibited_facts:
+      - inflammation as an original hallmark
+    expected_structured_fields:
+      primary: [Genomic instability, Telomere attrition, Epigenetic alterations, Loss of proteostasis]
+      antagonistic: [Deregulated nutrient-sensing, Mitochondrial dysfunction, Cellular senescence]
+      integrative: [Stem cell exhaustion, Altered intercellular communication]
+      minimum_pages: 3
+      minimum_chunks: 5
+    allowed_uncertainty: []
+    timeout: 180
+    maximum_retry_count: 1
+
+  - case_id: figure_1_labelled_diagram
+    pdf_filename: Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf
+    pdf_page: 2
+    question: Using only Figure 1 on the selected page, list every clearly labelled tissue structure and fluid compartment. Explain where each compartment is located and how the microscopic image relates to the schematic diagram. Do not include labels that are not visibly present.
+    expected_response_type: labelled_diagram
+    required_facts: [Nucleus, Connective tissue, Adipocyte, Intracellular fluid, Interstitial fluid, Extracellular fluid, Intravascular fluid]
+    prohibited_facts: []
+    expected_structured_fields:
+      relationships:
+        - [Intracellular fluid, within, Adipocyte]
+        - [Interstitial fluid, surrounds, cells]
+        - [Intravascular fluid, within, blood vessels]
+    allowed_uncertainty: []
+    timeout: 180
+    maximum_retry_count: 1
+
+  - case_id: figure_3_circuit
+    pdf_filename: Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf
+    pdf_page: 3
+    question: Using only Figure 3, identify every labelled electrical component and biological compartment. Explain what RE, RI and C represent and describe how they are connected in the equivalent circuit.
+    expected_response_type: labelled_diagram
+    required_facts: [RE, RI, C, extracellular-fluid resistance, intracellular-fluid resistance, membrane capacitance]
+    prohibited_facts: [alpha, beta, delta, gamma]
+    expected_structured_fields:
+      branch_components: [[RE], [C, RI]]
+      parallel: true
+      final_answer_path: validated_typed_vision
+    allowed_uncertainty: []
+    timeout: 180
+    maximum_retry_count: 1
+
+  - case_id: figure_9_six_panel_bode_graph
+    pdf_filename: Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf
+    pdf_page: 8
+    question: Using only Figure 9 on the selected page, identify the x-axis and y-axis variables in each panel, the sample groups shown, and the overall magnitude and phase trends as frequency increases. Compare Groups 1, 2 and 3, and do not estimate exact values unless they are clearly readable.
+    expected_response_type: graph
+    required_facts: [Frequency, Group 1, Group 2, Group 3, Sample 10, Sample 9, Sample 8, Sample 7, Sample 6, Sample 5, Sample 4, Sample 3, Sample 2, Sample 1]
+    prohibited_facts: []
+    expected_structured_fields:
+      panel_count: 6
+      group_samples:
+        Group 1: [Sample 10, Sample 9]
+        Group 2: [Sample 8, Sample 7, Sample 6, Sample 5]
+        Group 3: [Sample 4, Sample 3, Sample 2, Sample 1]
+      magnitude_order_high_to_low: [Group 3, Group 1, Group 2]
+      greatest_phase_complexity_group: Group 2
+      final_answer_path: validated_typed_vision
+    allowed_uncertainty: [exact values]
+    timeout: 300
+    maximum_retry_count: 1
+
+  - case_id: figure_13_nyquist_graph
+    pdf_filename: Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf
+    pdf_page: 10
+    question: Using only Figure 13, compare the experimental data with the Cole-Cole model for Samples 10 and 7. Which sample appears to have the closer visual fit, and where are the largest visible deviations?
+    expected_response_type: graph
+    required_facts: [Sample 10, Sample 7, good, right]
+    prohibited_facts: [high-frequency, low-frequency]
+    expected_structured_fields:
+      panel_count: 2
+      x_scale: linear
+      y_scale: linear
+    allowed_uncertainty: [Sample 10 visually closer]
+    timeout: 180
+    maximum_retry_count: 1
+
+  - case_id: table_1
+    pdf_filename: Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf
+    pdf_page: 7
+    question: Using only Table 1 on the selected page, extract the sample number, group, volume, weight and density for every sample. Then compare the three groups and describe how density changes as volume decreases. Mark any unreadable value rather than guessing.
+    expected_response_type: table
+    required_facts: [density generally increases as volume decreases]
+    prohibited_facts: []
+    expected_structured_fields:
+      columns: [Group, Sample, Volume, Weight, Density]
+      rows:
+        - [1, 10, 600, 534, 0.89]
+        - [1, 9, 540, 486, 0.90]
+        - [2, 8, 480, 446, 0.93]
+        - [2, 7, 420, 392, 0.93]
+        - [2, 6, 360, 350, 0.97]
+        - [2, 5, 300, 295, 0.98]
+        - [3, 4, 240, 257, 1.07]
+        - [3, 3, 180, 205, 1.14]
+        - [3, 2, 120, 151, 1.26]
+        - [3, 1, 60, 80, 1.33]
+      unreadable_cells: []
+    allowed_uncertainty: []
+    timeout: 180
+    maximum_retry_count: 1

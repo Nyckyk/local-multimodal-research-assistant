@@ -1,0 +1,26 @@
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+
+PAPERS_FOLDER = BASE_DIR / "papers"
+DATA_FOLDER = BASE_DIR / "data"
+TEXT_FOLDER = DATA_FOLDER / "extracted_text"
+DB_PATH = DATA_FOLDER / "chroma"
+
+COLLECTION_NAME = "papers"
+
+OLLAMA_MODEL = "qwen3.5:9b"
+VISION_MODEL = "research-vision:latest"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+INITIAL_RESULTS = 20
+FINAL_RESULTS = 8 
+MAX_HISTORY_MESSAGES = 6
+
+CHUNK_SIZE = 1600
+CHUNK_OVERLAP = 300
+
+PAPERS_FOLDER.mkdir(parents=True, exist_ok=True)
+TEXT_FOLDER.mkdir(parents=True, exist_ok=True)
+DB_PATH.mkdir(parents=True, exist_ok=True) 
