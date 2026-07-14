@@ -1,0 +1,141 @@
+"""Parse explicit and conversational figure/table references."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import asdict, dataclass
+
+
+_IDENTIFIER = r"(?:[A-Za-z]\.)?\d+(?:\.\d+)?|[A-Za-z]\d+"
+_TARGET_WORD = r"fig(?:ure)?\.?|table"
+
+
+@dataclass(frozen=True)
+class VisualReference:
+    target_type: str = "unknown"
+    target_number: str | None = None
+    panel: str | None = None
+    explicit_reference: bool = False
+    raw_reference: str = ""
+    remaining_query: str = ""
+    followup_kind: str | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def canonical_identifier(identifier: str | None) -> str:
+    """Return a comparison key while preserving the original elsewhere."""
+    if identifier is None:
+        return ""
+    return re.sub(r"\s+", "", str(identifier)).rstrip(".").casefold()
+
+
+def _target_type(word: str) -> str:
+    return "table" if word.casefold().startswith("table") else "figure"
+
+
+def _remaining_query(question: str, start: int, end: int) -> str:
+    remaining = f"{question[:start]} {question[end:]}"
+    return re.sub(r"\s+", " ", remaining).strip(" ,;:-")
+
+
+def parse_visual_reference(question: str) -> VisualReference:
+    """Parse one visual target without treating unrelated numbers as targets."""
+    text = str(question or "")
+
+    panel_prefix = re.search(
+        rf"\bpanel\s+(?P<panel>[A-Za-z])\s+(?:of|in)\s+"
+        rf"(?:(?:supplementary|supp\.)\s+)?(?P<kind>{_TARGET_WORD})\s*"
+        rf"(?P<number>{_IDENTIFIER})(?![A-Za-z0-9])",
+        text,
+        re.IGNORECASE,
+    )
+    if panel_prefix:
+        return VisualReference(
+            target_type=_target_type(panel_prefix.group("kind")),
+            target_number=panel_prefix.group("number"),
+            panel=panel_prefix.group("panel").casefold(),
+            explicit_reference=True,
+            raw_reference=panel_prefix.group(0),
+            remaining_query=_remaining_query(text, *panel_prefix.span()),
+        )
+
+    explicit = re.search(
+        rf"\b(?:(?:supplementary|supp\.)\s+)?(?P<kind>{_TARGET_WORD})\s*"
+        rf"(?P<number>{_IDENTIFIER})(?P<suffix>[a-z])?"
+        rf"(?:\s*\(\s*(?:panel\s*)?(?P<paren>[A-Za-z])\s*\))?"
+        rf"(?![A-Za-z0-9])",
+        text,
+        re.IGNORECASE,
+    )
+    if explicit:
+        kind = _target_type(explicit.group("kind"))
+        panel = explicit.group("paren")
+        if kind == "figure" and not panel:
+            panel = explicit.group("suffix")
+        number = explicit.group("number")
+        # The suffix belongs to a figure panel (Fig. 13b), not its identifier.
+        # Supplement identifiers such as S2 are captured wholly by _IDENTIFIER.
+        return VisualReference(
+            target_type=kind,
+            target_number=number,
+            panel=panel.casefold() if panel else None,
+            explicit_reference=True,
+            raw_reference=explicit.group(0),
+            remaining_query=_remaining_query(text, *explicit.span()),
+        )
+
+    panel_followup = re.search(r"\b(?:what about\s+)?panel\s+([A-Za-z])\b", text, re.I)
+    if panel_followup:
+        return VisualReference(
+            panel=panel_followup.group(1).casefold(),
+            raw_reference=panel_followup.group(0),
+            remaining_query=_remaining_query(text, *panel_followup.span()),
+            followup_kind="panel",
+        )
+
+    table_followup = re.search(r"\b(?:that|this|the)\s+table\b", text, re.I)
+    if table_followup:
+        return VisualReference(
+            target_type="table",
+            raw_reference=table_followup.group(0),
+            remaining_query=_remaining_query(text, *table_followup.span()),
+            followup_kind="previous",
+        )
+
+    figure_followup = re.search(r"\b(?:that|this|the)\s+figure\b", text, re.I)
+    if figure_followup:
+        return VisualReference(
+            target_type="figure",
+            raw_reference=figure_followup.group(0),
+            remaining_query=_remaining_query(text, *figure_followup.span()),
+            followup_kind="previous",
+        )
+
+    next_figure = re.search(r"\b(?:the\s+)?next\s+figure\b", text, re.I)
+    if next_figure:
+        return VisualReference(
+            target_type="figure",
+            raw_reference=next_figure.group(0),
+            remaining_query=_remaining_query(text, *next_figure.span()),
+            followup_kind="next",
+        )
+
+    if re.search(r"\b(?:there|it)\b", text, re.I) and re.search(
+        r"\b(?:axis|curve|figure|group|highest|lowest|panel|plot|row|show|table)\b",
+        text,
+        re.I,
+    ):
+        return VisualReference(
+            raw_reference="conversational visual reference",
+            remaining_query=text.strip(),
+            followup_kind="previous",
+        )
+
+    return VisualReference(remaining_query=text.strip())
+
+
+def has_visual_reference(question: str) -> bool:
+    reference = parse_visual_reference(question)
+    return reference.explicit_reference or reference.followup_kind is not None

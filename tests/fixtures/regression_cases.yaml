@@ -32,6 +32,22 @@ cases:
     timeout: 180
     maximum_retry_count: 1
 
+  - case_id: figure_6_auto_hallmarks
+    pdf_filename: hall marks of aging.pdf
+    pdf_page: 46
+    question: How does Figure 6 distinguish primary, antagonistic and integrative hallmarks?
+    expected_response_type: labelled_diagram
+    required_facts: [Genomic instability, Telomere attrition, Epigenetic alterations, Loss of proteostasis, Deregulated nutrient-sensing, Mitochondrial dysfunction, Cellular senescence, Stem cell exhaustion, Altered intercellular communication]
+    prohibited_facts: []
+    expected_structured_fields:
+      primary: [Genomic instability, Telomere attrition, Epigenetic alterations, Loss of proteostasis]
+      antagonistic: [Deregulated nutrient-sensing, Mitochondrial dysfunction, Cellular senescence]
+      integrative: [Stem cell exhaustion, Altered intercellular communication]
+      final_answer_path: validated_structured_vision
+    allowed_uncertainty: []
+    timeout: 300
+    maximum_retry_count: 1
+
   - case_id: figure_1_labelled_diagram
     pdf_filename: Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf
     pdf_page: 2
@@ -122,3 +138,60 @@ cases:
     allowed_uncertainty: []
     timeout: 180
     maximum_retry_count: 1
+
+visual_resolution_cases:
+  - case_id: resolve_hallmarks_figure_6
+    question: How does Figure 6 distinguish primary, antagonistic and integrative hallmarks?
+    target_type: figure
+    target_number: "6"
+    expected_pdf: hall marks of aging.pdf
+    expected_page: 46
+
+  - case_id: resolve_bioimpedance_figure_1
+    question: Explain the adipocyte tissue structures and fluid compartments in Figure 1.
+    target_type: figure
+    target_number: "1"
+    expected_pdf: Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf
+    expected_page: 2
+
+  - case_id: resolve_bioimpedance_figure_3
+    question: Using Figure 3, explain what RE, RI and C represent and how they are connected.
+    target_type: figure
+    target_number: "3"
+    expected_pdf: Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf
+    expected_page: 3
+
+  - case_id: resolve_bioimpedance_figure_9
+    question: Compare Groups 1, 2 and 3 in Figure 9.
+    target_type: figure
+    target_number: "9"
+    expected_pdf: Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf
+    expected_page: 8
+
+  - case_id: resolve_bioimpedance_table_1
+    question: Extract all rows from Table 1.
+    target_type: table
+    target_number: "1"
+    expected_pdf: Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf
+    expected_page: 7
+
+  - case_id: resolve_bioimpedance_figure_13
+    question: Compare Samples 10 and 7 in Figure 13.
+    target_type: figure
+    target_number: "13"
+    expected_pdf: Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf
+    expected_page: 10
+
+  - case_id: resolve_bioimpedance_table_b3
+    question: Extract Table B.3.
+    target_type: table
+    target_number: B.3
+    expected_pdf: Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf
+    expected_page: 14
+
+  - case_id: resolve_bioimpedance_figure_a1
+    question: Explain Figure A.1.
+    target_type: figure
+    target_number: A.1
+    expected_pdf: Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf
+    expected_page: 13

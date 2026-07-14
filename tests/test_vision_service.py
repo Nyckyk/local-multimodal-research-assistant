@@ -162,6 +162,28 @@ class VisionPipelineTests(unittest.TestCase):
         self.assertEqual(memberships["marker alpha"]["group"], "antagonistic")
         self.assertNotIn("marker beta", memberships)
 
+    def test_text_cross_check_accepts_explicit_group_descriptor(self):
+        memberships = vision._explicit_text_memberships(
+            "Cellular senescence is a beneficial compensatory response to damage. ",
+            ["Cellular senescence"],
+        )
+        self.assertEqual(memberships["cellular senescence"]["group"], "antagonistic")
+
+    def test_non_visible_partial_label_is_dropped_when_full_expansion_exists(self):
+        observations = {
+            "mitochondrial": {
+                "label": "Mitochondrial",
+                "groups": {"antagonistic": [{"fully_visible": False}]},
+            },
+            "mitochondrial dysfunction": {
+                "label": "Mitochondrial dysfunction",
+                "groups": {"antagonistic": [{"fully_visible": True}]},
+            },
+        }
+        vision._discard_partial_label_fragments(observations)
+        self.assertNotIn("mitochondrial", observations)
+        self.assertIn("mitochondrial dysfunction", observations)
+
     def test_author_and_page_metadata_are_removed(self):
         cleaned = vision.clean_detected_label("López-Otín et al., Page 46, instability")
         self.assertEqual(cleaned, "instability")

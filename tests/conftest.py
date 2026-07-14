@@ -27,6 +27,15 @@ def regression_cases():
 
 
 @pytest.fixture(scope="session")
+def visual_resolution_cases():
+    yaml = pytest.importorskip("yaml", reason="PyYAML is required for regression fixtures")
+    fixture_path = BASE_DIR / "tests" / "fixtures" / "regression_cases.yaml"
+    return yaml.safe_load(fixture_path.read_text(encoding="utf-8"))[
+        "visual_resolution_cases"
+    ]
+
+
+@pytest.fixture(scope="session")
 def require_ollama_models():
     try:
         return require_configured_models()

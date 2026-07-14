@@ -12,6 +12,8 @@ from rag.embeddings import load_embedder, load_reranker
 from rag.retrieval import retrieve_context
 from services.ollama_service import generate_answer
 from services.structured_vision import StructuredOutputError, TruncatedJSONError
+from services.visual_index import load_or_build_visual_index
+from services.visual_locator import resolve_visual_target
 from services.vision_service import analyse_pdf_page
 from settings import PAPERS_FOLDER
 
@@ -75,7 +77,8 @@ def _case_by_id(cases, case_id):
 @pytest.mark.parametrize(
     "case_id",
     [
-        "hallmarks_document_summary",
+            "hallmarks_document_summary",
+            "figure_6_auto_hallmarks",
         "figure_1_labelled_diagram",
         "figure_3_circuit",
         "figure_9_six_panel_bode_graph",
@@ -90,13 +93,10 @@ def test_real_local_regression_case(
     if selected and selected != case_id:
         pytest.skip(f"runner selected {selected}")
     case = _case_by_id(regression_cases, case_id)
-    pdf_path = PAPERS_FOLDER / case["pdf_filename"]
-    assert pdf_path.exists(), f"Missing PDF fixture: {pdf_path}"
-
     if case["expected_response_type"] == "rag_summary":
         _run_summary_case(case, artifact_writer)
     else:
-        _run_vision_case(case, pdf_path, artifact_writer)
+        _run_vision_case(case, artifact_writer)
 
 
 def _run_summary_case(case, artifact_writer):
@@ -147,18 +147,32 @@ def _run_summary_case(case, artifact_writer):
         raise
 
 
-def _run_vision_case(case, pdf_path: Path, artifact_writer):
+def _run_vision_case(case, artifact_writer):
     debug = {"_save_crops": True}
     answer = ""
     try:
-        answer = analyse_pdf_page(
-            pdf_path, int(case["pdf_page"]), case["question"], debug_info=debug
+        resolution = resolve_visual_target(
+            case["question"], load_or_build_visual_index()
         )
-        value = debug.get("validated_json")
+        assert resolution.status == "resolved", resolution.to_dict()
+        assert resolution.pdf_name == case["pdf_filename"]
+        assert resolution.page_number == int(case["pdf_page"])
+        pdf_path = Path(resolution.pdf_path)
+        answer = analyse_pdf_page(
+            pdf_path, int(resolution.page_number), case["question"], debug_info=debug
+        )
+        debug["resolved_visual_target"] = resolution.to_dict()
+        grouped = case["case_id"] == "figure_6_auto_hallmarks"
+        value = debug.get("normalized_json" if grouped else "validated_json")
         assert isinstance(value, dict), "validated structured output was not produced"
-        assert debug.get("final_answer_path") == "validated_typed_vision"
+        expected_path = case["expected_structured_fields"].get(
+            "final_answer_path", "validated_typed_vision"
+        )
+        assert debug.get("final_answer_path") == expected_path
         if case["case_id"] == "figure_1_labelled_diagram":
             _assert_figure_1(case, value)
+        elif case["case_id"] == "figure_6_auto_hallmarks":
+            _assert_figure_6(case, value)
         elif case["case_id"] == "figure_3_circuit":
             _assert_figure_3(case, value)
         elif case["case_id"] == "figure_9_six_panel_bode_graph":
@@ -189,6 +203,20 @@ def _assert_figure_1(case, value):
     assert "intracellular" in relationships and ("within" in relationships or "inside" in relationships)
     assert "interstitial" in relationships and ("surround" in relationships or "between" in relationships)
     assert "intravascular" in relationships and ("vessel" in relationships or "vascular" in relationships)
+
+
+def _assert_figure_6(case, value):
+    expected = case["expected_structured_fields"]
+    _assert_required_and_prohibited(case, value)
+    for group in ("primary", "antagonistic", "integrative"):
+        assert {
+            re.sub(r"[^a-z0-9]+", "", _normal(item))
+            for item in value[group]
+        } == {
+            re.sub(r"[^a-z0-9]+", "", _normal(item))
+            for item in expected[group]
+        }
+    assert value["uncertain"] == []
 
 
 def _assert_figure_3(case, value):
@@ -266,3 +294,28 @@ def _assert_table_1(case, value):
     assert value["unreadable_cells"] == []
     densities = [row[-1] for row in actual_rows]
     assert densities == sorted(densities)
+
+
+def test_automatic_resolution_leaves_duplicate_figure_one_ambiguous():
+    result = resolve_visual_target("Explain Figure 1.", load_or_build_visual_index())
+    assert result.status == "ambiguous"
+    assert len({candidate["pdf_name"] for candidate in result.candidates}) >= 2
+
+
+def test_automatic_resolution_retains_figure_for_panel_followup():
+    index = load_or_build_visual_index()
+    first = resolve_visual_target("Compare Groups 1, 2 and 3 in Figure 9.", index)
+    assert first.status == "resolved"
+    messages = [{
+        "role": "assistant",
+        "content": "Validated Figure 9 answer",
+        "visual_target": first.to_dict(),
+    }]
+    followup = resolve_visual_target(
+        "What about panel d?", index, conversation_messages=messages
+    )
+    assert followup.status == "resolved"
+    assert followup.pdf_name == first.pdf_name
+    assert followup.page_number == first.page_number
+    assert followup.target_number == "9"
+    assert followup.panel == "d"

@@ -53,7 +53,15 @@ def _run_pytest(root, shard, arguments, timeout=None, extra_env=None):
         "TRANSFORMERS_OFFLINE": "1",
         **(extra_env or {}),
     })
-    command = [sys.executable, "-m", "pytest", *arguments]
+    # Keep pytest's temporary files inside the timestamped result directory.
+    # This avoids inherited ACL problems in the system-wide pytest temp root on
+    # Windows and keeps each independently executed shard isolated.
+    base_temp = root / "_pytest_tmp" / shard
+    base_temp.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable, "-m", "pytest", "--basetemp", str(base_temp),
+        *arguments,
+    ]
     started = time.perf_counter()
     try:
         completed = subprocess.run(
@@ -75,6 +83,29 @@ def _run_pytest(root, shard, arguments, timeout=None, extra_env=None):
             "detail": f"timeout after {timeout} seconds", "failure_kind": "timeout",
         }]}
         (root / f"pytest_{shard}.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    elif exit_code:
+        # Collection/setup errors can make pytest exit nonzero without producing
+        # a failed test call. Never allow such a shard to appear as a green run.
+        report_path = root / f"pytest_{shard}.json"
+        if report_path.exists():
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+        else:
+            payload = {"duration_seconds": duration, "tests": []}
+        payload["exit_code"] = exit_code
+        payload.setdefault("duration_seconds", duration)
+        tests = payload.setdefault("tests", [])
+        if not any(row.get("status") == "FAIL" for row in tests):
+            tests.append({
+                "nodeid": f"{shard}::pytest_process",
+                "status": "FAIL",
+                "duration_seconds": duration,
+                "detail": (
+                    f"pytest exited with code {exit_code}; see "
+                    f"failure_details/{shard}_pytest.log"
+                ),
+                "failure_kind": "test_error",
+            })
+        report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return exit_code
 
 
@@ -162,6 +193,16 @@ def main():
                 root, case_id,
                 ["tests/test_ollama_regression.py", "-k", case_id, "-m", "ollama"],
                 timeout=timeout, extra_env={"REGRESSION_CASE_ID": case_id},
+            )
+        if exit_code == 0:
+            exit_code |= _run_pytest(
+                root,
+                "automatic_visual_resolution",
+                [
+                    "tests/test_ollama_regression.py", "-k",
+                    "automatic_resolution", "-m", "ollama",
+                ],
+                timeout=120,
             )
     if exit_code == 0 and args.smoke:
         exit_code |= _run_pytest(root, "smoke", ["tests/test_streamlit_smoke.py", "-m", "smoke"], timeout=300)

@@ -36,7 +36,20 @@ python scripts/test_vision.py
 streamlit run app.py
 ```
 
-For figure or table questions, enable **Use vision for this question**, select the PDF and enter the PDF page number.
+Figure and table questions are detected automatically. The app builds a local,
+incremental visual index from captions and nearby PDF text, resolves references
+such as `Figure 9`, `Fig. 13b`, `Table B.3`, and follow-up questions such as
+`What about panel c?`, then sends only the resolved page to the vision model.
+The index is stored under `data/visual_index/` and is rebuilt only when PDFs are
+added, removed, or changed.
+
+Use **Preferred PDF** when duplicate figure numbers need a source hint. If the
+reference is still ambiguous, the app asks you to choose a candidate. The
+**Manual visual target override** remains available for scanned documents or
+unusual numbering: select the PDF and enter the 1-based PDF page number.
+
+Automatic detection can be disabled per question. Text-only questions continue
+through the normal RAG path without invoking the vision model.
 
 The vision service automatically retries a page at lower image resolutions when Ollama reports that the image exceeds its context window. Vision failures are shown inside the debug panel instead of crashing the Streamlit app.
 

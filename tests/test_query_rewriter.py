@@ -48,6 +48,13 @@ class QueryRewriterTests(unittest.TestCase):
             rewritten = rewriter.rewrite_question(question, HISTORY)
         self.assertEqual(rewritten, question)
 
+    def test_panel_followup_and_supplement_identifier_are_preserved(self):
+        for question in ("What about panel b?", "Compare mTOR in Figure A.1"):
+            with self.subTest(question=question):
+                self.assertEqual(
+                    rewriter.rewrite_question(question, HISTORY), question
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

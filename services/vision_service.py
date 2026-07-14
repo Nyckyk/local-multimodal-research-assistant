@@ -23,6 +23,7 @@ COULD_NOT_VERIFY_MESSAGE = (
     "Could not verify a structured reading of this figure. "
     "No unvalidated classification is shown."
 )
+VISUAL_IDENTIFIER_PATTERN = r"(?:[A-Za-z]\.)?\d+(?:\.\d+)?|[A-Za-z]\d+"
 
 
 class StructuredVisionError(ValueError):
@@ -63,7 +64,11 @@ def _is_grouping_question(question: str) -> bool:
 
 
 def _figure_number(question: str) -> str | None:
-    match = re.search(r"\bfig(?:ure)?\.?\s*(\d+[a-z]?)", question, re.I)
+    match = re.search(
+        rf"\bfig(?:ure)?\.?\s*({VISUAL_IDENTIFIER_PATTERN})",
+        question,
+        re.I,
+    )
     return match.group(1).lower() if match else None
 
 
@@ -74,7 +79,7 @@ def _caption_blocks(page: fitz.Page) -> list[tuple[fitz.Rect, str]]:
         # Inline references such as "the components in Fig. 3" are prose, not
         # captions. Only a line beginning with the identifier is a crop bound.
         if re.search(
-            r"(?im)^\s*fig(?:ure)?\.?\s*\d+[a-z]?\b",
+            rf"(?im)^\s*fig(?:ure)?\.?\s*(?:{VISUAL_IDENTIFIER_PATTERN})\b",
             str(text),
         ):
             captions.append((fitz.Rect(x0, y0, x1, y1), str(text).strip()))
@@ -184,7 +189,9 @@ def _detect_figure_clip(page: fitz.Page, question: str) -> fitz.Rect:
 
 def _detect_table_clip(page: fitz.Page, question: str) -> fitz.Rect:
     page_rect = page.rect
-    match = re.search(r"\btable\s*(\d+[a-z]?)", question, re.IGNORECASE)
+    match = re.search(
+        rf"\btable\s*({VISUAL_IDENTIFIER_PATTERN})", question, re.IGNORECASE
+    )
     pattern = re.compile(
         rf"^\s*table\s*{re.escape(match.group(1))}\b" if match else r"^\s*table\s*\d+",
         re.IGNORECASE,
@@ -812,18 +819,61 @@ def _explicit_text_memberships(
     labels: list[str],
     default_page: int | None = None,
 ) -> dict[str, dict]:
-    """Accept membership only from a document sentence that explicitly lists it."""
+    """Accept membership only from a document sentence that explicitly states it."""
     candidates = extract_candidate_labels(evidence_text, default_page)
     by_label = {
         _normalise_item(candidate["label"]): candidate
         for candidate in candidates
         if candidate.get("group")
     }
+    label_keys = {_normalise_item(label): label for label in labels}
+    for page, block in _evidence_blocks(evidence_text, default_page):
+        # PDF text commonly wraps a single sentence over several physical lines.
+        prose = re.sub(r"(?<![.!?])\n", " ", block)
+        for sentence in re.split(r"(?<=[.!?])\s+", prose):
+            group = canonical_group_name(sentence)
+            if not group:
+                continue
+            sentence_key = _normalise_item(sentence)
+            for key, label in label_keys.items():
+                if key and re.search(rf"\b{re.escape(key)}\b", sentence_key):
+                    by_label[key] = {
+                        "label": label,
+                        "group": group,
+                        "source_page": page,
+                        "sentence": sentence.strip(),
+                    }
     return {
         key: by_label[key]
         for label in labels
         if (key := _normalise_item(label)) in by_label
     }
+
+
+def _discard_partial_label_fragments(observations: dict[str, dict]) -> None:
+    """Drop an incomplete OCR fragment when one full visible expansion exists."""
+    for short_key, short_record in list(observations.items()):
+        short_detections = [
+            detection
+            for evidence in short_record["groups"].values()
+            for detection in evidence
+        ]
+        if any(detection["fully_visible"] for detection in short_detections):
+            continue
+        short_tokens = set(short_key.split())
+        expansions = []
+        for long_key, long_record in observations.items():
+            if long_key == short_key or not short_tokens < set(long_key.split()):
+                continue
+            long_detections = [
+                detection
+                for evidence in long_record["groups"].values()
+                for detection in evidence
+            ]
+            if any(detection["fully_visible"] for detection in long_detections):
+                expansions.append(long_key)
+        if len(expansions) == 1:
+            del observations[short_key]
 
 
 def reconcile_spatial_results(
@@ -911,6 +961,7 @@ def reconcile_spatial_results(
             evidence = record["groups"].setdefault(nearest, [])
             evidence.append(detection)
 
+    _discard_partial_label_fragments(observations)
     final = {"primary": [], "antagonistic": [], "integrative": [], "uncertain": []}
     sources = {}
     confidences = {}
@@ -941,7 +992,7 @@ def reconcile_spatial_results(
             confidences[key] = ranked[0][1]
 
     text_memberships = _explicit_text_memberships(
-        page_text,
+        candidate_text or page_text,
         [record["label"] for record in observations.values()],
         source_page,
     )

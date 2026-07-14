@@ -115,6 +115,24 @@ def circuit_result():
 
 
 class StructuredVisionTests(unittest.TestCase):
+    def test_local_runner_crash_retries_same_request_once(self):
+        recovered = {"message": {"content": '{"recovered": true}'}}
+        with patch.object(
+            structured.ollama,
+            "chat",
+            side_effect=[
+                RuntimeError("model runner has unexpectedly stopped"),
+                recovered,
+            ],
+        ) as chat, patch.object(structured.time, "sleep") as sleep:
+            raw = structured._call_model_images(
+                [Path("panel.png")], "inspect", 100
+            )
+        self.assertEqual(raw, '{"recovered": true}')
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(chat.call_args_list[0].kwargs, chat.call_args_list[1].kwargs)
+        sleep.assert_called_once_with(1)
+
     def test_figure_one_detects_labelled_diagram(self):
         page_text = "Fig. 1. Histological and schematic representation of adipose tissue structure."
         self.assertEqual(

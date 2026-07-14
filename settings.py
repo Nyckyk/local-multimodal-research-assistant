@@ -6,6 +6,8 @@ PAPERS_FOLDER = BASE_DIR / "papers"
 DATA_FOLDER = BASE_DIR / "data"
 TEXT_FOLDER = DATA_FOLDER / "extracted_text"
 DB_PATH = DATA_FOLDER / "chroma"
+VISUAL_INDEX_FOLDER = DATA_FOLDER / "visual_index"
+VISUAL_INDEX_PATH = VISUAL_INDEX_FOLDER / "index.json"
 
 COLLECTION_NAME = "papers"
 
@@ -24,3 +26,4 @@ CHUNK_OVERLAP = 300
 PAPERS_FOLDER.mkdir(parents=True, exist_ok=True)
 TEXT_FOLDER.mkdir(parents=True, exist_ok=True)
 DB_PATH.mkdir(parents=True, exist_ok=True) 
+VISUAL_INDEX_FOLDER.mkdir(parents=True, exist_ok=True)

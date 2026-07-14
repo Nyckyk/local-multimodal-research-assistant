@@ -6,7 +6,7 @@ from settings import OLLAMA_MODEL
 
 REFERENCE_WORDS = {
     "it", "its", "that", "this", "these", "those", "they", "them",
-    "their", "former", "latter", "previous", "above", "below",
+    "their", "former", "latter", "previous", "above", "below", "there",
 }
 QUESTION_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "does", "do",

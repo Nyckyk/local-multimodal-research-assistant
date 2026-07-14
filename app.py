@@ -1,3 +1,6 @@
+from pathlib import Path
+import re
+
 import streamlit as st
 
 from rag.database import get_collection
@@ -6,6 +9,17 @@ from rag.ingestion import index_pdf
 from rag.retrieval import retrieve_context
 from services.ollama_service import generate_answer
 from services.query_rewriter import rewrite_question
+from services.visual_fallback import resolve_with_visual_fallback
+from services.visual_index import load_or_build_visual_index, visual_index_needs_rebuild
+from services.visual_locator import (
+    clear_visual_target_state,
+    format_resolution_problem,
+    manual_visual_resolution,
+    resolve_visual_target,
+    resolved_analysis_question,
+    should_activate_automatic_vision,
+)
+from services.visual_reference_parser import has_visual_reference
 from services.vision_service import COULD_NOT_VERIFY_MESSAGE, analyse_pdf_page
 from settings import MAX_HISTORY_MESSAGES, PAPERS_FOLDER
 
@@ -39,6 +53,14 @@ def load_components():
 collection, embedder, reranker = load_components()
 
 
+@st.cache_data(show_spinner=False)
+def load_visual_library(library_signature):
+    # The signature is a Streamlit cache key; the index service independently
+    # validates and rebuilds only changed local PDFs.
+    del library_signature
+    return load_or_build_visual_index()
+
+
 # ---------------------------------------------------------
 # Session state
 # ---------------------------------------------------------
@@ -48,6 +70,14 @@ if "messages" not in st.session_state:
 
 if "last_user_question" not in st.session_state:
     st.session_state.last_user_question = ""
+
+if "pending_visual_resolution" not in st.session_state:
+    st.session_state.pending_visual_resolution = None
+
+if st.session_state.get("pending_preferred_pdf_name"):
+    st.session_state.preferred_pdf_name = st.session_state.pop(
+        "pending_preferred_pdf_name"
+    )
 
 
 # ---------------------------------------------------------
@@ -149,41 +179,64 @@ with st.sidebar:
     st.divider()
     st.subheader("Vision analysis")
 
-    use_vision = st.checkbox(
-        "Use vision for this question",
+    automatic_visual_detection = st.checkbox(
+        "Automatic visual target detection",
+        value=True,
         help=(
-            "Enable this when the answer depends on a figure, "
-            "table, diagram or page layout."
+            "Automatically locate explicit figure/table references and "
+            "route them through validated local vision analysis."
         ),
     )
 
-    selected_pdf = None
-    vision_page_number = 1
-    vision_debug_enabled = False
+    preferred_pdf_name = st.selectbox(
+        "Preferred PDF (optional)",
+        options=["No preference", *[pdf_file.name for pdf_file in pdf_files]],
+        key="preferred_pdf_name",
+        help="A preference for automatic resolution, not an unconditional choice.",
+    )
+    preferred_pdf = (
+        PAPERS_FOLDER / preferred_pdf_name
+        if preferred_pdf_name != "No preference" else None
+    )
 
-    if use_vision and pdf_files:
-        selected_pdf_name = st.selectbox(
-            "PDF",
-            options=[
-                pdf_file.name
-                for pdf_file in pdf_files
-            ],
+    manual_visual_override = st.checkbox(
+        "Use manual vision override",
+        value=False,
+        help="Use the selected PDF and page instead of automatic resolution.",
+    )
+    manual_pdf = None
+    manual_page_number = 1
+    if manual_visual_override and pdf_files:
+        manual_pdf_name = st.selectbox(
+            "Manual PDF",
+            options=[pdf_file.name for pdf_file in pdf_files],
+        )
+        manual_pdf = PAPERS_FOLDER / manual_pdf_name
+        manual_page_number = st.number_input(
+            "Manual PDF page number", min_value=1, value=1, step=1,
         )
 
-        selected_pdf = PAPERS_FOLDER / selected_pdf_name
+    vision_debug_enabled = st.checkbox(
+        "Save vision debug crops",
+        value=False,
+        help="Keep temporary inference crops and show their coordinates.",
+    )
 
-        vision_page_number = st.number_input(
-            "PDF page number",
-            min_value=1,
-            value=1,
-            step=1,
+    pending = st.session_state.get("pending_visual_resolution")
+    if pending and pending.get("candidates"):
+        st.warning("A visual reference needs a paper choice.")
+        candidate_names = list(dict.fromkeys(
+            candidate["pdf_name"] for candidate in pending["candidates"]
+        ))
+        pending_choice = st.selectbox(
+            "Choose the intended paper",
+            options=candidate_names,
+            key="visual_candidate_choice",
         )
-
-        vision_debug_enabled = st.checkbox(
-            "Save vision debug crops",
-            value=False,
-            help="Keep temporary inference crops and show their coordinates.",
-        )
+        if st.button("Use this paper as preference", use_container_width=True):
+            st.session_state.pending_preferred_pdf_name = pending_choice
+            st.session_state.pending_visual_resolution = None
+            st.rerun()
 
     if st.button(
         "Clear conversation",
@@ -191,7 +244,19 @@ with st.sidebar:
     ):
         st.session_state.messages = []
         st.session_state.last_user_question = ""
+        clear_visual_target_state(st.session_state)
         st.rerun()
+
+
+library_signature = tuple(
+    (path.name, path.stat().st_size, path.stat().st_mtime_ns)
+    for path in pdf_files
+)
+if visual_index_needs_rebuild():
+    with st.spinner("Updating the local figure/table index..."):
+        visual_index = load_visual_library(library_signature)
+else:
+    visual_index = load_visual_library(library_signature)
 
 
 # ---------------------------------------------------------
@@ -273,14 +338,74 @@ if question:
 
             visual_answer = ""
             vision_error = ""
+            visual_context = ""
             vision_debug = {"_save_crops": vision_debug_enabled}
+            resolution_fallback_debug = {}
+            previous_visual_evidence = next(
+                (
+                    message.get("evidence")
+                    for message in reversed(st.session_state.messages[:-1])
+                    if isinstance(message.get("evidence"), dict)
+                    and message["evidence"].get("vision_result")
+                ),
+                None,
+            )
+            previous_sources = [
+                source.get("pdf", source.get("source", ""))
+                for message in st.session_state.messages[:-1]
+                for source in message.get("sources", [])
+            ]
+            if manual_visual_override and manual_pdf is not None:
+                resolution = manual_visual_resolution(
+                    manual_pdf, int(manual_page_number), question
+                )
+            elif automatic_visual_detection:
+                resolution = resolve_visual_target(
+                    question=question,
+                    index=visual_index,
+                    selected_pdf=preferred_pdf,
+                    conversation_messages=st.session_state.messages[:-1],
+                    current_source_names=previous_sources,
+                    embedder=embedder,
+                )
+                if has_visual_reference(question) and (
+                    resolution.status == "not_found"
+                    or (
+                        resolution.status == "ambiguous"
+                        and "confidence" in resolution.reason.casefold()
+                    )
+                ):
+                    with st.spinner("Checking unresolved pages with the local vision model..."):
+                        resolution = resolve_with_visual_fallback(
+                            question=question,
+                            base_resolution=resolution,
+                            index=visual_index,
+                            selected_pdf=preferred_pdf,
+                            debug_info=resolution_fallback_debug,
+                        )
+            else:
+                resolution = resolve_visual_target(question, {"files": {}})
+
+            use_vision = manual_visual_override or should_activate_automatic_vision(
+                question, resolution
+            )
+            selected_pdf = Path(resolution.pdf_path) if resolution.pdf_path else None
+            vision_page_number = resolution.page_number or 1
+            analysis_question = resolved_analysis_question(question, resolution)
 
             if use_vision and selected_pdf is not None:
+                if not manual_visual_override:
+                    st.info(
+                        "Automatically detected:\n\n"
+                        f"{resolution.target_type.title()} {resolution.target_number}"
+                        + (f", panel {resolution.panel}" if resolution.panel else "")
+                        + f"\n\n{resolution.pdf_name}\n\nPDF page {resolution.page_number}"
+                    )
                 try:
                     visual_answer = analyse_pdf_page(
                         pdf_path=selected_pdf,
                         page_number=int(vision_page_number),
-                        question=question,
+                        question=analysis_question,
                         debug_info=vision_debug,
                         text_evidence=context,
                     )
@@ -310,13 +435,33 @@ if question:
             # separate text model from contradicting a correct reading of the
             # selected figure/table/page.
             evidence = None
+            visual_reference_requested = has_visual_reference(question)
 
             if visual_answer:
-                answer = (
-                    f"{visual_answer}\n\n"
-                    f"Source: **{selected_pdf.name}**, "
-                    f"PDF page **{int(vision_page_number)}**."
+                cross_visual_comparison = bool(
+                    previous_visual_evidence
+                    and re.search(r"\b(?:compare|versus|vs\.?|difference)\b", question, re.I)
+                    and re.search(r"\b(?:it|that|previous|them)\b", question, re.I)
                 )
+                if cross_visual_comparison:
+                    comparison_context = (
+                        "[PREVIOUS VALIDATED VISUAL ANALYSIS]\n"
+                        f"Source: {previous_visual_evidence['pdf']}\n"
+                        f"PDF page: {previous_visual_evidence['page']}\n"
+                        f"Result: {previous_visual_evidence['vision_result']}\n\n"
+                        f"{context}"
+                    )
+                    answer = generate_answer(
+                        question=question,
+                        context=comparison_context,
+                        conversation_history=conversation_history,
+                    )
+                else:
+                    answer = (
+                        f"{visual_answer}\n\n"
+                        f"Source: **{selected_pdf.name}**, "
+                        f"PDF page **{int(vision_page_number)}**."
+                    )
                 evidence = {
                     "summary": (
                         "Local visual analysis of the selected page."
@@ -324,7 +469,13 @@ if question:
                     "pdf": selected_pdf.name,
                     "page": int(vision_page_number),
                     "vision_result": visual_answer,
+                    "visual_target": resolution.to_dict(),
                 }
+            elif resolution.status == "ambiguous" and visual_reference_requested:
+                answer = format_resolution_problem(resolution)
+                st.session_state.pending_visual_resolution = resolution.to_dict()
+            elif resolution.status == "not_found" and visual_reference_requested:
+                answer = format_resolution_problem(resolution)
             elif use_vision and selected_pdf is not None and vision_error:
                 answer = COULD_NOT_VERIFY_MESSAGE
             elif not context:
@@ -362,6 +513,13 @@ if question:
 
                 st.markdown("### Rewritten retrieval query")
                 st.code(retrieval_question)
+
+                if visual_reference_requested or manual_visual_override:
+                    st.markdown("### Visual target resolution")
+                    st.json(resolution.to_dict())
+                    if resolution_fallback_debug:
+                        st.markdown("### Local vision resolution fallback")
+                        st.json(resolution_fallback_debug)
 
                 if use_vision and selected_pdf is not None:
                     st.markdown("### Vision analysis")
@@ -468,6 +626,9 @@ if question:
             "vision_answer": visual_answer,
             "vision_error": vision_error,
             "evidence": evidence,
+            "visual_target": (
+                resolution.to_dict() if resolution.status == "resolved" else None
+            ),
         }
     )
 

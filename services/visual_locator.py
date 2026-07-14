@@ -1,0 +1,365 @@
+"""Resolve parsed figure/table references to a local PDF and 1-based page."""
+
+from __future__ import annotations
+
+import math
+import re
+import unicodedata
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
+
+from services.structured_vision import detect_visual_type
+from services.visual_index import flatten_visual_targets
+from services.visual_reference_parser import (
+    VisualReference,
+    canonical_identifier,
+    parse_visual_reference,
+)
+from settings import PAPERS_FOLDER
+
+
+SAFE_CONFIDENCE = 0.72
+AMBIGUITY_MARGIN = 0.035
+_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "does", "explain",
+    "fig", "figure", "for", "from", "how", "in", "is", "it", "of", "on",
+    "show", "table", "the", "this", "to", "using", "what", "with",
+}
+
+
+@dataclass
+class VisualResolution:
+    status: str
+    pdf_path: str | None = None
+    pdf_name: str | None = None
+    page_number: int | None = None
+    target_type: str = "unknown"
+    target_number: str | None = None
+    panel: str | None = None
+    caption: str = ""
+    visual_type: str | None = None
+    confidence: float = 0.0
+    candidate_count: int = 0
+    reason: str = ""
+    candidates: list[dict] = field(default_factory=list)
+    reference: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _tokens(text: str) -> set[str]:
+    text = unicodedata.normalize("NFKC", text or "")
+    return {
+        token.casefold() for token in re.findall(r"[A-Za-z0-9]+", text or "")
+        if token.casefold() not in _STOPWORDS and len(token) > 1
+    }
+
+
+def _lexical_relevance(question: str, caption: str) -> float:
+    question_tokens, caption_tokens = _tokens(question), _tokens(caption)
+    if not question_tokens or not caption_tokens:
+        return 0.0
+    exact = question_tokens & caption_tokens
+    fuzzy = {
+        token for token in question_tokens - exact
+        if len(token) >= 5 and any(
+            other.startswith(token[:5]) or token.startswith(other[:5])
+            for other in caption_tokens if len(other) >= 5
+        )
+    }
+    return (len(exact) + len(fuzzy)) / math.sqrt(
+        len(question_tokens) * len(caption_tokens)
+    )
+
+
+def _embedding_relevance(question: str, captions: list[str], embedder=None) -> list[float]:
+    if not captions:
+        return []
+    if embedder is None:
+        return [_lexical_relevance(question, caption) for caption in captions]
+    try:
+        vectors = embedder.encode(
+            [question, *captions], normalize_embeddings=True, show_progress_bar=False
+        )
+        query = vectors[0]
+        return [
+            max(0.0, min(1.0, float(sum(float(a) * float(b) for a, b in zip(query, vector)))))
+            for vector in vectors[1:]
+        ]
+    except Exception:
+        return [_lexical_relevance(question, caption) for caption in captions]
+
+
+def _question_names_pdf(question: str, pdf_name: str) -> bool:
+    question_key = re.sub(r"[^a-z0-9]+", " ", question.casefold())
+    stem_tokens = [
+        token for token in _tokens(Path(pdf_name).stem)
+        if len(token) >= 4
+    ]
+    if Path(pdf_name).name.casefold() in question.casefold():
+        return True
+    if not stem_tokens:
+        return False
+    return len(set(stem_tokens) & set(question_key.split())) >= min(2, len(stem_tokens))
+
+
+def _previous_target(messages: list[dict], target_type: str | None = None) -> dict | None:
+    for message in reversed(messages or []):
+        target = message.get("visual_target") or message.get("evidence", {}).get("visual_target")
+        if not isinstance(target, dict) or target.get("status") != "resolved":
+            continue
+        return target if not target_type or target.get("target_type") == target_type else None
+    return None
+
+
+def apply_conversation_reference(
+    reference: VisualReference, messages: list[dict]
+) -> tuple[VisualReference, dict | None, str]:
+    """Attach panel/that-table/next-figure references to prior visual state."""
+    if reference.explicit_reference:
+        return reference, _previous_target(messages), "explicit visual reference"
+    if reference.followup_kind == "panel":
+        previous = _previous_target(messages, "figure")
+        if previous:
+            return replace(
+                reference,
+                target_type="figure",
+                target_number=previous.get("target_number"),
+            ), previous, "panel attached to previous figure"
+    if reference.followup_kind == "previous":
+        previous = _previous_target(
+            messages,
+            reference.target_type if reference.target_type != "unknown" else None,
+        )
+        if previous:
+            return replace(
+                reference,
+                target_type=previous.get("target_type", reference.target_type),
+                target_number=previous.get("target_number"),
+                panel=previous.get("panel"),
+            ), previous, "conversational reference attached to previous visual target"
+    if reference.followup_kind == "next":
+        previous = _previous_target(messages, "figure")
+        identifier = str(previous.get("target_number", "")) if previous else ""
+        match = re.fullmatch(r"(\d+)", identifier)
+        if match:
+            return replace(
+                reference,
+                target_type="figure",
+                target_number=str(int(match.group(1)) + 1),
+            ), previous, "next figure after previous visual target"
+    return reference, None, "no unambiguous conversation target"
+
+
+def choose_visual_type(reference: VisualReference, question: str, caption: str) -> str:
+    if reference.target_type == "table":
+        return "table"
+    detected = detect_visual_type(question, caption)
+    return detected or "labelled_diagram"
+
+
+def manual_visual_resolution(
+    pdf_path: Path, page_number: int, question: str,
+) -> VisualResolution:
+    reference = parse_visual_reference(question)
+    return VisualResolution(
+        status="resolved",
+        pdf_path=str(pdf_path),
+        pdf_name=pdf_path.name,
+        page_number=int(page_number),
+        target_type=reference.target_type,
+        target_number=reference.target_number,
+        panel=reference.panel,
+        visual_type=("table" if reference.target_type == "table" else None),
+        confidence=1.0,
+        candidate_count=1,
+        reason="Manual PDF/page override",
+        reference=reference.to_dict(),
+    )
+
+
+def resolve_visual_target(
+    question: str,
+    index: dict,
+    selected_pdf: Path | str | None = None,
+    conversation_messages: list[dict] | None = None,
+    current_source_names: list[str] | None = None,
+    embedder=None,
+    papers_folder: Path = PAPERS_FOLDER,
+) -> VisualResolution:
+    reference, previous, context_reason = apply_conversation_reference(
+        parse_visual_reference(question), conversation_messages or []
+    )
+    if not reference.target_number or reference.target_type == "unknown":
+        return VisualResolution(
+            status="not_found",
+            target_type=reference.target_type,
+            panel=reference.panel,
+            reason=(
+                "No explicit or unambiguous conversational figure/table reference"
+                if not reference.followup_kind else context_reason
+            ),
+            reference=reference.to_dict(),
+        )
+
+    all_targets = flatten_visual_targets(index, papers_folder)
+    candidates = [
+        target for target in all_targets
+        if target["target_type"] == reference.target_type
+        and canonical_identifier(target["target_number"])
+        == canonical_identifier(reference.target_number)
+    ]
+    if not candidates:
+        return VisualResolution(
+            status="not_found",
+            target_type=reference.target_type,
+            target_number=reference.target_number,
+            panel=reference.panel,
+            reason=f"No indexed {reference.target_type} {reference.target_number} match",
+            reference=reference.to_dict(),
+        )
+
+    # Keep the caption occurrence for each PDF/page; inline references are only
+    # fallbacks when no caption occurrence exists on that same page.
+    deduplicated = {}
+    for candidate in candidates:
+        key = (candidate["pdf_name"], candidate["page_number"])
+        existing = deduplicated.get(key)
+        if existing is None or (
+            candidate["match_kind"] == "caption" and existing["match_kind"] != "caption"
+        ):
+            deduplicated[key] = candidate
+    candidates = list(deduplicated.values())
+    captions = [candidate.get("caption", "") for candidate in candidates]
+    relevance = _embedding_relevance(question, captions, embedder)
+    selected_name = Path(selected_pdf).name if selected_pdf else None
+    previous_name = previous.get("pdf_name") if previous else None
+    source_stems = {Path(name).stem.casefold() for name in (current_source_names or [])}
+    scored = []
+    for candidate, caption_score in zip(candidates, relevance):
+        score = 0.78 if candidate["match_kind"] == "caption" else 0.46
+        reasons = ["exact caption identifier" if candidate["match_kind"] == "caption" else "exact in-page reference"]
+        if _question_names_pdf(question, candidate["pdf_name"]):
+            score += 0.35
+            reasons.append("PDF named in question")
+        if selected_name and candidate["pdf_name"].casefold() == selected_name.casefold():
+            score += 0.14
+            reasons.append("selected PDF preference")
+        if previous_name and candidate["pdf_name"].casefold() == str(previous_name).casefold():
+            score += 0.12
+            reasons.append("previous visual PDF")
+        if Path(candidate["pdf_name"]).stem.casefold() in source_stems:
+            score += 0.07
+            reasons.append("conversation source context")
+        score += min(0.18, caption_score * 0.18)
+        if caption_score:
+            reasons.append("caption relevance")
+        scored.append({**candidate, "score": min(1.0, score), "score_reasons": reasons})
+    scored.sort(key=lambda row: (-row["score"], row["pdf_name"].casefold(), row["page_number"]))
+    top = scored[0]
+    second = scored[1] if len(scored) > 1 else None
+    public_candidates = [
+        {
+            "pdf_name": row["pdf_name"],
+            "page_number": row["page_number"],
+            "caption": row.get("caption", ""),
+            "confidence": round(row["score"], 3),
+            "reason": ", ".join(row["score_reasons"]),
+        }
+        for row in scored
+    ]
+    if second and top["pdf_name"] != second["pdf_name"] and (
+        top["score"] - second["score"] < AMBIGUITY_MARGIN
+    ):
+        return VisualResolution(
+            status="ambiguous",
+            target_type=reference.target_type,
+            target_number=reference.target_number,
+            panel=reference.panel,
+            confidence=round(top["score"], 3),
+            candidate_count=len(scored),
+            reason="Multiple similarly ranked exact matches",
+            candidates=public_candidates,
+            reference=reference.to_dict(),
+        )
+    if top["score"] < SAFE_CONFIDENCE:
+        return VisualResolution(
+            status="ambiguous",
+            target_type=reference.target_type,
+            target_number=reference.target_number,
+            panel=reference.panel,
+            confidence=round(top["score"], 3),
+            candidate_count=len(scored),
+            reason="Best match is below the safe confidence threshold",
+            candidates=public_candidates,
+            reference=reference.to_dict(),
+        )
+    visual_type = choose_visual_type(reference, question, top.get("caption", ""))
+    return VisualResolution(
+        status="resolved",
+        pdf_path=top["pdf_path"],
+        pdf_name=top["pdf_name"],
+        page_number=int(top["page_number"]),
+        target_type=reference.target_type,
+        target_number=reference.target_number,
+        panel=reference.panel,
+        caption=top.get("caption", ""),
+        visual_type=visual_type,
+        confidence=round(top["score"], 3),
+        candidate_count=len(scored),
+        reason="; ".join(top["score_reasons"]),
+        candidates=public_candidates,
+        reference=reference.to_dict(),
+    )
+
+
+def resolved_analysis_question(question: str, resolution: VisualResolution) -> str:
+    if resolution.status != "resolved" or not resolution.target_number:
+        return question
+    label = "Table" if resolution.target_type == "table" else "Figure"
+    panel = f", panel {resolution.panel}" if resolution.panel else ""
+    return f"{question}\nResolved visual target: {label} {resolution.target_number}{panel}."
+
+
+def should_activate_automatic_vision(question: str, resolution: VisualResolution) -> bool:
+    reference = parse_visual_reference(question)
+    return resolution.status == "resolved" and (
+        reference.explicit_reference or reference.followup_kind is not None
+    )
+
+
+def format_resolution_problem(resolution: VisualResolution) -> str:
+    label = "Table" if resolution.target_type == "table" else "Figure"
+    identifier = f" {resolution.target_number}" if resolution.target_number else ""
+    if resolution.status == "ambiguous":
+        low_confidence = "confidence" in resolution.reason.casefold()
+        lines = [
+            (
+                f"I found only a low-confidence match for {label}{identifier}:"
+                if low_confidence else
+                f"I found {label}{identifier} in multiple possible locations:"
+            )
+        ]
+        seen_pdfs = set()
+        for candidate in resolution.candidates:
+            if candidate["pdf_name"] in seen_pdfs:
+                continue
+            seen_pdfs.add(candidate["pdf_name"])
+            lines.append(
+                f"- {candidate['pdf_name']}, PDF page {candidate['page_number']}"
+            )
+        lines.append("Please select the intended paper or use the manual PDF/page override.")
+        return "\n".join(lines)
+    return (
+        f"I could not locate {label.lower()}{identifier} in the local visual index. "
+        "You can select the PDF and page with the manual vision override."
+    )
+
+
+def clear_visual_target_state(state) -> None:
+    for key in (
+        "last_visual_target", "pending_visual_resolution",
+        "pending_visual_question", "visual_candidate_choice",
+    ):
+        state.pop(key, None)

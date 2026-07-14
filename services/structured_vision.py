@@ -1,5 +1,6 @@
 import json
 import re
+import time
 import unicodedata
 from html import unescape
 from pathlib import Path
@@ -13,6 +14,7 @@ COMPACT_PANEL_NUM_PREDICT = 650
 COMPACT_COMPARISON_NUM_PREDICT = 350
 AXIS_LABEL_NUM_PREDICT = 220
 VISUAL_TYPES = {"labelled_diagram", "graph", "table"}
+VISUAL_IDENTIFIER_PATTERN = r"(?:[A-Za-z]\.)?\d+(?:\.\d+)?|[A-Za-z]\d+"
 
 
 class StructuredOutputError(ValueError):
@@ -105,11 +107,15 @@ def reread_magnitude_axis_label(
 
 def detect_visual_type(question: str, page_text: str = "") -> str | None:
     question_lower = question.lower()
-    if re.search(r"\btable\s*\d*\b", question_lower):
+    if re.search(
+        rf"\btable\s*(?:{VISUAL_IDENTIFIER_PATTERN})\b", question_lower
+    ):
         return "table"
 
     relevant_text = question_lower
-    figure_match = re.search(r"\bfig(?:ure)?\.?\s*(\d+[a-z]?)", question_lower)
+    figure_match = re.search(
+        rf"\bfig(?:ure)?\.?\s*({VISUAL_IDENTIFIER_PATTERN})", question_lower
+    )
     if figure_match:
         number = re.escape(figure_match.group(1))
         caption = re.search(
@@ -981,12 +987,23 @@ def _response_text(response) -> str:
     return (message.get("content") or message.get("thinking") or "").strip()
 
 
+def _chat_with_runner_retry(**kwargs):
+    """Retry one identical request when Ollama's local model runner crashes."""
+    try:
+        return ollama.chat(**kwargs)
+    except Exception as error:
+        if "model runner has unexpectedly stopped" not in str(error).casefold():
+            raise
+        time.sleep(1)
+        return ollama.chat(**kwargs)
+
+
 def _call_model(
     image_path: Path,
     prompt: str,
     num_predict: int = STRUCTURED_NUM_PREDICT,
 ) -> str:
-    response = ollama.chat(
+    response = _chat_with_runner_retry(
         model=VISION_MODEL,
         messages=[{"role": "user", "content": prompt, "images": [str(image_path)]}],
         format="json",
@@ -1003,7 +1020,7 @@ def _call_model_images(
     prompt: str,
     num_predict: int,
 ) -> str:
-    response = ollama.chat(
+    response = _chat_with_runner_retry(
         model=VISION_MODEL,
         messages=[{
             "role": "user",
