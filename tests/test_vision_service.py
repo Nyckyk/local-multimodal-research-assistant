@@ -127,6 +127,13 @@ class VisionPipelineTests(unittest.TestCase):
             vision._typed_render_scale(page, Rect(20, 400, 280, 540)),
             3.0,
         )
+
+    def test_wide_shallow_graph_crop_uses_higher_render_scale(self):
+        page = types.SimpleNamespace(rect=Rect(0, 0, 600, 800))
+        self.assertEqual(
+            vision._typed_render_scale(page, Rect(20, 40, 580, 250)),
+            3.0,
+        )
         self.assertEqual(
             vision._typed_render_scale(page, Rect(20, 40, 580, 500)),
             1.5,
@@ -136,6 +143,15 @@ class VisionPipelineTests(unittest.TestCase):
         self.assertEqual(
             vision._multi_panel_labels("(a) Sample 10 (b) Sample 7"),
             [],
+        )
+        self.assertEqual(
+            vision._two_panel_graph_labels("(a) Sample 10 (b) Sample 7"),
+            ["a", "b"],
+        )
+        clips = vision._side_by_side_panel_clips(Rect(20, 40, 580, 250))
+        self.assertEqual(
+            [(clip.x0, clip.x1) for clip in clips],
+            [(20, 300.0), (300.0, 580)],
         )
 
     def test_overlapping_regions_are_evidence_not_ownership(self):

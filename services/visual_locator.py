@@ -68,9 +68,29 @@ def _lexical_relevance(question: str, caption: str) -> float:
             for other in caption_tokens if len(other) >= 5
         )
     }
-    return (len(exact) + len(fuzzy)) / math.sqrt(
-        len(question_tokens) * len(caption_tokens)
-    )
+    matched = len(exact) + len(fuzzy)
+    # Caption length should not dilute a strong match to the user's distinctive
+    # terms. Long scientific captions routinely contain the few decisive words.
+    coverage = matched / len(question_tokens)
+    cosine = matched / math.sqrt(len(question_tokens) * len(caption_tokens))
+    return 0.7 * coverage + 0.3 * cosine
+
+
+def _unique_caption_coverage(question: str, captions: list[str]) -> list[float]:
+    """Measure question terms that distinguish one candidate caption."""
+    question_tokens = _tokens(question)
+    caption_tokens = [_tokens(caption) for caption in captions]
+    if not question_tokens:
+        return [0.0] * len(captions)
+    frequencies = {
+        token: sum(token in tokens for tokens in caption_tokens)
+        for token in question_tokens
+    }
+    return [
+        sum(token in tokens and frequencies[token] == 1 for token in question_tokens)
+        / len(question_tokens)
+        for tokens in caption_tokens
+    ]
 
 
 def _embedding_relevance(question: str, captions: list[str], embedder=None) -> list[float]:
@@ -232,31 +252,49 @@ def resolve_visual_target(
             deduplicated[key] = candidate
     candidates = list(deduplicated.values())
     captions = [candidate.get("caption", "") for candidate in candidates]
-    relevance = _embedding_relevance(question, captions, embedder)
+    embedding_relevance = _embedding_relevance(question, captions, embedder)
+    lexical_relevance = [_lexical_relevance(question, caption) for caption in captions]
+    relevance = [
+        max(embedding_score, lexical_score)
+        for embedding_score, lexical_score in zip(
+            embedding_relevance, lexical_relevance
+        )
+    ]
+    unique_coverage = _unique_caption_coverage(question, captions)
     selected_name = Path(selected_pdf).name if selected_pdf else None
     previous_name = previous.get("pdf_name") if previous else None
     source_stems = {Path(name).stem.casefold() for name in (current_source_names or [])}
     scored = []
-    for candidate, caption_score in zip(candidates, relevance):
+    for candidate, caption_score, unique_score in zip(
+        candidates, relevance, unique_coverage
+    ):
         score = 0.78 if candidate["match_kind"] == "caption" else 0.46
         reasons = ["exact caption identifier" if candidate["match_kind"] == "caption" else "exact in-page reference"]
         if _question_names_pdf(question, candidate["pdf_name"]):
-            score += 0.35
+            score += 0.50
             reasons.append("PDF named in question")
         if selected_name and candidate["pdf_name"].casefold() == selected_name.casefold():
-            score += 0.14
+            score += 0.04
             reasons.append("selected PDF preference")
         if previous_name and candidate["pdf_name"].casefold() == str(previous_name).casefold():
-            score += 0.12
+            score += 0.04
             reasons.append("previous visual PDF")
         if Path(candidate["pdf_name"]).stem.casefold() in source_stems:
-            score += 0.07
+            score += 0.02
             reasons.append("conversation source context")
-        score += min(0.18, caption_score * 0.18)
+        score += min(0.30, caption_score * 0.30)
         if caption_score:
             reasons.append("caption relevance")
-        scored.append({**candidate, "score": min(1.0, score), "score_reasons": reasons})
-    scored.sort(key=lambda row: (-row["score"], row["pdf_name"].casefold(), row["page_number"]))
+        score += min(0.15, unique_score * 0.15)
+        if unique_score:
+            reasons.append("distinctive caption terms")
+        scored.append({
+            **candidate,
+            "rank_score": score,
+            "score": min(1.0, score),
+            "score_reasons": reasons,
+        })
+    scored.sort(key=lambda row: (-row["rank_score"], row["pdf_name"].casefold(), row["page_number"]))
     top = scored[0]
     second = scored[1] if len(scored) > 1 else None
     public_candidates = [
@@ -270,7 +308,7 @@ def resolve_visual_target(
         for row in scored
     ]
     if second and top["pdf_name"] != second["pdf_name"] and (
-        top["score"] - second["score"] < AMBIGUITY_MARGIN
+        top["rank_score"] - second["rank_score"] < AMBIGUITY_MARGIN
     ):
         return VisualResolution(
             status="ambiguous",

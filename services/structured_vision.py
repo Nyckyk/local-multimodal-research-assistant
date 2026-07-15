@@ -1,10 +1,12 @@
 import json
+import math
 import re
 import time
 import unicodedata
 from html import unescape
 from pathlib import Path
 
+import fitz
 import ollama
 
 from settings import VISION_MODEL
@@ -13,6 +15,7 @@ STRUCTURED_NUM_PREDICT = 1800
 COMPACT_PANEL_NUM_PREDICT = 650
 COMPACT_COMPARISON_NUM_PREDICT = 350
 AXIS_LABEL_NUM_PREDICT = 220
+NYQUIST_FIT_NUM_PREDICT = 260
 VISUAL_TYPES = {"labelled_diagram", "graph", "table"}
 VISUAL_IDENTIFIER_PATTERN = r"(?:[A-Za-z]\.)?\d+(?:\.\d+)?|[A-Za-z]\d+"
 
@@ -244,7 +247,14 @@ def build_structured_prompt(
             "For model-versus-experimental plots, describe the overall visual fit quality "
             "for every panel before comparing which fit is closer. Identify where each "
             "panel's largest visible deviation occurs using left/right or Re(Z), even when "
-            "the overall fit is good."
+            "the overall fit is good. Use the exact panel sample/group as the subject of "
+            "fit and deviation comparisons, not a generic phrase such as fit quality. "
+            "Compare closeness using the largest visible model-data separation divided by "
+            "that panel's displayed y-axis range, not raw separation between differently "
+            "scaled panels. "
+            "Do not call a fit excellent, perfect, or superimposed across the entire range "
+            "when a visible deviation remains. Apply each scientific multiplier to the "
+            "numeric y-axis tick range reported in visible_range."
         ),
         "table": (
             "Transcribe columns and rows in display order. Repeat visually merged group "
@@ -322,7 +332,11 @@ def _normal_name(value) -> str:
     return re.sub(r"[^a-z0-9]+", "", compatible.lower())
 
 
-def _validate_circuit_topology(topology: dict, component_names: set[str]) -> None:
+def _validate_circuit_topology(
+    topology: dict,
+    component_names: set[str],
+    physiological_labels: set[str] | None = None,
+) -> None:
     _require_keys(
         topology,
         {"nodes", "edges", "branches", "parallel_branch_sets"},
@@ -334,10 +348,31 @@ def _validate_circuit_topology(topology: dict, component_names: set[str]) -> Non
     ):
         raise StructuredOutputError("Circuit topology fields must be lists.")
 
+    physiological_labels = {
+        label for label in (physiological_labels or set()) if len(label) >= 3
+    }
     node_ids = []
     for node in topology["nodes"]:
-        if not isinstance(node, dict) or not isinstance(node.get("id"), str):
+        if (
+            not isinstance(node, dict)
+            or not isinstance(node.get("id"), str)
+            or not node["id"].strip()
+        ):
             raise StructuredOutputError("Each circuit node needs a string id.")
+        node_text = _normal_name(
+            f"{node['id']} {node.get('label', '') if isinstance(node.get('label'), str) else ''}"
+        )
+        for label in physiological_labels:
+            concept_node_forms = {
+                label,
+                f"{label}node", f"node{label}",
+                f"{label}terminal", f"terminal{label}",
+                f"{label}junction", f"junction{label}",
+            }
+            if any(form in node_text for form in concept_node_forms):
+                raise StructuredOutputError(
+                    "Physiological labels cannot be used as electrical circuit nodes."
+                )
         node_ids.append(node["id"])
     if len(set(node_ids)) != len(node_ids):
         raise StructuredOutputError("Circuit node ids must be unique.")
@@ -362,6 +397,7 @@ def _validate_circuit_topology(topology: dict, component_names: set[str]) -> Non
         edges_by_component[component_key] = edge
 
     branches = {}
+    branch_component_keys = set()
     for branch in topology["branches"]:
         if not isinstance(branch, dict):
             raise StructuredOutputError("Each circuit branch must be an object.")
@@ -381,9 +417,11 @@ def _validate_circuit_topology(topology: dict, component_names: set[str]) -> Non
         # between the branch's declared wire junctions.
         current = branch["start_node"]
         for component in branch["components"]:
-            edge = edges_by_component.get(_normal_name(component))
+            component_key = _normal_name(component)
+            edge = edges_by_component.get(component_key)
             if edge is None:
                 raise StructuredOutputError("A circuit branch references an unknown edge component.")
+            branch_component_keys.add(component_key)
             endpoints = {edge["from_node"], edge["to_node"]}
             if current not in endpoints:
                 raise StructuredOutputError("Circuit branch components do not form a continuous path.")
@@ -391,6 +429,15 @@ def _validate_circuit_topology(topology: dict, component_names: set[str]) -> Non
         if current != branch["end_node"]:
             raise StructuredOutputError("A circuit branch does not end at its declared junction.")
         branches[branch["id"]] = branch
+
+    if branch_component_keys != set(edges_by_component):
+        raise StructuredOutputError(
+            "Every circuit edge component must belong to a declared branch."
+        )
+    if component_names and set(edges_by_component) != component_names:
+        raise StructuredOutputError(
+            "Every declared electrical component must have exactly one circuit edge."
+        )
 
     for branch_set in topology["parallel_branch_sets"]:
         if not isinstance(branch_set, list) or len(branch_set) < 2:
@@ -417,6 +464,9 @@ def _explicit_series_pairs(evidence_text: str) -> list[tuple[str, str]]:
         r"(?:\w+[\s-]+){0,3}([A-Za-z][A-Za-z0-9_]*)",
         r"series[^()]{0,80}\(([A-Za-z][A-Za-z0-9_]*),\s*"
         r"([A-Za-z][A-Za-z0-9_]*)\)",
+        r"([A-Za-z][A-Za-z0-9_]*)\s+and\s+"
+        r"([A-Za-z][A-Za-z0-9_]*)\s+(?:form|forms|are|make|comprise)"
+        r"[^.]{0,40}\bseries\b",
     )
     for pattern in patterns:
         pairs.extend(re.findall(pattern, evidence_text, re.IGNORECASE))
@@ -435,7 +485,8 @@ def _explicit_parallel_pairs(evidence_text: str) -> list[tuple[str, str]]:
     for multiplication_sign in ("⋅", "·"):
         formula = formula.replace(multiplication_sign, "*")
     pattern = re.compile(
-        r"([A-Za-z][A-Za-z0-9_]*)\*([A-Za-z][A-Za-z0-9_]*)/\(?\1\+\2\)?",
+        r"\(?([A-Za-z][A-Za-z0-9_]*)\*([A-Za-z][A-Za-z0-9_]*)\)?"
+        r"/\(?\1\+\2\)?",
         re.IGNORECASE,
     )
     pairs.extend(pattern.findall(formula))
@@ -514,6 +565,17 @@ def ground_circuit_topology_from_evidence(value: dict, evidence_text: str) -> di
         "parallel_branch_sets": [["direct_branch", "series_branch"]],
     }
     corrected = dict(value)
+    corrected["components"] = [
+        {
+            **component,
+            "description": re.sub(
+                r"\s*\([A-Z][A-Z0-9_-]{1,7}\)\s*", " ",
+                str(component.get("description", "")),
+            ).strip(),
+        }
+        if isinstance(component, dict) else component
+        for component in value.get("components", [])
+    ]
     corrected["circuit_topology"] = topology
     stable_references = set(component_display)
     stable_references.update(
@@ -598,7 +660,11 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
     if diagram_kind == "circuit":
         if not isinstance(value["circuit_topology"], dict):
             raise StructuredOutputError("Circuit diagrams require circuit_topology.")
-        _validate_circuit_topology(value["circuit_topology"], component_names)
+        _validate_circuit_topology(
+            value["circuit_topology"],
+            component_names,
+            set(label_names).difference(component_names),
+        )
         for first, second in _explicit_series_pairs(evidence_text):
             expected = {_normal_name(first), _normal_name(second)}
             matching = [
@@ -671,6 +737,17 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
         if not isinstance(connection, dict):
             raise StructuredOutputError("Each diagram connection must be an object.")
         _require_keys(connection, {"from", "to", "relationship"}, "Diagram connection")
+        if diagram_kind != "circuit":
+            for field in ("from", "to"):
+                endpoint = str(connection[field]).strip()
+                base = re.sub(
+                    r"\s*\((?:microscopic|schematic|histological|diagram|image|left|right)\)\s*$",
+                    "",
+                    endpoint,
+                    flags=re.IGNORECASE,
+                ).strip()
+                if base != endpoint and _normal_name(base) in valid_references:
+                    connection[field] = base
         endpoints = {_normal_name(connection["from"]), _normal_name(connection["to"])}
         unknown = endpoints.difference(valid_references)
         if diagram_kind != "circuit":
@@ -721,6 +798,63 @@ def _power_of_ten_tick(label) -> int | None:
     translated = text.translate(_SUPERSCRIPT_TRANSLATION)
     match = re.fullmatch(r"10(?:\^|\*\*)?([-+]?\d+)", translated)
     return int(match.group(1)) if match else None
+
+
+def _scientific_multiplier_factor(multiplier) -> float | None:
+    if multiplier is None or str(multiplier).strip().lower() in {"", "none", "null"}:
+        return 1.0
+    text = unicodedata.normalize("NFKC", str(multiplier))
+    text = text.replace("×", "x").replace("Ã—", "x").replace(" ", "")
+    match = re.fullmatch(r"[x*]?10(?:\^|\*\*)?([-+]?\d+)", text, re.IGNORECASE)
+    return 10.0 ** int(match.group(1)) if match else None
+
+
+def _visible_numeric_axis_range(axis: dict) -> tuple[float, float] | None:
+    ticks = [_numeric_tick(label) for label in axis.get("tick_labels", [])]
+    factor = _scientific_multiplier_factor(axis.get("scientific_multiplier"))
+    if factor is None or len(ticks) < 2 or any(value is None for value in ticks):
+        return None
+    values = [float(value) * factor for value in ticks]
+    return min(values), max(values)
+
+
+def _validate_nyquist_panel(panel: dict) -> None:
+    group = str(panel.get("group", "")).strip()
+    if not group:
+        raise StructuredOutputError("Each Nyquist panel needs a sample/group identity.")
+    series_text = " ".join(map(str, panel.get("series", []))).casefold()
+    fit_text = " ".join(
+        map(str, [*panel.get("shape_features", []), *panel.get("visible_trends", [])])
+    )
+    model_and_data = "data" in series_text and "model" in series_text
+    if model_and_data:
+        if not re.search(
+            r"\b(?:good|close|closely|near|follow|fit|overlaid)\b",
+            fit_text,
+            re.IGNORECASE,
+        ):
+            raise StructuredOutputError(
+                "Each model-versus-data Nyquist panel needs a visible fit-quality description."
+            )
+        if not re.search(r"\bgood\b", fit_text, re.IGNORECASE):
+            panel["visible_trends"].append(
+                "The data and model show a good overall fit."
+            )
+            fit_text += " The data and model show a good overall fit."
+    y_range = _visible_numeric_axis_range(panel["y_axis"])
+    visible = panel["visible_range"]
+    if y_range and isinstance(visible.get("min"), (int, float)) and isinstance(
+        visible.get("max"), (int, float)
+    ):
+        expected_min, expected_max = y_range
+        tolerance = max(1e-9, abs(expected_max - expected_min) * 0.08)
+        if not (
+            math.isclose(float(visible["min"]), expected_min, abs_tol=tolerance)
+            and math.isclose(float(visible["max"]), expected_max, abs_tol=tolerance)
+        ):
+            raise StructuredOutputError(
+                "Nyquist visible_range must apply the y-axis scientific multiplier."
+            )
 
 
 def infer_axis_scale(tick_labels: list, scientific_multiplier=None) -> str:
@@ -856,6 +990,18 @@ def _validate_comparison(
     relation = str(comparison["relation"]).lower()
     metric = str(comparison["metric"]).lower()
     subject = str(comparison["subject"]).strip().lower()
+    panel_subjects = {
+        str(panel.get("group", "")).strip().lower()
+        for panel in panels if panel.get("group")
+    }
+    if (
+        re.search(r"\b(?:fit|deviation|mismatch)\b", metric, re.IGNORECASE)
+        and subject not in panel_subjects
+        and not comparison["uncertain"]
+    ):
+        raise StructuredOutputError(
+            "Fit/deviation comparisons must name a visible panel sample or group."
+        )
     text_subjects = _explicit_text_subjects(evidence_text, relation, metric)
     if text_subjects:
         if subject in text_subjects:
@@ -916,6 +1062,14 @@ def validate_graph(value: dict, evidence_text: str = "") -> dict:
             },
             "Graph panel",
         )
+        if not panel.get("group"):
+            combined_identity = re.fullmatch(
+                r"\s*\(?([A-Za-z0-9]+)\)?\s+(.+?)\s*",
+                str(panel.get("panel", "")),
+            )
+            if combined_identity:
+                panel["panel"] = combined_identity.group(1)
+                panel["group"] = combined_identity.group(2)
         _validate_axis(panel["x_axis"], str(panel["panel"]), "x")
         _validate_axis(panel["y_axis"], str(panel["panel"]), "y")
         if not all(
@@ -923,6 +1077,11 @@ def validate_graph(value: dict, evidence_text: str = "") -> dict:
             for key in ("series", "shape_features", "visible_trends")
         ):
             raise StructuredOutputError("Graph series, shapes and trends must be lists.")
+        complexity = panel["complexity_score"]
+        if not isinstance(complexity, (int, float)) or isinstance(complexity, bool):
+            raise StructuredOutputError("Graph complexity must be numeric.")
+        if not math.isfinite(float(complexity)) or not 0 <= complexity <= 1:
+            raise StructuredOutputError("Graph complexity must be between 0 and 1.")
         _range_score(panel)
     if not isinstance(value["comparisons"], list) or not isinstance(value["uncertain_values"], list):
         raise StructuredOutputError("Graph comparison/uncertainty fields are invalid.")
@@ -936,6 +1095,64 @@ def validate_graph(value: dict, evidence_text: str = "") -> dict:
         or "re(z)" in str(panel.get("x_axis", {}).get("label", "")).lower().replace(" ", "")
         for panel in value["panels"]
     )
+    if is_nyquist:
+        panel_ids = [_normal_name(panel.get("panel", "")) for panel in value["panels"]]
+        panel_groups = [
+            _normal_name(panel.get("group", "")) for panel in value["panels"]
+        ]
+        if len(panel_ids) != len(set(panel_ids)) or len(panel_groups) != len(set(panel_groups)):
+            raise StructuredOutputError(
+                "Nyquist panel identifiers and sample/group identities must be unique."
+            )
+        for panel in value["panels"]:
+            _validate_nyquist_panel(panel)
+        deviation_subjects = {
+            str(comparison.get("subject", "")).strip().lower()
+            for comparison in value["comparisons"]
+            if re.search(
+                r"\b(?:deviation|mismatch)\b",
+                f"{comparison.get('metric', '')} {comparison.get('claim', '')}",
+                re.IGNORECASE,
+            )
+        }
+        for panel in value["panels"]:
+            fit_text = " ".join(
+                map(str, [*panel["shape_features"], *panel["visible_trends"]])
+            )
+            has_located_deviation = bool(re.search(
+                r"\b(?:deviation|mismatch|separation)\w*\b[^.]{0,90}"
+                r"\b(?:left|right|low|high)\b|"
+                r"\b(?:left|right|low|high)\b[^.]{0,90}"
+                r"\b(?:deviation|mismatch|separation)\w*\b",
+                fit_text,
+                re.IGNORECASE,
+            ))
+            if (
+                str(panel.get("group", "")).strip().lower() not in deviation_subjects
+                and not has_located_deviation
+            ):
+                continue
+            if re.search(
+                r"\b(?:excellent|perfect(?:ly)?|superimposed|indistinguishable)\b"
+                r"[^.]{0,70}\b(?:entire|whole|throughout)\b[^.]{0,30}"
+                r"\b(?:arc|plot|range)\b",
+                fit_text,
+                re.IGNORECASE,
+            ):
+                raise StructuredOutputError(
+                    "Nyquist fit language contradicts a reported visible deviation."
+                )
+        if value["frequency_direction_evidence"] and not all(
+            re.search(
+                r"\b(?:arrow|frequency\s+label|caption|explicit\s+text)\b",
+                str(item),
+                re.IGNORECASE,
+            )
+            for item in value["frequency_direction_evidence"]
+        ):
+            raise StructuredOutputError(
+                "Nyquist frequency direction evidence needs arrows, labels or explicit text."
+            )
     if is_nyquist and not value["frequency_direction_evidence"]:
         prose = " ".join(
             [trend for panel in value["panels"] for trend in panel["visible_trends"]]
@@ -1003,16 +1220,357 @@ def _call_model(
     prompt: str,
     num_predict: int = STRUCTURED_NUM_PREDICT,
 ) -> str:
-    response = _chat_with_runner_retry(
-        model=VISION_MODEL,
-        messages=[{"role": "user", "content": prompt, "images": [str(image_path)]}],
-        format="json",
-        options={"temperature": 0, "num_ctx": 8192, "num_predict": num_predict},
+    arguments = {
+        "model": VISION_MODEL,
+        "messages": [{
+            "role": "user", "content": prompt, "images": [str(image_path)],
+        }],
+        "format": "json",
+        "options": {
+            "temperature": 0, "num_ctx": 8192, "num_predict": num_predict,
+        },
+    }
+    for _ in range(2):
+        raw = _response_text(_chat_with_runner_retry(**arguments))
+        if raw:
+            return raw
+    raise StructuredOutputError("Vision model returned an empty response twice.")
+
+
+def _nyquist_fit_verification_prompt(panel: dict) -> str:
+    return f"""
+Analyse only this single Nyquist panel, identified as panel
+{panel.get('panel')} ({panel.get('group')}). Ignore any legend sample marker.
+Compare the experimental data markers with the fitted model curve. Estimate
+the largest visible vertical model-data separation separately in the left and
+right halves of the plotted x range. Express each as a fraction of the full
+displayed y-axis span, so 0.05 means five percent of that panel's y range.
+Compare blue data-marker centres against the orange dashed curve, not marker
+arms. Inspect the descending high-Re(Z) endpoint. Left means low Re(Z); right
+means high Re(Z). Do not round a visible nonzero separation down to zero.
+Do not compare this panel with another image and do not use its scientific
+multiplier or raw impedance magnitude as a fit-quality proxy.
+
+Return JSON only:
+{{
+  "panel": "{panel.get('panel')}",
+  "group": "{panel.get('group')}",
+  "left_normalized_largest_deviation": 0.0,
+  "right_normalized_largest_deviation": 0.0,
+  "confidence": 0.0
+}}
+"""
+
+
+def _cluster_nearby_pixels(
+    points: set[tuple[int, int]], radius: int = 2
+) -> list[list[tuple[int, int]]]:
+    remaining = set(points)
+    components = []
+    while remaining:
+        start = remaining.pop()
+        component = [start]
+        pending = [start]
+        while pending:
+            x, y = pending.pop()
+            for near_x in range(x - radius, x + radius + 1):
+                for near_y in range(y - radius, y + radius + 1):
+                    neighbour = (near_x, near_y)
+                    if neighbour in remaining:
+                        remaining.remove(neighbour)
+                        component.append(neighbour)
+                        pending.append(neighbour)
+        components.append(component)
+    return components
+
+
+def _colored_nyquist_fit_reading(
+    image_path: Path, panel: dict
+) -> dict | None:
+    """Measure blue-marker/orange-curve separation when those pixels are visible."""
+    try:
+        pixmap = fitz.Pixmap(str(image_path))
+    except Exception:
+        return None
+    if pixmap.n < 3 or pixmap.width < 80 or pixmap.height < 80:
+        return None
+    width, height, channels = pixmap.width, pixmap.height, pixmap.n
+    samples = pixmap.samples
+    blue_points: set[tuple[int, int]] = set()
+    orange_by_x: dict[int, list[int]] = {}
+    for y in range(height):
+        row_offset = y * width * channels
+        for x in range(width):
+            offset = row_offset + x * channels
+            red, green, blue = samples[offset:offset + 3]
+            if (
+                blue > 130 and green > 60
+                and blue > red + 20 and blue > green + 15
+            ):
+                blue_points.add((x, y))
+            if (
+                red > 160 and red > green + 35
+                and green > 30 and blue < 180
+            ):
+                orange_by_x.setdefault(x, []).append(y)
+    if len(blue_points) < 80 or sum(map(len, orange_by_x.values())) < 80:
+        return None
+
+    centres = []
+    for component in _cluster_nearby_pixels(blue_points):
+        if not 1 <= len(component) <= 160:
+            continue
+        x = sum(point[0] for point in component) / len(component)
+        y = sum(point[1] for point in component) / len(component)
+        if not (
+            width * 0.06 < x < width * 0.95
+            and height * 0.06 < y < height * 0.86
+        ):
+            continue
+        # Scientific plots commonly place the legend in the upper-right.
+        # Exclude only that compact corner; the descending curve remains below it.
+        if x > width * 0.72 and y < height * 0.22:
+            continue
+        nearest_squared = None
+        for orange_x in range(max(0, int(x) - 24), min(width, int(x) + 25)):
+            for orange_y in orange_by_x.get(orange_x, []):
+                distance_squared = (orange_x - x) ** 2 + (orange_y - y) ** 2
+                if nearest_squared is None or distance_squared < nearest_squared:
+                    nearest_squared = distance_squared
+        if nearest_squared is not None and nearest_squared <= 24 ** 2:
+            centres.append((x, math.sqrt(nearest_squared)))
+    if len(centres) < 12:
+        return None
+    x_values = [item[0] for item in centres]
+    midpoint = (min(x_values) + max(x_values)) / 2
+    left = [distance for x, distance in centres if x < midpoint]
+    right = [distance for x, distance in centres if x >= midpoint]
+    if len(left) < 4 or len(right) < 4:
+        return None
+    left_score = sum(left) / len(left) / height
+    right_score = sum(right) / len(right) / height
+    return {
+        "panel": panel.get("panel"),
+        "group": panel.get("group"),
+        "left_normalized_largest_deviation": left_score,
+        "right_normalized_largest_deviation": right_score,
+        "confidence": min(0.95, 0.70 + len(centres) / 200),
+    }
+
+
+def _validate_nyquist_fit_reading(
+    value: dict, expected_panel: dict
+) -> dict:
+    _require_keys(
+        value,
+        {
+            "panel", "group", "left_normalized_largest_deviation",
+            "right_normalized_largest_deviation", "confidence",
+        },
+        "Nyquist fit verification",
     )
-    raw = _response_text(response)
-    if not raw:
-        raise StructuredOutputError("Vision model returned an empty response.")
-    return raw
+    if _normal_name(value["panel"]) != _normal_name(expected_panel["panel"]):
+        raise StructuredOutputError("Nyquist fit verification returned the wrong panel.")
+    if _normal_name(value["group"]) != _normal_name(expected_panel["group"]):
+        raise StructuredOutputError("Nyquist fit verification returned the wrong group.")
+    left_score = value["left_normalized_largest_deviation"]
+    right_score = value["right_normalized_largest_deviation"]
+    confidence = value["confidence"]
+    for score in (left_score, right_score):
+        if (
+            not isinstance(score, (int, float))
+            or isinstance(score, bool)
+            or not math.isfinite(float(score))
+            or not 0 <= score <= 1
+        ):
+            raise StructuredOutputError(
+                "Nyquist normalized deviations must be numbers between 0 and 1."
+            )
+    if (
+        not isinstance(confidence, (int, float))
+        or isinstance(confidence, bool)
+        or not math.isfinite(float(confidence))
+        or not 0 <= confidence <= 1
+    ):
+        raise StructuredOutputError(
+            "Nyquist fit verification confidence must be between 0 and 1."
+        )
+    left_score, right_score = float(left_score), float(right_score)
+    largest = max(left_score, right_score)
+    gap = abs(left_score - right_score)
+    value["normalized_largest_deviation"] = largest
+    value["largest_deviation_side"] = (
+        "uncertain"
+        if gap < 0.002 or gap / max(largest, 1e-9) < 0.10
+        else "left" if left_score > right_score else "right"
+    )
+    return value
+
+
+def _replace_nyquist_fit_comparison(
+    value: dict,
+    readings: list[dict],
+    *,
+    force_uncertain: bool = False,
+) -> None:
+    panels_by_id = {
+        _normal_name(panel.get("panel", "")): panel for panel in value["panels"]
+    }
+    ordered = [
+        (panels_by_id[_normal_name(reading["panel"])], reading)
+        for reading in readings
+        if _normal_name(reading["panel"]) in panels_by_id
+    ]
+    if len(ordered) < 2:
+        force_uncertain = True
+        ordered = [(panel, {}) for panel in value["panels"][:2]]
+    groups = [str(panel.get("group", "")).strip() for panel, _ in ordered]
+    for panel, reading in ordered:
+        side = reading.get("largest_deviation_side")
+        if side not in {"left", "right"}:
+            continue
+        for field in ("shape_features", "visible_trends"):
+            panel[field] = [
+                text for text in panel[field]
+                if not re.search(
+                    r"\b(?:excellent|perfect(?:ly)?|superimposed|indistinguishable)\b"
+                    r"[^.]{0,70}\b(?:entire|whole|throughout)\b[^.]{0,30}"
+                    r"\b(?:arc|plot|range)\b",
+                    str(text),
+                    re.IGNORECASE,
+                )
+            ]
+        location = "high Re(Z)" if side == "right" else "low Re(Z)"
+        panel["visible_trends"].append(
+            f"The largest visible model-data deviation is on the {side} side "
+            f"at {location}."
+        )
+    comparisons = [
+        item for item in value["comparisons"]
+        if not re.search(
+            r"\b(?:closer|better)\b.{0,30}\bfit\b|\bfit\b.{0,30}\b(?:closer|better)\b",
+            f"{item.get('claim', '')} {item.get('metric', '')}",
+            re.IGNORECASE,
+        )
+    ]
+    scores = [
+        float(reading["normalized_largest_deviation"])
+        for _, reading in ordered if "normalized_largest_deviation" in reading
+    ]
+    confidences = [
+        float(reading["confidence"])
+        for _, reading in ordered if "confidence" in reading
+    ]
+    if len(scores) >= 2:
+        low, next_low = sorted(scores)[:2]
+        gap = next_low - low
+        relative_gap = gap / max(next_low, 1e-9)
+    else:
+        gap = relative_gap = 0.0
+    uncertain = (
+        force_uncertain
+        or len(scores) < 2
+        or len(confidences) < 2
+        or min(confidences) < 0.65
+        or gap < 0.02
+        or relative_gap < 0.10
+    )
+    if uncertain:
+        claim = (
+            "The relative visual fit is too close to distinguish reliably between "
+            + " and ".join(groups)
+            + "."
+        )
+        comparison = {
+            "claim": claim,
+            "subject": groups[0],
+            "relation": "other",
+            "metric": "normalized largest model-data deviation",
+            "evidence": ["vision"],
+            "confidence": min(confidences) if confidences else 0.0,
+            "uncertain": True,
+            "evidence_conflict": False,
+        }
+        note = "Relative Nyquist fit closeness could not be distinguished reliably."
+        if note not in value["uncertain_values"]:
+            value["uncertain_values"].append(note)
+    else:
+        best_index = min(
+            range(len(ordered)),
+            key=lambda index: float(
+                ordered[index][1]["normalized_largest_deviation"]
+            ),
+        )
+        best_group = groups[best_index]
+        other_groups = [group for index, group in enumerate(groups) if index != best_index]
+        comparison = {
+            "claim": (
+                f"{best_group} appears to have a slightly closer visual fit than "
+                + " and ".join(other_groups)
+                + "."
+            ),
+            "subject": best_group,
+            "relation": "lowest",
+            "metric": "normalized largest model-data deviation",
+            "evidence": ["vision"],
+            "confidence": min(confidences),
+            "uncertain": False,
+            "evidence_conflict": False,
+        }
+    value["comparisons"] = [*comparisons, comparison]
+
+
+def verify_nyquist_fit_comparison(
+    value: dict,
+    panel_images: list[tuple[str, Path]],
+    evidence_text: str = "",
+) -> tuple[dict, list[str], str]:
+    """Ground a two-panel fit comparison in independent tight-crop readings."""
+    panels_by_id = {
+        _normal_name(panel.get("panel", "")): panel
+        for panel in value.get("panels", [])
+        if str(panel.get("graph_kind", "")).casefold() == "nyquist"
+    }
+    if len(panels_by_id) != 2 or len(panel_images) != 2:
+        return value, [], "not_applicable"
+    raw_responses = []
+    readings = []
+    verification_error = ""
+    for panel_id, image_path in panel_images:
+        panel = panels_by_id.get(_normal_name(panel_id))
+        if panel is None and len(readings) < len(panels_by_id):
+            panel = sorted(
+                panels_by_id.values(),
+                key=lambda item: _normal_name(item.get("panel", "")),
+            )[len(readings)]
+        if panel is None:
+            verification_error = "tight crop did not match a validated panel"
+            break
+        pixel_reading = _colored_nyquist_fit_reading(image_path, panel)
+        raw = (
+            json.dumps(pixel_reading)
+            if pixel_reading is not None
+            else _call_model(
+                image_path,
+                _nyquist_fit_verification_prompt(panel),
+                num_predict=NYQUIST_FIT_NUM_PREDICT,
+            )
+        )
+        raw_responses.append(raw)
+        try:
+            readings.append(_validate_nyquist_fit_reading(
+                parse_json_response(raw), panel
+            ))
+        except StructuredOutputError as error:
+            verification_error = str(error)
+            break
+    _replace_nyquist_fit_comparison(
+        value,
+        readings,
+        force_uncertain=bool(verification_error),
+    )
+    validate_graph(value, evidence_text)
+    return value, raw_responses, verification_error or "verified"
 
 
 def _call_model_images(
@@ -1020,20 +1578,23 @@ def _call_model_images(
     prompt: str,
     num_predict: int,
 ) -> str:
-    response = _chat_with_runner_retry(
-        model=VISION_MODEL,
-        messages=[{
+    arguments = {
+        "model": VISION_MODEL,
+        "messages": [{
             "role": "user",
             "content": prompt,
             "images": [str(path) for path in image_paths],
         }],
-        format="json",
-        options={"temperature": 0, "num_ctx": 8192, "num_predict": num_predict},
-    )
-    raw = _response_text(response)
-    if not raw:
-        raise StructuredOutputError("Vision model returned an empty response.")
-    return raw
+        "format": "json",
+        "options": {
+            "temperature": 0, "num_ctx": 8192, "num_predict": num_predict,
+        },
+    }
+    for _ in range(2):
+        raw = _response_text(_chat_with_runner_retry(**arguments))
+        if raw:
+            return raw
+    raise StructuredOutputError("Vision model returned an empty response twice.")
 
 
 def _compact_panel_prompt(
@@ -1215,6 +1776,30 @@ def validate_compact_comparison(value: dict, panels: list[dict]) -> dict:
     return value
 
 
+def _consensus_panel_scale(panels: list[dict], axis_name: str, kind: str = "") -> str:
+    scales = {
+        str(panel.get(axis_name, {}).get("scale", "unknown")).lower()
+        for panel in panels
+        if not kind or kind in str(panel.get("graph_kind", "")).lower()
+    }
+    scales.discard("unknown")
+    return next(iter(scales)) if len(scales) == 1 else "unknown"
+
+
+def _merge_shared_axis_reading(panel_axis: dict, shared_axis: dict) -> dict:
+    """Apply a shared label/unit reread without overwriting panel scale."""
+    merged = dict(panel_axis)
+    for field in ("label", "unit"):
+        value = shared_axis.get(field)
+        if isinstance(value, str) and value.strip():
+            merged[field] = value
+    if str(merged.get("scale", "unknown")).lower() == "unknown":
+        shared_scale = str(shared_axis.get("scale", "unknown")).lower()
+        if shared_scale in {"linear", "log"}:
+            merged["scale"] = shared_scale
+    return merged
+
+
 def _compact_comparison_prompt(panels: list[dict], evidence_text: str) -> str:
     observations = [
         {
@@ -1393,10 +1978,23 @@ def analyse_compact_multi_panel_graph(
             and isinstance(comparison_candidate.get("x_axis"), dict)
             and isinstance(comparison_candidate.get("magnitude_y_axis"), dict)
         ):
+            x_scale = _consensus_panel_scale(panels, "x_axis")
+            magnitude_scale = _consensus_panel_scale(
+                panels, "y_axis", "magnitude"
+            )
+            if x_scale != "unknown":
+                comparison_candidate["x_axis"]["scale"] = x_scale
+            if magnitude_scale != "unknown":
+                comparison_candidate["magnitude_y_axis"]["scale"] = magnitude_scale
             for panel in panels:
-                panel["x_axis"] = dict(comparison_candidate["x_axis"])
+                panel["x_axis"] = _merge_shared_axis_reading(
+                    panel["x_axis"], comparison_candidate["x_axis"]
+                )
                 if "magnitude" in str(panel["graph_kind"]).lower():
-                    panel["y_axis"] = dict(comparison_candidate["magnitude_y_axis"])
+                    panel["y_axis"] = _merge_shared_axis_reading(
+                        panel["y_axis"],
+                        comparison_candidate["magnitude_y_axis"],
+                    )
         comparison = validate_compact_comparison(comparison_candidate, panels)
     except StructuredOutputError as error:
         if debug_info is not None:
@@ -1441,10 +2039,19 @@ def analyse_compact_multi_panel_graph(
 
 
 def _repair_prompt(visual_type: str, raw: str, error: str) -> str:
+    graph_rules = (
+        "For Nyquist panels, reread each panel marker and sample label, apply axis "
+        "multipliers to visible_range, describe both fits, and locate deviations using "
+        "left/right or low/high Re(Z). A fit/deviation comparison subject must be the "
+        "visible sample/group. Do not infer frequency direction without visible arrows "
+        "or labels, and do not claim a perfect entire-range fit when deviations remain."
+        if visual_type == "graph" else ""
+    )
     return f"""
 Repair the following malformed {visual_type} response. Return exactly one JSON
 object matching the schema, with no fences or explanation. Preserve only
 information already present; use null or "unreadable" instead of inventing data.
+{graph_rules}
 
 Schema:
 {_schema_text(visual_type)}
@@ -1454,6 +2061,26 @@ Validation error:
 
 Malformed response:
 {raw}
+"""
+
+
+def _graph_reinspection_prompt(
+    question: str, error: str, evidence_text: str
+) -> str:
+    return build_structured_prompt("graph", question, evidence_text) + f"""
+
+The prior image reading failed strict validation: {error}
+Reinspect the image from scratch; do not copy prior invalid fields. In
+particular, infer linear/log only from visible ticks, keep complexity_score
+between 0 and 1, apply scientific multipliers to visible_range, and make every
+fit/deviation comparison subject a visible panel sample or group. For Nyquist
+plots, inspect the separation between data points and the model curve at both
+leftmost and rightmost endpoints before reporting deviations as left/right or
+low/high Re(Z). Compare fit closeness by the largest visible separation divided
+by each panel's displayed y-axis range; do not compare raw separation across
+different scientific multipliers, and do not use point density as a fit proxy.
+Leave frequency direction unsupported unless an arrow or explicit frequency
+label is visible.
 """
 
 
@@ -1565,6 +2192,7 @@ def analyse_typed_image(
     question: str,
     evidence_text: str = "",
     debug_info: dict | None = None,
+    fit_verification_images: list[tuple[str, Path]] | None = None,
 ) -> str:
     prompt = build_structured_prompt(visual_type, question, evidence_text)
     circuit_context = visual_type == "labelled_diagram" and bool(re.search(
@@ -1595,6 +2223,14 @@ def analyse_typed_image(
                 image_path,
                 _topology_retry_prompt(raw, str(first_error), evidence_text),
             )
+        elif visual_type == "graph":
+            retry_kind = "targeted_graph_reinspection"
+            retry_raw = _call_model(
+                image_path,
+                _graph_reinspection_prompt(
+                    question, str(first_error), evidence_text
+                ),
+            )
         else:
             retry_raw = _call_model(
                 image_path,
@@ -1606,7 +2242,13 @@ def analyse_typed_image(
             if topology_retry:
                 candidate = dict(parsed)
                 for field in ("components", "connections", "circuit_topology", "uncertain_items"):
-                    if field in repaired:
+                    if field == "uncertain_items":
+                        continue
+                    if field in repaired and not (
+                        field in {"components", "connections"}
+                        and not repaired[field]
+                        and parsed.get(field)
+                    ):
                         candidate[field] = repaired[field]
                 repaired = candidate
             value = validate_typed_response(visual_type, repaired, evidence_text)
@@ -1650,11 +2292,32 @@ def analyse_typed_image(
                 fallback = strip_json_fences(raw)
                 return "**Unvalidated vision fallback:**\n\n" + fallback
 
+    fit_verification_raw = []
+    fit_verification_status = "not_applicable"
+    if (
+        visual_type == "graph"
+        and fit_verification_images
+        and re.search(r"\b(?:closer|better)\b.{0,30}\bfit\b|\bfit\b.{0,30}\bcloser\b", question, re.IGNORECASE)
+    ):
+        value, fit_verification_raw, fit_verification_status = (
+            verify_nyquist_fit_comparison(
+                value, fit_verification_images, evidence_text
+            )
+        )
+
     if debug_info is not None:
+        recorded_raw = raw
+        if fit_verification_raw:
+            recorded_raw += (
+                "\n\n--- TIGHT PANEL FIT VERIFICATION ---\n\n"
+                + "\n\n--- PANEL ---\n\n".join(fit_verification_raw)
+            )
         debug_info.update({
             "visual_type": visual_type,
             **({"initial_response": initial_raw} if errors else {}),
-            "raw_vision_response": raw,
+            "raw_vision_response": recorded_raw,
+            "raw_fit_verification_responses": fit_verification_raw,
+            "fit_verification_status": fit_verification_status,
             "validated_json": value,
             "validation_error": " | ".join(errors),
             "retry_kind": retry_kind if errors else "",

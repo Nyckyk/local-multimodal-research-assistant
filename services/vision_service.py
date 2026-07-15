@@ -223,6 +223,29 @@ def _multi_panel_labels(page_text: str) -> list[str]:
     return ordered if len(ordered) >= 4 and len(ordered) % 2 == 0 else []
 
 
+def _two_panel_graph_labels(page_text: str) -> list[str]:
+    """Identify a simple left-to-right pair without using the six-panel path."""
+    labels = re.findall(
+        r"\(([a-z])\)\s*(?:group|sample|panel)\b",
+        page_text,
+        re.IGNORECASE,
+    )
+    ordered = []
+    for label in labels:
+        lowered = label.lower()
+        if lowered not in ordered:
+            ordered.append(lowered)
+    return ordered if len(ordered) == 2 else []
+
+
+def _side_by_side_panel_clips(figure_clip: fitz.Rect) -> list[fitz.Rect]:
+    midpoint = figure_clip.x0 + figure_clip.width / 2
+    return [
+        fitz.Rect(figure_clip.x0, figure_clip.y0, midpoint, figure_clip.y1),
+        fitz.Rect(midpoint, figure_clip.y0, figure_clip.x1, figure_clip.y1),
+    ]
+
+
 def _graph_panel_pair_clips(figure_clip: fitz.Rect, panel_count: int) -> list[fitz.Rect]:
     row_count = panel_count // 2
     return [
@@ -248,10 +271,7 @@ def _magnitude_y_axis_label_clip(pair_clip: fitz.Rect) -> fitz.Rect:
 
 def _typed_render_scale(page: fitz.Page, clip: fitz.Rect) -> float:
     """Give small diagrams enough pixels for labels and wire junctions."""
-    if (
-        clip.width < page.rect.width * 0.6
-        and clip.height < page.rect.height * 0.25
-    ):
+    if clip.height < page.rect.height * 0.30:
         return 3.0
     return 1.5
 
@@ -1281,6 +1301,54 @@ def _analyse_typed_page(
         clip,
         debug_folder / f"{visual_type}.png" if debug_folder else None,
     )
+    fit_verification_images: list[tuple[str, Path]] = []
+    fit_verification_clips = []
+    two_panel_labels = (
+        _two_panel_graph_labels(page_text) if visual_type == "graph" else []
+    )
+    asks_for_two_panel_fit = bool(
+        re.search(
+            r"\b(?:samples?|groups?)\s+[^.?!]{0,40}"
+            r"\b(?:and|versus|vs\.?)\b",
+            question,
+            re.IGNORECASE,
+        )
+        and re.search(
+            r"\b(?:closer|better|fit|deviation)\b",
+            question,
+            re.IGNORECASE,
+        )
+    )
+    if not two_panel_labels and asks_for_two_panel_fit:
+        two_panel_labels = ["panel_1", "panel_2"]
+    if (
+        len(two_panel_labels) == 2
+        and clip.width > clip.height * 1.35
+        and re.search(r"\bnyquist\b", combined_evidence, re.IGNORECASE)
+        and re.search(
+            r"\b(?:closer|better)\b.{0,30}\bfit\b|\bfit\b.{0,30}\bcloser\b",
+            question,
+            re.IGNORECASE,
+        )
+    ):
+        fit_verification_clips = _side_by_side_panel_clips(clip)
+        fit_verification_images = [
+            (
+                label,
+                _render_page_image(
+                    page,
+                    3.0,
+                    panel_clip,
+                    (
+                        debug_folder / f"fit_panel_{label}.png"
+                        if debug_folder else None
+                    ),
+                ),
+            )
+            for label, panel_clip in zip(
+                two_panel_labels, fit_verification_clips
+            )
+        ]
     if debug_info is not None:
         debug_info.clear()
         debug_info.update({
@@ -1292,10 +1360,19 @@ def _analyse_typed_page(
             debug_info.update({
                 "crop_folder": str(debug_folder),
                 "crops": [{
-                "name": visual_type,
-                "path": str(image_path),
-                "coordinates": _rect_coordinates(clip),
-                }],
+                    "name": visual_type,
+                    "path": str(image_path),
+                    "coordinates": _rect_coordinates(clip),
+                }, *[
+                    {
+                        "name": f"fit_panel_{label}",
+                        "path": str(path),
+                        "coordinates": _rect_coordinates(panel_clip),
+                    }
+                    for (label, path), panel_clip in zip(
+                        fit_verification_images, fit_verification_clips
+                    )
+                ]],
             })
     try:
         return analyse_typed_image(
@@ -1304,10 +1381,13 @@ def _analyse_typed_page(
             question=question,
             evidence_text=combined_evidence,
             debug_info=debug_info,
+            fit_verification_images=fit_verification_images,
         )
     finally:
         if not save_crops:
             image_path.unlink(missing_ok=True)
+            for _, path in fit_verification_images:
+                path.unlink(missing_ok=True)
 
 
 def analyse_pdf_page(

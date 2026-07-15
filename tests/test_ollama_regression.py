@@ -235,6 +235,26 @@ def _assert_figure_3(case, value):
         for branch_id in topology["parallel_branch_sets"][0]
     ]
     assert len({frozenset((b["start_node"], b["end_node"])) for b in parallel}) == 1
+    edge_components = {
+        re.sub(r"[^a-z0-9]+", "", _normal(edge["component"]))
+        for edge in topology["edges"]
+    }
+    assert edge_components == {"re", "ri", "c"}
+    series_branch = next(
+        branch for branch in branches if len(branch["components"]) == 2
+    )
+    edges = {
+        re.sub(r"[^a-z0-9]+", "", _normal(edge["component"])): edge
+        for edge in topology["edges"]
+    }
+    first, second = [
+        edges[re.sub(r"[^a-z0-9]+", "", _normal(component))]
+        for component in series_branch["components"]
+    ]
+    assert (
+        first["to_node"] == second["from_node"]
+        or first["from_node"] == second["to_node"]
+    )
 
 
 def _assert_figure_9(case, value):
@@ -246,6 +266,10 @@ def _assert_figure_9(case, value):
     kinds = [_normal(panel["graph_kind"]) for panel in panels]
     assert sum("magnitude" in kind for kind in kinds) == 3
     assert sum("phase" in kind for kind in kinds) == 3
+    assert all(
+        _normal(panel["y_axis"]["scale"]) == "linear"
+        for panel in panels
+    )
     magnitude_labels = [panel["y_axis"]["label"] for panel in panels if "magnitude" in _normal(panel["graph_kind"])]
     assert all(_contains(label, "Zfat") for label in magnitude_labels)
     comparisons = value["comparisons"]
@@ -258,6 +282,12 @@ def _assert_figure_13(case, value, answer):
     for fact in ("Sample 10", "Sample 7"):
         assert _contains(rendered, fact)
     assert len(value["panels"]) == 2
+    by_panel = {
+        re.sub(r"[^a-z0-9]+", "", _normal(panel["panel"])): panel
+        for panel in value["panels"]
+    }
+    assert _normal(by_panel["a"]["group"]) == "sample 10"
+    assert _normal(by_panel["b"]["group"]) == "sample 7"
     assert all(_normal(panel["x_axis"]["scale"]) == "linear" for panel in value["panels"])
     assert all(_normal(panel["y_axis"]["scale"]) == "linear" for panel in value["panels"])
     for panel in value["panels"]:
@@ -269,7 +299,50 @@ def _assert_figure_13(case, value, answer):
             _contains(fit_text, phrase)
             for phrase in ("good", "closely follow", "nearly indistinguishable")
         ), f"fit quality was not described as good for {panel.get('group')}"
-    assert _contains(rendered + answer, "right") or _contains(rendered + answer, "high Re(Z)")
+        fit_key = _normal(fit_text)
+        assert not re.search(
+            r"\b(?:excellent|perfect|superimposed|indistinguishable)\b"
+            r"[^.]{0,50}\b(?:entire|whole) range\b",
+            fit_key,
+        )
+
+        multiplier = str(panel["y_axis"].get("scientific_multiplier") or "")
+        exponent = re.search(r"10\s*(?:\^|\*\*)?\s*([-+]?\d+)", multiplier)
+        factor = 10 ** int(exponent.group(1)) if exponent else 1
+        ticks = [float(str(tick).replace(",", "")) for tick in panel["y_axis"]["tick_labels"]]
+        expected_max = max(ticks) * factor
+        actual_max = float(panel["visible_range"]["max"])
+        assert abs(actual_max - expected_max) <= max(1e-9, expected_max * 0.08)
+
+    sample_seven_evidence = json.dumps(
+        [
+            by_panel["b"],
+            *[
+                item for item in value["comparisons"]
+                if _contains(item.get("subject", ""), "Sample 7")
+                or _contains(item.get("claim", ""), "Sample 7")
+            ],
+        ],
+        ensure_ascii=False,
+    )
+    assert _contains(sample_seven_evidence, "right") or _contains(
+        sample_seven_evidence, "high Re(Z)"
+    )
+    for item in value["comparisons"]:
+        if re.search(r"\b(?:closer|better)\b", _normal(item.get("claim", ""))):
+            assert item.get("uncertain") or _contains(
+                item.get("subject", ""),
+                "Sample 10",
+            )
+
+    def physical_x_max(panel):
+        multiplier = str(panel["x_axis"].get("scientific_multiplier") or "")
+        exponent = re.search(r"10\s*(?:\^|\*\*)?\s*([-+]?\d+)", multiplier)
+        factor = 10 ** int(exponent.group(1)) if exponent else 1
+        return max(float(str(tick).replace(",", "")) for tick in panel["x_axis"]["tick_labels"]) * factor
+
+    assert physical_x_max(by_panel["a"]) > physical_x_max(by_panel["b"])
+    assert value["frequency_direction_evidence"] == []
     for phrase in case["prohibited_facts"]:
         assert not _contains(rendered + answer, phrase), f"unsupported direction inferred: {phrase}"
 
@@ -319,3 +392,40 @@ def test_automatic_resolution_retains_figure_for_panel_followup():
     assert followup.page_number == first.page_number
     assert followup.target_number == "9"
     assert followup.panel == "d"
+
+
+def test_automatic_resolution_hallmarks_semantics_override_previous_pdf():
+    index = load_or_build_visual_index()
+    bio = "Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf"
+    messages = [{
+        "role": "assistant",
+        "content": "Validated Figure 9 answer",
+        "visual_target": {
+            "status": "resolved", "target_type": "figure", "target_number": "9",
+            "pdf_name": bio, "page_number": 8,
+        },
+    }]
+    result = resolve_visual_target(
+        "How does Figure 6 distinguish primary, antagonistic and integrative hallmarks?",
+        index,
+        selected_pdf=bio,
+        conversation_messages=messages,
+    )
+    assert result.status == "resolved", result.to_dict()
+    assert result.pdf_name == "hall marks of aging.pdf"
+    assert result.page_number == 46
+
+
+def test_automatic_resolution_figure_one_uses_genuine_previous_pdf_context():
+    index = load_or_build_visual_index()
+    first = resolve_visual_target("Compare Groups 1, 2 and 3 in Figure 9.", index)
+    messages = [{
+        "role": "assistant", "content": "Figure 9 answer",
+        "visual_target": first.to_dict(),
+    }]
+    result = resolve_visual_target(
+        "Explain Figure 1.", index, conversation_messages=messages
+    )
+    assert result.status == "resolved", result.to_dict()
+    assert result.pdf_name == first.pdf_name
+    assert result.page_number == 2

@@ -133,6 +133,24 @@ class StructuredVisionTests(unittest.TestCase):
         self.assertEqual(chat.call_args_list[0].kwargs, chat.call_args_list[1].kwargs)
         sleep.assert_called_once_with(1)
 
+    def test_empty_multi_image_response_retries_identical_request_once(self):
+        with patch.object(
+            structured,
+            "_chat_with_runner_retry",
+            side_effect=[
+                {"message": {"content": ""}},
+                {"message": {"content": '{"label": "|Zfat|"}'}},
+            ],
+        ) as chat:
+            raw = structured._call_model_images(
+                [Path("axis_a.png"), Path("axis_c.png")],
+                "Read the label.",
+                220,
+            )
+        self.assertEqual(raw, '{"label": "|Zfat|"}')
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(chat.call_args_list[0].kwargs, chat.call_args_list[1].kwargs)
+
     def test_figure_one_detects_labelled_diagram(self):
         page_text = "Fig. 1. Histological and schematic representation of adipose tissue structure."
         self.assertEqual(
@@ -184,6 +202,34 @@ class StructuredVisionTests(unittest.TestCase):
         )
         self.assertEqual(validated["connections"][0]["to"], "blood vessel")
 
+    def test_non_circuit_view_qualifiers_normalize_to_visible_labels(self):
+        result = {
+            "diagram_kind": "other",
+            "labels": ["Adipocyte", "Intracellular fluid"],
+            "components": [
+                {"name": "Adipocyte", "description": "cell"},
+                {"name": "Intracellular fluid", "description": "fluid"},
+            ],
+            "spatial_relationships": [],
+            "connections": [{
+                "from": "Adipocyte (microscopic)",
+                "to": "Intracellular fluid (schematic)",
+                "relationship": "contains",
+            }],
+            "circuit_topology": None,
+            "explanation": "The image corresponds to the schematic.",
+            "uncertain_items": [],
+        }
+        validated = structured.validate_labelled_diagram(result)
+        self.assertEqual(
+            validated["connections"][0],
+            {
+                "from": "Adipocyte",
+                "to": "Intracellular fluid",
+                "relationship": "contains",
+            },
+        )
+
     def test_duplicate_diagram_label_is_rejected(self):
         result = {
             "diagram_kind": "other",
@@ -209,6 +255,59 @@ class StructuredVisionTests(unittest.TestCase):
         )
         self.assertEqual(structured._normal_name("RE"), structured._normal_name("R_E"))
         self.assertEqual(structured._normal_name("RE"), structured._normal_name("Rₑ"))
+
+    def test_physiological_labels_are_not_electrical_nodes(self):
+        result = json.loads(json.dumps(circuit_result()))
+        topology = result["circuit_topology"]
+        topology["nodes"][0] = {"id": "ECF", "label": "ECF terminal"}
+        for edge in topology["edges"]:
+            if edge["from_node"] == "n_start":
+                edge["from_node"] = "ECF"
+            if edge["to_node"] == "n_start":
+                edge["to_node"] = "ECF"
+        for branch in topology["branches"]:
+            if branch["start_node"] == "n_start":
+                branch["start_node"] = "ECF"
+        with self.assertRaisesRegex(
+            structured.StructuredOutputError, "Physiological labels"
+        ):
+            structured.validate_labelled_diagram(result)
+
+    def test_series_caption_and_parallel_equation_build_exact_topology(self):
+        evidence = (
+            "R_I and C form a series branch. "
+            "R_infinity = (R_I * R_E) / (R_I + R_E)."
+        )
+        grounded = structured.ground_circuit_topology_from_evidence(
+            circuit_result(), evidence
+        )
+        validated = structured.validate_labelled_diagram(grounded, evidence)
+        topology = validated["circuit_topology"]
+        edges = {
+            structured._normal_name(edge["component"]): edge
+            for edge in topology["edges"]
+        }
+        self.assertEqual(set(edges), {"re", "ri", "c"})
+        series = next(
+            branch for branch in topology["branches"]
+            if {structured._normal_name(item) for item in branch["components"]}
+            == {"ri", "c"}
+        )
+        first, second = [
+            edges[structured._normal_name(item)] for item in series["components"]
+        ]
+        self.assertEqual(first["to_node"], second["from_node"])
+        parallel = [
+            next(
+                branch for branch in topology["branches"]
+                if branch["id"] == branch_id
+            )
+            for branch_id in topology["parallel_branch_sets"][0]
+        ]
+        self.assertEqual(
+            len({(branch["start_node"], branch["end_node"]) for branch in parallel}),
+            1,
+        )
 
     def test_figure_three_rejects_one_series_chain(self):
         result = circuit_result()
@@ -301,6 +400,7 @@ class StructuredVisionTests(unittest.TestCase):
             key: invalid[key]
             for key in ("components", "connections", "circuit_topology", "uncertain_items")
         }
+        retry["components"] = []
         debug = {}
         evidence = (
             "The compartment is represented by a series resistor RI and capacitor C. "
@@ -427,6 +527,186 @@ class StructuredVisionTests(unittest.TestCase):
             "linear",
         )
 
+    def test_graph_complexity_must_be_between_zero_and_one(self):
+        result = {
+            "figure_number": "13",
+            "panels": [graph_panel(
+                "a", "nyquist", "Sample 10",
+                axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+                complexity=2.0,
+            )],
+            "comparisons": [], "frequency_direction_evidence": [],
+            "uncertain_values": [],
+        }
+        with self.assertRaisesRegex(
+            structured.StructuredOutputError, "between 0 and 1"
+        ):
+            structured.validate_graph(result)
+
+    def test_nyquist_visible_range_applies_scientific_multiplier(self):
+        result = {
+            "figure_number": "13",
+            "panels": [graph_panel(
+                "b", "nyquist", "Sample 7",
+                axis("Re(Z)", "ohm", "linear", ["0", "1", "2"], "x10^4"),
+                axis("-Im(Z)", "ohm", "linear", ["0", "0.5", "1"], "x10^4"),
+                0, 100000,
+            )],
+            "comparisons": [], "frequency_direction_evidence": [],
+            "uncertain_values": [],
+        }
+        with self.assertRaisesRegex(
+            structured.StructuredOutputError, "scientific multiplier"
+        ):
+            structured.validate_graph(result)
+
+    def test_nyquist_fit_comparison_names_visible_sample(self):
+        result = {
+            "figure_number": "13",
+            "panels": [graph_panel(
+                "b", "nyquist", "Sample 7",
+                axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+            )],
+            "comparisons": [comparison(
+                "Sample 7 has the closest fit.", "Visual fit quality",
+                "highest", "fit quality",
+            )],
+            "frequency_direction_evidence": [], "uncertain_values": [],
+        }
+        with self.assertRaisesRegex(
+            structured.StructuredOutputError, "visible panel sample"
+        ):
+            structured.validate_graph(result)
+
+    def test_tight_panel_fit_verification_uses_normalized_deviation(self):
+        panels = [
+            graph_panel(
+                "a", "nyquist", "Specimen Alpha",
+                axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+                trends=[
+                    "Raw data have a good fit to the model.",
+                    "The largest deviation is on the right side.",
+                ],
+            ),
+            graph_panel(
+                "b", "nyquist", "Specimen Beta",
+                axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+                trends=[
+                    "Raw data have a good fit to the model.",
+                    "The largest deviation is on the right side.",
+                ],
+            ),
+        ]
+        for panel in panels:
+            panel["series"] = ["Raw Data", "Fitted Model"]
+        result = {
+            "figure_number": "x", "panels": panels,
+            "comparisons": [comparison(
+                "Specimen Beta has the closer fit.", "Specimen Beta",
+                "lowest", "normalized largest model-data deviation",
+            )],
+            "frequency_direction_evidence": [], "uncertain_values": [],
+        }
+        readings = [
+            {"panel": "a", "group": "Specimen Alpha",
+             "left_normalized_largest_deviation": 0.04,
+             "right_normalized_largest_deviation": 0.12,
+             "confidence": 0.9},
+            {"panel": "b", "group": "Specimen Beta",
+             "left_normalized_largest_deviation": 0.08,
+             "right_normalized_largest_deviation": 0.24,
+             "confidence": 0.85},
+        ]
+        with patch.object(
+            structured,
+            "_call_model",
+            side_effect=[json.dumps(reading) for reading in readings],
+        ):
+            validated, raw, status = structured.verify_nyquist_fit_comparison(
+                result,
+                [("a", Path("a.png")), ("b", Path("b.png"))],
+            )
+        self.assertEqual(status, "verified")
+        self.assertEqual(len(raw), 2)
+        self.assertEqual(validated["comparisons"][-1]["subject"], "Specimen Alpha")
+        self.assertFalse(validated["comparisons"][-1]["uncertain"])
+        self.assertIn("high Re(Z)", validated["panels"][1]["visible_trends"][-1])
+
+    def test_tight_panel_fit_verification_is_uncertain_when_nearly_tied(self):
+        panels = [
+            graph_panel(
+                "a", "nyquist", "Specimen Alpha",
+                axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+                trends=[
+                    "The fit is good; the largest deviation is on the right."
+                ],
+            ),
+            graph_panel(
+                "b", "nyquist", "Specimen Beta",
+                axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+                trends=[
+                    "The fit is good; the largest deviation is on the right."
+                ],
+            ),
+        ]
+        result = {
+            "figure_number": "x", "panels": panels, "comparisons": [],
+            "frequency_direction_evidence": [], "uncertain_values": [],
+        }
+        readings = [
+            {"panel": "a", "group": "Specimen Alpha",
+             "left_normalized_largest_deviation": 0.10,
+             "right_normalized_largest_deviation": 0.20,
+             "confidence": 0.9},
+            {"panel": "b", "group": "Specimen Beta",
+             "left_normalized_largest_deviation": 0.11,
+             "right_normalized_largest_deviation": 0.21,
+             "confidence": 0.9},
+        ]
+        with patch.object(
+            structured,
+            "_call_model",
+            side_effect=[json.dumps(reading) for reading in readings],
+        ):
+            validated, _, _ = structured.verify_nyquist_fit_comparison(
+                result,
+                [("a", Path("a.png")), ("b", Path("b.png"))],
+            )
+        self.assertTrue(validated["comparisons"][-1]["uncertain"])
+        self.assertIn("too close", validated["comparisons"][-1]["claim"])
+
+    def test_nyquist_combined_panel_and_sample_identity_is_normalized(self):
+        panel = graph_panel(
+            "(a) Sample 10", "nyquist", None,
+            axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+        )
+        result = {
+            "figure_number": "13", "panels": [panel], "comparisons": [],
+            "frequency_direction_evidence": [], "uncertain_values": [],
+        }
+        validated = structured.validate_graph(result)
+        self.assertEqual(validated["panels"][0]["panel"], "a")
+        self.assertEqual(validated["panels"][0]["group"], "Sample 10")
+
+    def test_nyquist_entire_range_claim_cannot_conflict_with_deviation(self):
+        result = {
+            "figure_number": "13",
+            "panels": [graph_panel(
+                "b", "nyquist", "Sample 7",
+                axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+                trends=["The fit is perfect across the entire range."],
+            )],
+            "comparisons": [comparison(
+                "Sample 7 deviates on the right side.", "Sample 7",
+                "other", "deviation magnitude",
+            )],
+            "frequency_direction_evidence": [], "uncertain_values": [],
+        }
+        with self.assertRaisesRegex(
+            structured.StructuredOutputError, "contradicts"
+        ):
+            structured.validate_graph(result)
+
     def test_nyquist_frequency_direction_without_evidence_is_rejected(self):
         result = {
             "figure_number": "13",
@@ -434,7 +714,7 @@ class StructuredVisionTests(unittest.TestCase):
                 "b", "nyquist", "Sample 7",
                 axis("Re(Z)", "Ω", "linear", ["0", "1", "2"], "×10^4"),
                 axis("-Im(Z)", "Ω", "linear", ["0", "1", "2"], "×10^4"),
-                0, 10000, trends=["The mismatch occurs at higher frequencies."],
+                0, 20000, trends=["The mismatch occurs at higher frequencies."],
             )],
             "comparisons": [], "frequency_direction_evidence": [], "uncertain_values": [],
         }
@@ -610,6 +890,46 @@ class StructuredVisionTests(unittest.TestCase):
         self.assertEqual(
             debug["validated_json"]["comparisons"]["magnitude_y_axis"]["label"],
             "|Zfat|<sub>dB</sub> (Ω)",
+        )
+
+    def test_comparison_axis_reread_does_not_change_panel_scales(self):
+        comparison = {
+            "magnitude_order_high_to_low": ["Group 1"],
+            "greatest_phase_complexity_group": "Group 1",
+            "x_axis": {"label": "Frequency", "unit": "Hz", "scale": "log"},
+            "magnitude_y_axis": {
+                "label": "|Zfat| dB", "unit": "ohm", "scale": "log"
+            },
+            "confidence": 0.95,
+            "uncertain": [],
+        }
+        debug = {}
+        with patch.object(
+            structured,
+            "_call_model",
+            return_value=json.dumps(
+                compact_pair("a", "b", "Group 1", 100, 0.3)
+            ),
+        ), patch.object(
+            structured, "_call_model_images", return_value=json.dumps(comparison)
+        ):
+            structured.analyse_compact_multi_panel_graph(
+                [Path("panels_ab.png")], [["a", "b"]], "9", "Figure 9",
+                debug_info=debug,
+            )
+        panels = debug["validated_json"]["panels"]
+        self.assertTrue(all(panel["x_axis"]["scale"] == "log" for panel in panels))
+        self.assertEqual(
+            next(panel for panel in panels if panel["graph_kind"] == "magnitude")["y_axis"]["scale"],
+            "linear",
+        )
+        self.assertEqual(
+            next(panel for panel in panels if panel["graph_kind"] == "phase")["y_axis"]["scale"],
+            "linear",
+        )
+        self.assertEqual(
+            debug["validated_json"]["comparisons"]["magnitude_y_axis"]["scale"],
+            "linear",
         )
 
     def test_truncated_compact_pair_is_retried_without_showing_raw_json(self):

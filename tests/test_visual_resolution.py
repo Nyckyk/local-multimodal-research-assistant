@@ -197,6 +197,48 @@ def test_caption_relevance_disambiguates_duplicate_number():
     assert result.status == "resolved" and result.pdf_name == "tissue.pdf"
 
 
+def test_hallmarks_figure_six_semantics_override_previous_bioimpedance_pdf():
+    bio = "Bioimpedance spectroscopy.pdf"
+    hallmarks = "hall marks of aging.pdf"
+    index = _index(
+        (bio, 5, "figure", "6", "Fig. 6. Genetic algorithm diagnostic output", "caption"),
+        (
+            hallmarks, 46, "figure", "6",
+            "Figure 6. Primary, antagonistic and integrative hallmarks of aging",
+            "caption",
+        ),
+    )
+    result = resolve_visual_target(
+        "How does Figure 6 distinguish primary, antagonistic and integrative hallmarks?",
+        index,
+        conversation_messages=_previous(pdf_name=bio, page=8),
+    )
+    assert result.status == "resolved"
+    assert (result.pdf_name, result.page_number) == (hallmarks, 46)
+
+
+def test_hallmarks_figure_six_semantics_override_active_sidebar_and_previous_pdf():
+    bio = "Bioimpedance spectroscopy.pdf"
+    hallmarks = "hall marks of aging.pdf"
+    index = _index(
+        (bio, 5, "figure", "6", "Fig. 6. Genetic algorithm diagnostics", "caption"),
+        (
+            hallmarks, 46, "figure", "6",
+            "Figure 6. Primary, antagonistic and integrative hallmarks of aging",
+            "caption",
+        ),
+    )
+    result = resolve_visual_target(
+        "How does Figure 6 distinguish primary, antagonistic and integrative hallmarks?",
+        index,
+        selected_pdf=bio,
+        conversation_messages=_previous(pdf_name=bio, page=8),
+    )
+    assert (result.status, result.pdf_name, result.page_number) == (
+        "resolved", hallmarks, 46
+    )
+
+
 def test_visual_type_comes_from_target_and_caption():
     index = _index(
         ("paper.pdf", 7, "table", "1", "Table 1. Measurements", "caption"),
@@ -216,6 +258,37 @@ def test_duplicate_figure_one_without_context_is_ambiguous():
     result = resolve_visual_target("Explain Figure 1", index)
     assert result.status == "ambiguous"
     assert {row["pdf_name"] for row in result.candidates[:2]} == {"aging.pdf", "tissue.pdf"}
+
+
+def test_duplicate_figure_one_uses_prior_pdf_only_with_visual_context():
+    index = _index(
+        ("aging.pdf", 37, "figure", "1", "Figure 1. Hallmarks", "caption"),
+        ("tissue.pdf", 2, "figure", "1", "Figure 1. Tissue", "caption"),
+    )
+    previous = resolve_visual_target(
+        "Explain Figure 1", index,
+        conversation_messages=_previous(pdf_name="tissue.pdf", page=8),
+    )
+    assert previous.status == "resolved" and previous.pdf_name == "tissue.pdf"
+
+    unrelated_history = [{"role": "assistant", "content": "A text-only answer"}]
+    cleared = resolve_visual_target(
+        "Explain Figure 1", index, conversation_messages=unrelated_history
+    )
+    assert cleared.status == "ambiguous"
+
+
+def test_real_hallmarks_figure_six_overrides_previous_bioimpedance_context():
+    bio = "Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf"
+    result = resolve_visual_target(
+        "How does Figure 6 distinguish primary, antagonistic and integrative hallmarks?",
+        load_or_build_visual_index(),
+        selected_pdf=bio,
+        conversation_messages=_previous(pdf_name=bio, page=8),
+    )
+    assert result.status == "resolved", result.to_dict()
+    assert result.pdf_name == "hall marks of aging.pdf"
+    assert result.page_number == 46
 
 
 def test_missing_and_low_confidence_targets_are_not_silently_selected():
