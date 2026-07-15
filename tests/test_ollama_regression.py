@@ -14,7 +14,7 @@ from services.ollama_service import generate_answer
 from services.structured_vision import StructuredOutputError, TruncatedJSONError
 from services.visual_index import load_or_build_visual_index
 from services.visual_locator import resolve_visual_target
-from services.vision_service import analyse_pdf_page
+from services.visual_runtime import analyse_resolved_visual
 from settings import PAPERS_FOLDER
 
 
@@ -157,11 +157,9 @@ def _run_vision_case(case, artifact_writer):
         assert resolution.status == "resolved", resolution.to_dict()
         assert resolution.pdf_name == case["pdf_filename"]
         assert resolution.page_number == int(case["pdf_page"])
-        pdf_path = Path(resolution.pdf_path)
-        answer = analyse_pdf_page(
-            pdf_path, int(resolution.page_number), case["question"], debug_info=debug
+        answer = analyse_resolved_visual(
+            case["question"], resolution, debug_info=debug
         )
-        debug["resolved_visual_target"] = resolution.to_dict()
         grouped = case["case_id"] == "figure_6_auto_hallmarks"
         value = debug.get("normalized_json" if grouped else "validated_json")
         assert isinstance(value, dict), "validated structured output was not produced"

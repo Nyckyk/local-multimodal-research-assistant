@@ -212,8 +212,8 @@ class StructuredVisionTests(unittest.TestCase):
             ],
             "spatial_relationships": [],
             "connections": [{
-                "from": "Adipocyte (microscopic)",
-                "to": "Intracellular fluid (schematic)",
+                "from": "Adipocyte (microscopic image)",
+                "to": "Intracellular fluid (schematic diagram)",
                 "relationship": "contains",
             }],
             "circuit_topology": None,
@@ -228,6 +228,42 @@ class StructuredVisionTests(unittest.TestCase):
                 "to": "Intracellular fluid",
                 "relationship": "contains",
             },
+        )
+
+    def test_known_composite_endpoint_expands_to_two_relationships(self):
+        result = {
+            "diagram_kind": "other",
+            "labels": [
+                "Extracellular fluid", "Interstitial fluid",
+                "Intravascular fluid",
+            ],
+            "components": [
+                {"name": "Extracellular fluid", "description": "fluid"},
+                {"name": "Interstitial fluid", "description": "fluid"},
+                {"name": "Intravascular fluid", "description": "fluid"},
+            ],
+            "spatial_relationships": [{
+                "subject": "Extracellular fluid",
+                "relationship": "comprises",
+                "object": "Interstitial fluid and Intravascular fluid",
+            }],
+            "connections": [{
+                "from": "Extracellular fluid",
+                "to": "Interstitial fluid and Intravascular fluid",
+                "relationship": "comprises",
+            }],
+            "circuit_topology": None,
+            "explanation": "The extracellular compartment has two fluid spaces.",
+            "uncertain_items": [],
+        }
+        validated = structured.validate_labelled_diagram(result)
+        self.assertEqual(
+            [item["object"] for item in validated["spatial_relationships"]],
+            ["Interstitial fluid", "Intravascular fluid"],
+        )
+        self.assertEqual(
+            [item["to"] for item in validated["connections"]],
+            ["Interstitial fluid", "Intravascular fluid"],
         )
 
     def test_duplicate_diagram_label_is_rejected(self):
@@ -309,6 +345,21 @@ class StructuredVisionTests(unittest.TestCase):
             1,
         )
 
+    def test_unrelated_retrieved_circuit_does_not_override_target_components(self):
+        evidence = (
+            "RI and C form a series branch. "
+            "R_infinity = (RI * RE) / (RI + RE). "
+            "Another figure is in series with two parallel branches, each "
+            "comprising a resistance (R1, R2)."
+        )
+        validated = structured.validate_labelled_diagram(
+            circuit_result(), evidence
+        )
+        self.assertEqual(
+            validated["circuit_topology"]["parallel_branch_sets"],
+            [["branch_1", "branch_2"]],
+        )
+
     def test_figure_three_rejects_one_series_chain(self):
         result = circuit_result()
         result["components"] = result["components"][:3]
@@ -360,8 +411,7 @@ class StructuredVisionTests(unittest.TestCase):
         }
         debug = {}
         evidence = (
-            "The compartment is represented by a series resistor RI and capacitor C. "
-            "Rinf = RI * RE / (RI + RE)."
+            "The compartment is represented by a series resistor RI and capacitor C."
         )
         with patch.object(
             structured,
@@ -409,7 +459,7 @@ class StructuredVisionTests(unittest.TestCase):
         with patch.object(
             structured,
             "_call_model",
-            side_effect=[json.dumps(invalid), json.dumps(retry)],
+            side_effect=[json.dumps(invalid)],
         ):
             structured.analyse_typed_image(
                 Path("figure3.png"), "labelled_diagram", "Explain this circuit",
@@ -422,7 +472,11 @@ class StructuredVisionTests(unittest.TestCase):
         )
         self.assertEqual(
             debug["retry_kind"],
-            "targeted_topology_grounded_repair",
+            "grounded_topology_repair",
+        )
+        self.assertEqual(
+            debug["final_answer_code_path"],
+            "validated_repaired_structured_vision",
         )
 
     def test_six_panel_bode_graph_uses_graph_validation(self):
@@ -977,16 +1031,36 @@ class StructuredVisionTests(unittest.TestCase):
         self.assertIn("Figure 9", answer)
         self.assertEqual(call.call_count, 2)
 
-    def test_failed_validation_returns_labelled_unvalidated_fallback(self):
+    def test_failed_validation_never_returns_unvalidated_model_text(self):
         debug = {}
         with patch.object(structured, "_call_model", side_effect=["useful partial output", "still invalid"]):
             answer = structured.analyse_typed_image(
                 Path("table.png"), "table", "Read Table 1", debug_info=debug
             )
-        self.assertIn("Unvalidated vision fallback", answer)
-        self.assertIn("useful partial output", answer)
+        self.assertIn("Could not verify a structured reading", answer)
+        self.assertNotIn("useful partial output", answer)
+        self.assertNotIn("still invalid", answer)
         self.assertTrue(debug["validation_error"])
-        self.assertEqual(debug["final_answer_path"], "unvalidated_plain_text_fallback")
+        self.assertEqual(debug["final_answer_path"], "grounded_caption_summary_fallback")
+
+    def test_failed_figure_one_validation_returns_grounded_caption_summary(self):
+        debug = {}
+        evidence = (
+            "TARGET FIGURE CAPTION (authoritative for this crop):\n"
+            "Figure 1. Histological and schematic representation of adipose tissue.\n\n"
+            "PAGE TEXT CROSS-CHECK:\nNearby discussion."
+        )
+        with patch.object(
+            structured, "_call_model", side_effect=["{bad", "still invalid"]
+        ):
+            answer = structured.analyse_typed_image(
+                Path("figure1.png"), "labelled_diagram", "Explain Figure 1",
+                evidence_text=evidence, debug_info=debug,
+            )
+        self.assertIn("Grounded caption summary", answer)
+        self.assertIn("Histological and schematic representation", answer)
+        self.assertNotIn("still invalid", answer)
+        self.assertNotIn("{bad", answer)
 
     def test_failed_circuit_json_never_displays_raw_topology(self):
         debug = {}

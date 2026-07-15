@@ -16,11 +16,11 @@ from services.visual_locator import (
     format_resolution_problem,
     manual_visual_resolution,
     resolve_visual_target,
-    resolved_analysis_question,
     should_activate_automatic_vision,
 )
 from services.visual_reference_parser import has_visual_reference
-from services.vision_service import COULD_NOT_VERIFY_MESSAGE, analyse_pdf_page
+from services.visual_runtime import analyse_resolved_visual
+from services.vision_service import COULD_NOT_VERIFY_MESSAGE
 from settings import MAX_HISTORY_MESSAGES, PAPERS_FOLDER
 
 
@@ -391,8 +391,6 @@ if question:
             )
             selected_pdf = Path(resolution.pdf_path) if resolution.pdf_path else None
             vision_page_number = resolution.page_number or 1
-            analysis_question = resolved_analysis_question(question, resolution)
-
             if use_vision and selected_pdf is not None:
                 if not manual_visual_override:
                     st.info(
@@ -402,10 +400,9 @@ if question:
                         + f"\n\n{resolution.pdf_name}\n\nPDF page {resolution.page_number}"
                     )
                 try:
-                    visual_answer = analyse_pdf_page(
-                        pdf_path=selected_pdf,
-                        page_number=int(vision_page_number),
-                        question=analysis_question,
+                    visual_answer = analyse_resolved_visual(
+                        question=question,
+                        resolution=resolution,
                         debug_info=vision_debug,
                         text_evidence=context,
                     )

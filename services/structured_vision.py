@@ -3,6 +3,7 @@ import math
 import re
 import time
 import unicodedata
+from copy import deepcopy
 from html import unescape
 from pathlib import Path
 
@@ -585,6 +586,15 @@ def ground_circuit_topology_from_evidence(value: dict, evidence_text: str) -> di
         )
         for label in value.get("labels", [])
     )
+    corrected["spatial_relationships"] = [
+        relationship for relationship in value.get("spatial_relationships", [])
+        if isinstance(relationship, dict)
+        and all(
+            isinstance(relationship.get(field), str)
+            and relationship[field].strip()
+            for field in ("subject", "relationship", "object")
+        )
+    ]
     preserved_connections = [
         connection for connection in value.get("connections", [])
         if isinstance(connection, dict)
@@ -607,6 +617,87 @@ def ground_circuit_topology_from_evidence(value: dict, evidence_text: str) -> di
     return corrected
 
 
+_VIEW_QUALIFIER = re.compile(
+    r"\s*\((?:microscopic(?:\s+image)?|schematic(?:\s+diagram)?|"
+    r"histological(?:\s+image)?|diagram|image|left|right)\)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _diagram_reference_display(value: dict) -> dict[str, str]:
+    references: dict[str, str] = {}
+    for label in value.get("labels", []):
+        display = (
+            label if isinstance(label, str)
+            else label.get("text", label.get("name", ""))
+            if isinstance(label, dict) else ""
+        )
+        if isinstance(display, str) and _normal_name(display):
+            references.setdefault(_normal_name(display), display.strip())
+    for component in value.get("components", []):
+        display = (
+            component if isinstance(component, str)
+            else component.get("name", "")
+            if isinstance(component, dict) else ""
+        )
+        if isinstance(display, str) and _normal_name(display):
+            references.setdefault(_normal_name(display), display.strip())
+    return references
+
+
+def _known_endpoint_parts(endpoint: str, references: dict[str, str]) -> list[str]:
+    """Split only an explicit conjunction whose every member is already known."""
+    stripped = _VIEW_QUALIFIER.sub("", endpoint).strip()
+    direct = references.get(_normal_name(stripped))
+    if direct:
+        return [direct]
+    parts = [
+        part.strip(" ,")
+        for part in re.split(r"\s*,?\s+(?:and|&)\s+", stripped, flags=re.IGNORECASE)
+    ]
+    if len(parts) < 2 or any(not part for part in parts):
+        return [stripped]
+    normalized = [_normal_name(part) for part in parts]
+    if len(set(normalized)) != len(normalized) or any(
+        name not in references for name in normalized
+    ):
+        return [stripped]
+    return [references[name] for name in normalized]
+
+
+def normalize_composite_diagram_endpoints(value: dict) -> dict:
+    """Expand clear known-label conjunctions without inventing diagram entities."""
+    corrected = deepcopy(value)
+    if str(corrected.get("diagram_kind", "")).strip().lower() != "other":
+        return corrected
+    references = _diagram_reference_display(corrected)
+    for field, start_key, end_key in (
+        ("spatial_relationships", "subject", "object"),
+        ("connections", "from", "to"),
+    ):
+        expanded = []
+        for relationship in corrected.get(field, []):
+            if not isinstance(relationship, dict):
+                expanded.append(relationship)
+                continue
+            start = relationship.get(start_key)
+            end = relationship.get(end_key)
+            if not isinstance(start, str) or not isinstance(end, str):
+                expanded.append(relationship)
+                continue
+            starts = _known_endpoint_parts(start, references)
+            ends = _known_endpoint_parts(end, references)
+            for start_part in starts:
+                for end_part in ends:
+                    expanded.append({
+                        **relationship,
+                        start_key: start_part,
+                        end_key: end_part,
+                    })
+        corrected[field] = expanded
+    return corrected
+
+
 def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
     required = {
         "diagram_kind", "labels", "components", "spatial_relationships",
@@ -620,6 +711,7 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
     if not isinstance(value["explanation"], str) or not isinstance(value["uncertain_items"], list):
         raise StructuredOutputError("Diagram explanation/uncertainty fields are invalid.")
 
+    value = normalize_composite_diagram_endpoints(value)
     diagram_kind = str(value["diagram_kind"]).strip().lower()
     if diagram_kind not in {"circuit", "other"}:
         raise StructuredOutputError("diagram_kind must be circuit or other.")
@@ -667,6 +759,8 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
         )
         for first, second in _explicit_series_pairs(evidence_text):
             expected = {_normal_name(first), _normal_name(second)}
+            if not expected.issubset(component_names):
+                continue
             matching = [
                 branch
                 for branch in value["circuit_topology"]["branches"]
@@ -681,6 +775,8 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
         by_id = {branch["id"]: branch for branch in branches}
         for first, second in _explicit_parallel_pairs(evidence_text):
             first_key, second_key = _normal_name(first), _normal_name(second)
+            if not {first_key, second_key}.issubset(component_names):
+                continue
             supported = False
             for branch_set in parallel_sets:
                 member_components = [
@@ -737,17 +833,6 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
         if not isinstance(connection, dict):
             raise StructuredOutputError("Each diagram connection must be an object.")
         _require_keys(connection, {"from", "to", "relationship"}, "Diagram connection")
-        if diagram_kind != "circuit":
-            for field in ("from", "to"):
-                endpoint = str(connection[field]).strip()
-                base = re.sub(
-                    r"\s*\((?:microscopic|schematic|histological|diagram|image|left|right)\)\s*$",
-                    "",
-                    endpoint,
-                    flags=re.IGNORECASE,
-                ).strip()
-                if base != endpoint and _normal_name(base) in valid_references:
-                    connection[field] = base
         endpoints = {_normal_name(connection["from"]), _normal_name(connection["to"])}
         unknown = endpoints.difference(valid_references)
         if diagram_kind != "circuit":
@@ -2166,8 +2251,24 @@ def format_structured_result(visual_type: str, value: dict) -> str:
         return "\n".join(lines)
     lines = [value["explanation"]]
     if value["components"]:
-        names = [item if isinstance(item, str) else item.get("name", "") for item in value["components"]]
-        lines.append("\n**Components:** " + ", ".join(filter(None, names)))
+        if value.get("circuit_topology"):
+            lines.append("\n**Components:**")
+            for item in value["components"]:
+                if isinstance(item, str):
+                    lines.append(f"- {item}")
+                else:
+                    name = str(item.get("name", "")).strip()
+                    description = str(item.get("description", "")).strip()
+                    if name:
+                        lines.append(
+                            f"- {name}: {description}" if description else f"- {name}"
+                        )
+        else:
+            names = [
+                item if isinstance(item, str) else item.get("name", "")
+                for item in value["components"]
+            ]
+            lines.append("\n**Components:** " + ", ".join(filter(None, names)))
     if value["connections"]:
         lines.append("\n**Connections:**")
         lines.extend(
@@ -2186,6 +2287,30 @@ def format_structured_result(visual_type: str, value: dict) -> str:
     return "\n".join(lines)
 
 
+def _grounded_caption_fallback(evidence_text: str, visual_type: str) -> str:
+    caption_match = re.search(
+        r"TARGET FIGURE CAPTION[^\n]*:\s*\n(.*?)"
+        r"(?=\n\s*\n(?:PAGE TEXT|RETRIEVED TEXT)[^\n]*:|\Z)",
+        evidence_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    caption = (
+        re.sub(r"\s+", " ", caption_match.group(1)).strip()
+        if caption_match else ""
+    )
+    if caption:
+        return (
+            f"**Grounded caption summary:** {caption}\n\n"
+            "I could not verify every structured relationship in the image, so "
+            "no unvalidated model output is shown."
+        )
+    readable_type = visual_type.replace("_", " ")
+    return (
+        f"Could not verify a structured reading of this {readable_type}. "
+        "No unvalidated model output is shown."
+    )
+
+
 def analyse_typed_image(
     image_path: Path,
     visual_type: str,
@@ -2200,17 +2325,38 @@ def analyse_typed_image(
         question,
         re.IGNORECASE,
     ))
-    raw = _call_model(image_path, prompt)
+    try:
+        raw = _call_model(image_path, prompt)
+    except Exception as error:
+        if debug_info is not None:
+            debug_info.update({
+                "visual_type": visual_type,
+                "initial_response": "",
+                "raw_vision_response": "",
+                "initial_parsed_json": None,
+                "initial_validation_errors": [],
+                "repaired_json": None,
+                "repaired_validation_result": "not_attempted",
+                "validation_error": str(error),
+                "final_answer_path": "vision_model_error",
+                "final_answer_code_path": "vision_model_error",
+            })
+        raise
     initial_raw = raw
     errors = []
     parsed = None
-    retry_kind = "json_repair"
+    initial_validation_errors = []
+    retry_kind = ""
     retry_raw = ""
+    repaired_json = None
+    repaired_validation_result = "not_attempted"
+    used_repair = False
     try:
         parsed = parse_json_response(raw)
         value = validate_typed_response(visual_type, parsed, evidence_text)
     except StructuredOutputError as first_error:
         errors.append(str(first_error))
+        initial_validation_errors.append(str(first_error))
         topology_retry = (
             visual_type == "labelled_diagram"
             and isinstance(parsed, dict)
@@ -2218,79 +2364,109 @@ def analyse_typed_image(
             and _is_topology_error(first_error)
         )
         if topology_retry:
-            retry_kind = "targeted_topology_retry"
-            retry_raw = _call_model(
-                image_path,
-                _topology_retry_prompt(raw, str(first_error), evidence_text),
-            )
-        elif visual_type == "graph":
-            retry_kind = "targeted_graph_reinspection"
-            retry_raw = _call_model(
-                image_path,
-                _graph_reinspection_prompt(
-                    question, str(first_error), evidence_text
-                ),
-            )
-        else:
-            retry_raw = _call_model(
-                image_path,
-                _repair_prompt(visual_type, raw, str(first_error)),
-            )
-        repaired = None
-        try:
-            repaired = parse_json_response(retry_raw)
+            try:
+                repaired_json = ground_circuit_topology_from_evidence(
+                    parsed, evidence_text
+                )
+                value = validate_typed_response(
+                    visual_type, repaired_json, evidence_text
+                )
+                repaired_validation_result = "validated"
+                retry_kind = "grounded_topology_repair"
+                used_repair = True
+            except StructuredOutputError as grounding_error:
+                errors.append(str(grounding_error))
+
+        if not used_repair:
             if topology_retry:
-                candidate = dict(parsed)
-                for field in ("components", "connections", "circuit_topology", "uncertain_items"):
-                    if field == "uncertain_items":
-                        continue
-                    if field in repaired and not (
-                        field in {"components", "connections"}
-                        and not repaired[field]
-                        and parsed.get(field)
+                retry_kind = "targeted_topology_retry"
+                retry_raw = _call_model(
+                    image_path,
+                    _topology_retry_prompt(raw, str(first_error), evidence_text),
+                )
+            elif visual_type == "graph":
+                retry_kind = "targeted_graph_reinspection"
+                retry_raw = _call_model(
+                    image_path,
+                    _graph_reinspection_prompt(
+                        question, str(first_error), evidence_text
+                    ),
+                )
+            else:
+                retry_kind = "json_repair"
+                retry_raw = _call_model(
+                    image_path,
+                    _repair_prompt(visual_type, raw, str(first_error)),
+                )
+            try:
+                repaired_json = parse_json_response(retry_raw)
+                if topology_retry:
+                    candidate = dict(parsed)
+                    for field in (
+                        "components", "connections", "circuit_topology",
+                        "uncertain_items",
                     ):
-                        candidate[field] = repaired[field]
-                repaired = candidate
-            value = validate_typed_response(visual_type, repaired, evidence_text)
-            raw = retry_raw
-        except StructuredOutputError as second_error:
-            errors.append(str(second_error))
-            recovered = False
-            if topology_retry and isinstance(repaired, dict):
-                try:
-                    grounded = ground_circuit_topology_from_evidence(
-                        repaired, evidence_text
-                    )
-                    value = validate_typed_response(
-                        visual_type, grounded, evidence_text
-                    )
-                    raw = retry_raw
-                    retry_kind = "targeted_topology_grounded_repair"
-                    recovered = True
-                except StructuredOutputError as grounding_error:
-                    errors.append(str(grounding_error))
-            if not recovered:
-                if debug_info is not None:
-                    debug_info.update({
-                        "visual_type": visual_type,
-                        "initial_response": initial_raw,
-                        "raw_vision_response": raw,
-                        "retry_response": retry_raw,
-                        "retry_kind": retry_kind,
-                        "validation_error": " | ".join(errors),
-                        "final_answer_path": (
+                        if field == "uncertain_items":
+                            continue
+                        if field in repaired_json and not (
+                            field in {"components", "connections"}
+                            and not repaired_json[field]
+                            and parsed.get(field)
+                        ):
+                            candidate[field] = repaired_json[field]
+                    repaired_json = candidate
+                value = validate_typed_response(
+                    visual_type, repaired_json, evidence_text
+                )
+                repaired_validation_result = "validated"
+                raw = retry_raw
+                used_repair = True
+            except StructuredOutputError as second_error:
+                errors.append(str(second_error))
+                recovered = False
+                if topology_retry and isinstance(repaired_json, dict):
+                    try:
+                        repaired_json = ground_circuit_topology_from_evidence(
+                            repaired_json, evidence_text
+                        )
+                        value = validate_typed_response(
+                            visual_type, repaired_json, evidence_text
+                        )
+                        repaired_validation_result = "validated"
+                        raw = retry_raw
+                        retry_kind = "targeted_topology_grounded_repair"
+                        used_repair = True
+                        recovered = True
+                    except StructuredOutputError as grounding_error:
+                        errors.append(str(grounding_error))
+                if not recovered:
+                    repaired_validation_result = str(second_error)
+                    if debug_info is not None:
+                        fallback_path = (
                             "could_not_verify_topology"
                             if topology_retry or circuit_context
-                            else "unvalidated_plain_text_fallback"
-                        ),
-                    })
-                if topology_retry or circuit_context:
-                    return (
-                        "Could not verify the circuit topology from the visible wire "
-                        "junctions and caption evidence."
-                    )
-                fallback = strip_json_fences(raw)
-                return "**Unvalidated vision fallback:**\n\n" + fallback
+                            else "grounded_caption_summary_fallback"
+                        )
+                        debug_info.update({
+                            "visual_type": visual_type,
+                            "initial_response": initial_raw,
+                            "raw_vision_response": raw,
+                            "retry_response": retry_raw,
+                            "initial_parsed_json": parsed,
+                            "initial_validation_errors": initial_validation_errors,
+                            "repaired_json": repaired_json,
+                            "repaired_validation_result": repaired_validation_result,
+                            "retry_kind": retry_kind,
+                            "validation_error": " | ".join(errors),
+                            "final_answer_path": fallback_path,
+                            "final_answer_code_path": fallback_path,
+                        })
+                    if topology_retry or circuit_context:
+                        return (
+                            "Could not verify the circuit topology from the visible wire "
+                            "junctions and caption evidence."
+                        )
+                    return _grounded_caption_fallback(evidence_text, visual_type)
 
     fit_verification_raw = []
     fit_verification_status = "not_applicable"
@@ -2316,11 +2492,20 @@ def analyse_typed_image(
             "visual_type": visual_type,
             **({"initial_response": initial_raw} if errors else {}),
             "raw_vision_response": recorded_raw,
+            "retry_response": retry_raw,
             "raw_fit_verification_responses": fit_verification_raw,
             "fit_verification_status": fit_verification_status,
+            "initial_parsed_json": parsed,
+            "initial_validation_errors": initial_validation_errors,
+            "repaired_json": repaired_json,
+            "repaired_validation_result": repaired_validation_result,
             "validated_json": value,
             "validation_error": " | ".join(errors),
             "retry_kind": retry_kind if errors else "",
             "final_answer_path": "validated_typed_vision",
+            "final_answer_code_path": (
+                "validated_repaired_structured_vision"
+                if used_repair else "validated_structured_vision"
+            ),
         })
     return format_structured_result(visual_type, value)
