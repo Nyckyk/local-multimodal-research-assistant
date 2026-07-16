@@ -10,6 +10,8 @@ from services.visual_index import extract_page_record, load_or_build_visual_inde
 from services.visual_fallback import resolve_with_visual_fallback
 from services.visual_locator import (
     VisualResolution,
+    _previous_target,
+    apply_conversation_reference,
     clear_visual_target_state,
     manual_visual_resolution,
     resolve_visual_target,
@@ -60,6 +62,77 @@ def _previous(target_type="figure", target_number="9", panel=None, pdf_name="one
             "page_number": page,
         },
     }]
+
+
+def test_previous_target_skips_nullable_legacy_and_malformed_messages():
+    malformed_messages = [
+        {"role": "assistant", "evidence": None},
+        {"role": "assistant", "evidence": "invalid"},
+        {"role": "assistant", "evidence": []},
+        {"role": "assistant", "visual_target": None},
+        {"role": "assistant", "visual_target": {"target_type": "figure"}},
+        None,
+        "legacy message",
+    ]
+    assert _previous_target(malformed_messages) is None
+
+    explicit = parse_visual_reference("Compare Samples 10 and 7 in Figure 13.")
+    resolved_reference, previous, reason = apply_conversation_reference(
+        explicit, malformed_messages
+    )
+    assert resolved_reference == explicit
+    assert previous is None
+    assert reason == "explicit visual reference"
+
+
+def test_previous_target_recovers_valid_nested_evidence_target():
+    nested_target = {
+        "pdf_name": "paper.pdf",
+        "page_number": 10,
+        "target_type": "figure",
+        "target_number": "13",
+    }
+    messages = [
+        {"role": "assistant", "evidence": {"visual_target": nested_target}},
+        {"role": "assistant", "evidence": None},
+    ]
+    assert _previous_target(messages) == nested_target
+
+    reference = parse_visual_reference("What about panel b?")
+    resolved_reference, previous, reason = apply_conversation_reference(
+        reference, messages
+    )
+    assert previous == nested_target
+    assert resolved_reference.target_type == "figure"
+    assert resolved_reference.target_number == "13"
+    assert resolved_reference.panel == "b"
+    assert reason == "panel attached to previous figure"
+
+
+def test_previous_target_recovers_valid_direct_target():
+    direct_target = {
+        "status": "resolved",
+        "pdf_name": "paper.pdf",
+        "page_number": 10,
+        "target_type": "figure",
+        "target_number": "13",
+    }
+    assert _previous_target([{
+        "role": "assistant", "visual_target": direct_target,
+    }]) == direct_target
+
+
+def test_figure_thirteen_resolution_tolerates_nullable_conversation_evidence():
+    result = resolve_visual_target(
+        "Compare Samples 10 and 7 in Figure 13.",
+        load_or_build_visual_index(),
+        conversation_messages=[
+            {"role": "assistant", "content": "Legacy answer", "evidence": None},
+        ],
+    )
+    assert result.status == "resolved", result.to_dict()
+    assert result.pdf_name.startswith("Bioimpedance spectroscopy")
+    assert result.page_number == 10
 
 
 def test_parse_figure_9():

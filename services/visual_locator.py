@@ -129,8 +129,41 @@ def _question_names_pdf(question: str, pdf_name: str) -> bool:
 
 def _previous_target(messages: list[dict], target_type: str | None = None) -> dict | None:
     for message in reversed(messages or []):
-        target = message.get("visual_target") or message.get("evidence", {}).get("visual_target")
-        if not isinstance(target, dict) or target.get("status") != "resolved":
+        if not isinstance(message, dict):
+            continue
+
+        direct_target = message.get("visual_target")
+        evidence = message.get("evidence")
+        if not isinstance(evidence, dict):
+            evidence = {}
+        evidence_target = evidence.get("visual_target")
+
+        target = None
+        for candidate in (direct_target, evidence_target):
+            if not isinstance(candidate, dict):
+                continue
+            status = candidate.get("status")
+            candidate_type = candidate.get("target_type")
+            candidate_number = candidate.get("target_number")
+            pdf_name = candidate.get("pdf_name")
+            page_number = candidate.get("page_number")
+            if status not in (None, "resolved"):
+                continue
+            if candidate_type not in {"figure", "table"}:
+                continue
+            if not isinstance(candidate_number, str) or not candidate_number.strip():
+                continue
+            if not isinstance(pdf_name, str) or not pdf_name.strip():
+                continue
+            if (
+                not isinstance(page_number, int)
+                or isinstance(page_number, bool)
+                or page_number < 1
+            ):
+                continue
+            target = candidate
+            break
+        if target is None:
             continue
         return target if not target_type or target.get("target_type") == target_type else None
     return None

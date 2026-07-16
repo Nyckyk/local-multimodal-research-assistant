@@ -262,24 +262,43 @@ else:
 # ---------------------------------------------------------
 
 for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    if not isinstance(message, dict):
+        continue
+    role = message.get("role")
+    content = message.get("content")
+    if not isinstance(role, str) or not isinstance(content, str):
+        continue
+    with st.chat_message(role):
+        st.markdown(content)
 
         evidence = message.get("evidence")
+        if not isinstance(evidence, dict):
+            evidence = None
+        message_sources = message.get("sources")
+        if not isinstance(message_sources, list):
+            message_sources = []
 
-        if message.get("sources") or evidence:
+        if message_sources or evidence:
             with st.expander("Sources"):
                 if evidence:
                     st.write(
-                        f"- Visual analysis: {evidence['pdf']}, "
-                        f"page {evidence['page']}"
+                        f"- Visual analysis: {evidence.get('pdf', 'unknown source')}, "
+                        f"page {evidence.get('page', 'unknown')}"
                     )
 
-                for source in message.get("sources", []):
+                for source in message_sources:
+                    if not isinstance(source, dict):
+                        continue
+                    source_score = source.get("score")
+                    if (
+                        not isinstance(source_score, (int, float))
+                        or isinstance(source_score, bool)
+                    ):
+                        source_score = 0.0
                     st.write(
-                        f"- Retrieved text: {source['source']}, "
-                        f"page {source['page']} "
-                        f"(score: {source['score']:.3f})"
+                        f"- Retrieved text: {source.get('source', 'unknown source')}, "
+                        f"page {source.get('page', 'unknown')} "
+                        f"(score: {source_score:.3f})"
                     )
 
 
@@ -314,10 +333,16 @@ if question:
             conversation_history = []
 
             for message in recent_messages[:-1]:
+                if not isinstance(message, dict):
+                    continue
+                role = message.get("role")
+                content = message.get("content")
+                if not isinstance(role, str) or not isinstance(content, str):
+                    continue
                 conversation_history.append(
                     {
-                        "role": message["role"],
-                        "content": message["content"],
+                        "role": role,
+                        "content": content,
                     }
                 )
 
@@ -343,16 +368,23 @@ if question:
                 (
                     message.get("evidence")
                     for message in reversed(st.session_state.messages[:-1])
-                    if isinstance(message.get("evidence"), dict)
+                    if isinstance(message, dict)
+                    and isinstance(message.get("evidence"), dict)
                     and message["evidence"].get("vision_result")
                 ),
                 None,
             )
-            previous_sources = [
-                source.get("pdf", source.get("source", ""))
-                for message in st.session_state.messages[:-1]
-                for source in message.get("sources", [])
-            ]
+            previous_sources = []
+            for message in st.session_state.messages[:-1]:
+                if not isinstance(message, dict):
+                    continue
+                message_sources = message.get("sources")
+                if not isinstance(message_sources, list):
+                    continue
+                previous_sources.extend(
+                    source.get("pdf", source.get("source", ""))
+                    for source in message_sources if isinstance(source, dict)
+                )
             if manual_visual_override and manual_pdf is not None:
                 resolution = manual_visual_resolution(
                     manual_pdf, int(manual_page_number), question
