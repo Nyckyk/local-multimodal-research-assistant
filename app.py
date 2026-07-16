@@ -570,15 +570,35 @@ if question:
                             st.code("\n".join(
                                 vision_debug["initial_validation_errors"]
                             ))
+                            if vision_debug.get("initial_response"):
+                                st.text_area(
+                                    "Initial raw structured output",
+                                    value=vision_debug["initial_response"],
+                                    height=220,
+                                    key=(
+                                        f"initial_raw_"
+                                        f"{len(st.session_state.messages)}"
+                                    ),
+                                )
                             if vision_debug.get("repaired_validation_result") == "passed":
                                 st.markdown("### Repaired-output validation: passed")
                         if vision_debug.get("validation_error"):
                             st.markdown("### Vision validation error")
                             st.code(vision_debug["validation_error"])
                         if vision_debug.get("raw_vision_response"):
-                            st.markdown("### Raw vision response")
+                            repaired_output = (
+                                vision_debug.get("initial_validation_errors")
+                                and vision_debug.get("repaired_validation_result") == "passed"
+                            )
+                            st.markdown(
+                                "### Repaired/final vision response"
+                                if repaired_output else "### Raw vision response"
+                            )
                             st.text_area(
-                                "Raw structured output",
+                                (
+                                    "Repaired/final structured output"
+                                    if repaired_output else "Raw structured output"
+                                ),
                                 value=vision_debug["raw_vision_response"],
                                 height=220,
                                 key=f"raw_vision_{len(st.session_state.messages)}",

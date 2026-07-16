@@ -260,6 +260,42 @@ def test_duplicate_figure_one_without_context_is_ambiguous():
     assert {row["pdf_name"] for row in result.candidates[:2]} == {"aging.pdf", "tissue.pdf"}
 
 
+def test_generic_identifier_score_gap_below_configured_margin_is_ambiguous():
+    index = _index(
+        ("one.pdf", 2, "figure", "1", "Figure 1. First topic", "caption"),
+        ("two.pdf", 37, "figure", "1", "Figure 1. Second topic", "caption"),
+    )
+    with patch(
+        "services.visual_locator._embedding_relevance",
+        return_value=[0.4, 0.2],
+    ):
+        result = resolve_visual_target("Explain Figure 1.", index)
+    gap = result.candidates[0]["confidence"] - result.candidates[1]["confidence"]
+    assert abs(gap - 0.06) < 1e-9
+    assert result.status == "ambiguous"
+    assert {row["pdf_name"] for row in result.candidates} == {"one.pdf", "two.pdf"}
+
+
+def test_real_figure_one_explicit_bioimpedance_name_resolves_page_two():
+    result = resolve_visual_target(
+        "Explain Figure 1 in the bioimpedance paper.",
+        load_or_build_visual_index(),
+    )
+    assert result.status == "resolved", result.to_dict()
+    assert result.pdf_name.startswith("Bioimpedance spectroscopy")
+    assert result.page_number == 2
+
+
+def test_real_figure_one_hallmarks_terminology_resolves_page_thirty_seven():
+    result = resolve_visual_target(
+        "Explain the nine hallmarks in Figure 1.",
+        load_or_build_visual_index(),
+    )
+    assert result.status == "resolved", result.to_dict()
+    assert result.pdf_name == "hall marks of aging.pdf"
+    assert result.page_number == 37
+
+
 def test_duplicate_figure_one_uses_prior_pdf_only_with_visual_context():
     index = _index(
         ("aging.pdf", 37, "figure", "1", "Figure 1. Hallmarks", "caption"),

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -19,6 +20,11 @@ RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 INITIAL_RESULTS = 20
 FINAL_RESULTS = 8 
 MAX_HISTORY_MESSAGES = 6
+
+VISUAL_AMBIGUITY_MARGIN = float(os.getenv("VISUAL_AMBIGUITY_MARGIN", "0.075"))
+NYQUIST_LOCAL_DEVIATION_THRESHOLD = float(
+    os.getenv("NYQUIST_LOCAL_DEVIATION_THRESHOLD", "0.02")
+)
 
 CHUNK_SIZE = 1600
 CHUNK_OVERLAP = 300

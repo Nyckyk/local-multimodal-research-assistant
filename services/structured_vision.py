@@ -10,7 +10,7 @@ from pathlib import Path
 import fitz
 import ollama
 
-from settings import VISION_MODEL
+from settings import NYQUIST_LOCAL_DEVIATION_THRESHOLD, VISION_MODEL
 
 STRUCTURED_NUM_PREDICT = 1800
 COMPACT_PANEL_NUM_PREDICT = 650
@@ -1526,6 +1526,9 @@ def _colored_nyquist_fit_reading(
             if (
                 red > 160 and red > green + 35
                 and green > 30 and blue < 180
+                and width * 0.06 < x < width * 0.95
+                and height * 0.06 < y < height * 0.86
+                and not (x > width * 0.72 and y < height * 0.22)
             ):
                 orange_by_x.setdefault(x, []).append(y)
     if len(blue_points) < 80 or sum(map(len, orange_by_x.values())) < 80:
@@ -1564,11 +1567,16 @@ def _colored_nyquist_fit_reading(
         return None
     left_score = sum(left) / len(left) / height
     right_score = sum(right) / len(right) / height
+    right_endpoint_extension = max(
+        0.0,
+        (max(orange_by_x) - max(x_values)) / width,
+    )
     return {
         "panel": panel.get("panel"),
         "group": panel.get("group"),
         "left_normalized_largest_deviation": left_score,
         "right_normalized_largest_deviation": right_score,
+        "right_endpoint_extension": right_endpoint_extension,
         "confidence": min(0.95, 0.70 + len(centres) / 200),
     }
 
@@ -1590,8 +1598,9 @@ def _validate_nyquist_fit_reading(
         raise StructuredOutputError("Nyquist fit verification returned the wrong group.")
     left_score = value["left_normalized_largest_deviation"]
     right_score = value["right_normalized_largest_deviation"]
+    right_endpoint_extension = value.get("right_endpoint_extension", 0.0)
     confidence = value["confidence"]
-    for score in (left_score, right_score):
+    for score in (left_score, right_score, right_endpoint_extension):
         if (
             not isinstance(score, (int, float))
             or isinstance(score, bool)
@@ -1611,15 +1620,29 @@ def _validate_nyquist_fit_reading(
             "Nyquist fit verification confidence must be between 0 and 1."
         )
     left_score, right_score = float(left_score), float(right_score)
+    right_endpoint_extension = float(right_endpoint_extension)
     largest = max(left_score, right_score)
     gap = abs(left_score - right_score)
     value["normalized_largest_deviation"] = largest
-    value["largest_deviation_side"] = (
-        "uncertain"
-        if gap < 0.002 or gap / max(largest, 1e-9) < 0.10
-        else "left" if left_score > right_score else "right"
+    value["local_deviation_score"] = max(
+        largest, right_endpoint_extension
     )
+    if right_endpoint_extension >= NYQUIST_LOCAL_DEVIATION_THRESHOLD:
+        value["largest_deviation_side"] = "right"
+    else:
+        value["largest_deviation_side"] = (
+            "uncertain"
+            if gap < 0.002 or gap / max(largest, 1e-9) < 0.10
+            else "left" if left_score > right_score else "right"
+        )
     return value
+
+
+def _is_located_nyquist_deviation(text: str) -> bool:
+    return bool(
+        re.search(r"\b(?:deviation|mismatch|separation)\w*\b", text, re.IGNORECASE)
+        and re.search(r"\b(?:left|right|low|high|endpoint)\b", text, re.IGNORECASE)
+    )
 
 
 def _replace_nyquist_fit_comparison(
@@ -1641,24 +1664,28 @@ def _replace_nyquist_fit_comparison(
         ordered = [(panel, {}) for panel in value["panels"][:2]]
     groups = [str(panel.get("group", "")).strip() for panel, _ in ordered]
     for panel, reading in ordered:
-        side = reading.get("largest_deviation_side")
-        if side not in {"left", "right"}:
-            continue
         for field in ("shape_features", "visible_trends"):
             panel[field] = [
                 text for text in panel[field]
-                if not re.search(
+                if not _is_located_nyquist_deviation(str(text))
+                and not re.search(
                     r"\b(?:excellent|perfect(?:ly)?|superimposed|indistinguishable)\b"
                     r"[^.]{0,70}\b(?:entire|whole|throughout)\b[^.]{0,30}"
                     r"\b(?:arc|plot|range)\b",
-                    str(text),
-                    re.IGNORECASE,
+                    str(text), re.IGNORECASE,
                 )
             ]
+        side = reading.get("largest_deviation_side")
+        if (
+            side not in {"left", "right"}
+            or float(reading.get("local_deviation_score", 0.0))
+            < NYQUIST_LOCAL_DEVIATION_THRESHOLD
+        ):
+            continue
         location = "high Re(Z)" if side == "right" else "low Re(Z)"
         deviation_trend = (
-            f"The largest visible model-data deviation is on the {side} side "
-            f"at {location}."
+            f"For {panel.get('group')}, the tight panel crop shows the largest "
+            f"visible model-data deviation on the {side} side at {location}."
         )
         if _normal_name(deviation_trend) not in {
             _normal_name(trend) for trend in panel["visible_trends"]
@@ -1667,9 +1694,16 @@ def _replace_nyquist_fit_comparison(
     comparisons = [
         item for item in value["comparisons"]
         if not re.search(
-            r"\b(?:closer|better)\b.{0,30}\bfit\b|\bfit\b.{0,30}\b(?:closer|better)\b",
+            r"\b(?:fit|deviation|mismatch|separation)\w*\b",
             f"{item.get('claim', '')} {item.get('metric', '')}",
             re.IGNORECASE,
+        )
+    ]
+    value["uncertain_values"] = [
+        note for note in value["uncertain_values"]
+        if not re.search(
+            r"\brelative\b[^.]{0,50}\bfit\b|\bfit\b[^.]{0,50}\bdistinguish",
+            str(note), re.IGNORECASE,
         )
     ]
     scores = [
@@ -1710,9 +1744,6 @@ def _replace_nyquist_fit_comparison(
             "uncertain": True,
             "evidence_conflict": False,
         }
-        note = "Relative Nyquist fit closeness could not be distinguished reliably."
-        if note not in value["uncertain_values"]:
-            value["uncertain_values"].append(note)
     else:
         best_index = min(
             range(len(ordered)),

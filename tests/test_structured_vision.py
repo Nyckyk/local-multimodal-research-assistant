@@ -803,6 +803,78 @@ class StructuredVisionTests(unittest.TestCase):
             )
         self.assertTrue(validated["comparisons"][-1]["uncertain"])
         self.assertIn("too close", validated["comparisons"][-1]["claim"])
+        self.assertEqual(validated["uncertain_values"], [])
+        rendered = structured.format_structured_result("graph", validated)
+        self.assertEqual(rendered.lower().count("too close to distinguish"), 1)
+
+    def test_tight_crop_deviations_remain_panel_specific_and_significant(self):
+        panels = [
+            graph_panel(
+                "a", "nyquist", "Specimen Alpha",
+                axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+                trends=[
+                    "The fit is good.",
+                    "The largest deviation is on the right side.",
+                ],
+            ),
+            graph_panel(
+                "b", "nyquist", "Specimen Beta",
+                axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+                trends=[
+                    "The fit is good.",
+                    "The largest deviation is on the right side.",
+                ],
+            ),
+        ]
+        result = {
+            "figure_number": "x", "panels": panels,
+            "comparisons": [
+                comparison(
+                    "Specimen Alpha deviates on the right.",
+                    "Specimen Alpha", "highest", "model-data deviation",
+                ),
+                comparison(
+                    "Specimen Beta deviates on the left.",
+                    "Specimen Beta", "highest", "model-data deviation",
+                ),
+            ],
+            "frequency_direction_evidence": [], "uncertain_values": [
+                "Relative Nyquist fit closeness could not be distinguished reliably."
+            ],
+        }
+        readings = [
+            {
+                "panel": "a", "group": "Specimen Alpha",
+                "left_normalized_largest_deviation": 0.004,
+                "right_normalized_largest_deviation": 0.009,
+                "right_endpoint_extension": 0.0, "confidence": 0.9,
+            },
+            {
+                "panel": "b", "group": "Specimen Beta",
+                "left_normalized_largest_deviation": 0.004,
+                "right_normalized_largest_deviation": 0.008,
+                "right_endpoint_extension": 0.05, "confidence": 0.9,
+            },
+        ]
+        with patch.object(
+            structured,
+            "_call_model",
+            side_effect=[json.dumps(reading) for reading in readings],
+        ):
+            validated, _, status = structured.verify_nyquist_fit_comparison(
+                result,
+                [("a", Path("a.png")), ("b", Path("b.png"))],
+            )
+        self.assertEqual(status, "verified")
+        alpha_text = " ".join(validated["panels"][0]["visible_trends"])
+        beta_text = " ".join(validated["panels"][1]["visible_trends"])
+        self.assertNotRegex(alpha_text.lower(), r"deviation.*(?:right|high)")
+        self.assertIn("For Specimen Beta", beta_text)
+        self.assertIn("right side at high Re(Z)", beta_text)
+        self.assertNotIn("Specimen Alpha", beta_text)
+        self.assertEqual(validated["uncertain_values"], [])
+        rendered = structured.format_structured_result("graph", validated)
+        self.assertEqual(rendered.lower().count("too close to distinguish"), 1)
 
     def test_nyquist_combined_panel_and_sample_identity_is_normalized(self):
         panel = graph_panel(
@@ -1138,6 +1210,40 @@ class StructuredVisionTests(unittest.TestCase):
         self.assertEqual(
             debug["final_answer_code_path"],
             "validated_repaired_structured_vision",
+        )
+        self.assertIn("Figure 13", answer)
+
+    def test_valid_raw_graph_has_no_initial_or_final_validation_error(self):
+        valid = {
+            "figure_number": "13",
+            "panels": [
+                graph_panel(
+                    "a", "nyquist", "Sample 10",
+                    axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+                    complexity=0.2,
+                ),
+                graph_panel(
+                    "b", "nyquist", "Sample 7",
+                    axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+                    complexity=0.2,
+                ),
+            ],
+            "comparisons": [], "frequency_direction_evidence": [],
+            "uncertain_values": [],
+        }
+        debug = {}
+        with patch.object(structured, "_call_model", return_value=json.dumps(valid)):
+            answer = structured.analyse_typed_image(
+                Path("figure13.png"), "graph",
+                "Compare Samples 10 and 7 in Figure 13.",
+                debug_info=debug,
+            )
+        self.assertEqual(debug["initial_validation_errors"], [])
+        self.assertEqual(debug["repaired_validation_result"], "not_attempted")
+        self.assertEqual(debug["validation_error"], "")
+        self.assertNotIn("Graph complexity", json.dumps(debug))
+        self.assertEqual(
+            debug["final_answer_code_path"], "validated_structured_vision"
         )
         self.assertIn("Figure 13", answer)
 

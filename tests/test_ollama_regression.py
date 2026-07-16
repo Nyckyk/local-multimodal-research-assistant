@@ -176,7 +176,7 @@ def _run_vision_case(case, artifact_writer):
         elif case["case_id"] == "figure_9_six_panel_bode_graph":
             _assert_figure_9(case, value)
         elif case["case_id"] == "figure_13_nyquist_graph":
-            _assert_figure_13(case, value, answer)
+            _assert_figure_13(case, value, answer, debug)
         elif case["case_id"] == "table_1":
             _assert_table_1(case, value)
         _write_debug(artifact_writer, case["case_id"], debug, answer=answer)
@@ -275,7 +275,7 @@ def _assert_figure_9(case, value):
     assert comparisons["greatest_phase_complexity_group"] == "Group 2"
 
 
-def _assert_figure_13(case, value, answer):
+def _assert_figure_13(case, value, answer, debug):
     rendered = json.dumps(value, ensure_ascii=False)
     for fact in ("Sample 10", "Sample 7"):
         assert _contains(rendered, fact)
@@ -329,6 +329,12 @@ def _assert_figure_13(case, value, answer):
     assert _contains(sample_seven_evidence, "right") or _contains(
         sample_seven_evidence, "high Re(Z)"
     )
+    sample_ten_trends = " ".join(map(str, by_panel["a"]["visible_trends"]))
+    sample_seven_trends = " ".join(map(str, by_panel["b"]["visible_trends"]))
+    assert "tight panel crop" not in sample_ten_trends.lower()
+    assert "tight panel crop" in sample_seven_trends.lower()
+    assert _contains(sample_seven_trends, "Sample 7")
+    assert _contains(sample_seven_trends, "high Re(Z)")
     for item in value["comparisons"]:
         if re.search(r"\b(?:closer|better)\b", _normal(item.get("claim", ""))):
             assert item.get("uncertain") or _contains(
@@ -352,6 +358,42 @@ def _assert_figure_13(case, value, answer):
     assert _contains(scale_comparison["subject"], "Sample 10")
     assert "10^5" in scale_comparison["claim"]
     assert "10^4" in scale_comparison["claim"]
+    fit_uncertainties = []
+    for item in value["comparisons"]:
+        if item.get("uncertain") and (
+            _contains(item.get("metric", ""), "fit")
+            or _contains(item.get("metric", ""), "model-data deviation")
+        ):
+            fit_uncertainties.append(item)
+    assert len(fit_uncertainties) == 1
+    assert _contains(fit_uncertainties[0]["claim"], "too close to distinguish")
+    assert not any(
+        _contains(note, "fit closeness") for note in value["uncertain_values"]
+    )
+    assert _normal(answer).count("too close to distinguish") == 1
+    initial = debug.get("initial_parsed_json")
+    initial_complexities = [
+        panel.get("complexity_score") for panel in initial.get("panels", [])
+    ] if isinstance(initial, dict) else []
+    complexity_errors = [
+        error for error in debug.get("initial_validation_errors", [])
+        if "complexity" in error.casefold()
+    ]
+    if complexity_errors:
+        assert any(
+            not isinstance(score, (int, float))
+            or isinstance(score, bool)
+            or not 0 <= score <= 1
+            for score in initial_complexities
+        )
+    elif initial_complexities:
+        assert all(
+            isinstance(score, (int, float))
+            and not isinstance(score, bool)
+            and 0 <= score <= 1
+            for score in initial_complexities
+        )
+    assert debug.get("validation_error") == ""
     assert value["frequency_direction_evidence"] == []
     for phrase in case["prohibited_facts"]:
         assert not _contains(rendered + answer, phrase), f"unsupported direction inferred: {phrase}"

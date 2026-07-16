@@ -15,11 +15,10 @@ from services.visual_reference_parser import (
     canonical_identifier,
     parse_visual_reference,
 )
-from settings import PAPERS_FOLDER
+from settings import PAPERS_FOLDER, VISUAL_AMBIGUITY_MARGIN
 
 
 SAFE_CONFIDENCE = 0.72
-AMBIGUITY_MARGIN = 0.035
 _STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "does", "explain",
     "fig", "figure", "for", "from", "how", "in", "is", "it", "of", "on",
@@ -121,7 +120,11 @@ def _question_names_pdf(question: str, pdf_name: str) -> bool:
         return True
     if not stem_tokens:
         return False
-    return len(set(stem_tokens) & set(question_key.split())) >= min(2, len(stem_tokens))
+    overlap = set(stem_tokens) & set(question_key.split())
+    return (
+        len(overlap) >= min(2, len(stem_tokens))
+        or any(len(token) >= 8 for token in overlap)
+    )
 
 
 def _previous_target(messages: list[dict], target_type: str | None = None) -> dict | None:
@@ -307,8 +310,20 @@ def resolve_visual_target(
         }
         for row in scored
     ]
-    if second and top["pdf_name"] != second["pdf_name"] and (
-        top["rank_score"] - second["rank_score"] < AMBIGUITY_MARGIN
+    explicit_or_context_tie_break = any(
+        reason in top["score_reasons"]
+        for reason in (
+            "PDF named in question",
+            "selected PDF preference",
+            "previous visual PDF",
+            "conversation source context",
+        )
+    )
+    if (
+        second
+        and top["pdf_name"] != second["pdf_name"]
+        and top["rank_score"] - second["rank_score"] < VISUAL_AMBIGUITY_MARGIN
+        and not explicit_or_context_tie_break
     ):
         return VisualResolution(
             status="ambiguous",
@@ -434,5 +449,7 @@ def clear_visual_conversation_state(state) -> None:
     state["pending_preferred_pdf_name"] = "No preference"
 
     for key in list(state):
-        if str(key).startswith(("vision_result_", "raw_vision_", "debug_chunk_")):
+        if str(key).startswith((
+            "vision_result_", "raw_vision_", "initial_raw_", "debug_chunk_",
+        )):
             state.pop(key, None)
