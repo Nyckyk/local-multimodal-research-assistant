@@ -617,6 +617,65 @@ class StructuredVisionTests(unittest.TestCase):
                 ):
                     structured.validate_graph(result)
 
+    def test_graph_formatter_normalizes_figure_prefix_once(self):
+        panel = graph_panel(
+            "a", "nyquist", "Sample 10",
+            axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+        )
+        for identifier in ("13", "Fig. 13", "Figure 13"):
+            with self.subTest(identifier=identifier):
+                rendered = structured.format_structured_result("graph", {
+                    "figure_number": identifier,
+                    "panels": [panel],
+                    "comparisons": [],
+                    "uncertain_values": [],
+                })
+                self.assertTrue(
+                    rendered.startswith("**Figure 13 graph analysis**")
+                )
+                self.assertNotIn("Figure Fig.", rendered)
+                self.assertNotIn("Figure Figure", rendered)
+
+    def test_graph_formatter_includes_group_without_duplication(self):
+        panels = [
+            graph_panel(
+                "a", "nyquist", "Sample 10",
+                axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+            ),
+            graph_panel(
+                "b \u2014 Sample 7", "nyquist", "Sample 7",
+                axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+            ),
+        ]
+        rendered = structured.format_structured_result("graph", {
+            "figure_number": "Fig. 13",
+            "panels": panels,
+            "comparisons": [],
+            "uncertain_values": [],
+        })
+        self.assertIn("**Panel a \u2014 Sample 10**", rendered)
+        self.assertEqual(rendered.count("**Panel b \u2014 Sample 7**"), 1)
+        self.assertNotIn("Sample 7 \u2014 Sample 7", rendered)
+
+        compact_panel = {
+            "panel": "a", "group": "Group 1",
+            "x_axis": {"label": "Frequency", "unit": "Hz", "scale": "log"},
+            "y_axis": {"label": "|Zfat|", "unit": "ohm", "scale": "linear"},
+            "visible_trend": "Magnitude decreases.",
+        }
+        compact = structured.format_compact_graph_result({
+            "figure_number": "Figure 9",
+            "panels": [compact_panel],
+            "comparisons": {
+                "magnitude_order_high_to_low": [],
+                "greatest_phase_complexity_group": "",
+                "uncertain": [],
+            },
+            "uncertain_values": [],
+        })
+        self.assertTrue(compact.startswith("**Figure 9 graph analysis**"))
+        self.assertIn("**Panel a \u2014 Group 1**", compact)
+
     def test_figure_thirteen_comparison_is_deduplicated_and_scale_grounded(self):
         sample_ten = graph_panel(
             "(a) Sample 10", "nyquist", None,

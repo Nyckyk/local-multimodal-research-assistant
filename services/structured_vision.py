@@ -2088,11 +2088,28 @@ Caption/text cross-check:
 """
 
 
+def _display_figure_label(identifier) -> str:
+    text = str(identifier or "").strip()
+    text = re.sub(r"^(?:fig(?:ure)?\.?)\s*", "", text, flags=re.IGNORECASE)
+    return f"Figure {text}".rstrip()
+
+
+def _display_panel_label(panel_identifier, group=None) -> str:
+    panel_text = str(panel_identifier or "").strip()
+    panel_text = re.sub(r"^panel\s+", "", panel_text, flags=re.IGNORECASE)
+    group_text = str(group or "").strip()
+    label = f"Panel {panel_text}".rstrip()
+    if group_text and _normal_name(group_text) not in _normal_name(panel_text):
+        label += f" \u2014 {group_text}"
+    return label
+
+
 def format_compact_graph_result(value: dict) -> str:
-    lines = [f"**Figure {value.get('figure_number', '')} graph analysis**"]
+    figure_label = _display_figure_label(value.get("figure_number"))
+    lines = [f"**{figure_label} graph analysis**"]
     for panel in value["panels"]:
         lines.extend([
-            f"\n- **Panel {panel['panel']} — {panel['group']}**",
+            f"\n- **{_display_panel_label(panel.get('panel'), panel.get('group'))}**",
             f"  - x-axis: {panel['x_axis']['label']} ({panel['x_axis']['unit']}, {panel['x_axis']['scale']})",
             f"  - y-axis: {panel['y_axis']['label']} ({panel['y_axis']['unit']}, {panel['y_axis']['scale']})",
             f"  - {panel['visible_trend']}",
@@ -2394,9 +2411,12 @@ def format_structured_result(visual_type: str, value: dict) -> str:
             lines.extend(["", *[f"- {item}" for item in value["comparisons"]]])
         return "\n".join(lines)
     if visual_type == "graph":
-        lines = [f"**Figure {value.get('figure_number', '')} graph analysis**"]
+        figure_label = _display_figure_label(value.get("figure_number"))
+        lines = [f"**{figure_label} graph analysis**"]
         for panel in value["panels"]:
-            lines.append(f"\n- **Panel {panel['panel']}**")
+            lines.append(
+                f"\n- **{_display_panel_label(panel.get('panel'), panel.get('group'))}**"
+            )
             x_axis, y_axis = panel["x_axis"], panel["y_axis"]
             lines.append(
                 f"  - x-axis: {x_axis['label']} "
