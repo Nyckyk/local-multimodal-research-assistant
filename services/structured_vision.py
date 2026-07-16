@@ -894,6 +894,26 @@ def _scientific_multiplier_factor(multiplier) -> float | None:
     return 10.0 ** int(match.group(1)) if match else None
 
 
+def normalize_nyquist_axis_label(label: str) -> str:
+    """Use conventional impedance notation without changing the variable."""
+    text = unicodedata.normalize("NFKC", str(label or ""))
+    text = re.sub(
+        r"(?:-|\u2212|\u2013)\s*Img\s*\(\s*Z\s*\)",
+        "-Im(Z)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text
+
+
+def _scientific_multiplier_exponent(axis: dict) -> int | None:
+    factor = _scientific_multiplier_factor(axis.get("scientific_multiplier"))
+    if factor is None or factor <= 0:
+        return None
+    exponent = round(math.log10(factor))
+    return exponent if math.isclose(factor, 10.0 ** exponent) else None
+
+
 def _visible_numeric_axis_range(axis: dict) -> tuple[float, float] | None:
     ticks = [_numeric_tick(label) for label in axis.get("tick_labels", [])]
     factor = _scientific_multiplier_factor(axis.get("scientific_multiplier"))
@@ -1125,6 +1145,90 @@ def _validate_comparison(
                 )
 
 
+def _comparison_claim_key(comparison: dict) -> str:
+    claim = unicodedata.normalize("NFKC", str(comparison.get("claim", "")))
+    return re.sub(r"[^a-z0-9]+", " ", claim.casefold()).strip()
+
+
+def _deduplicate_graph_comparisons(comparisons: list[dict]) -> list[dict]:
+    deduplicated = []
+    by_claim = {}
+    for comparison in comparisons:
+        key = _comparison_claim_key(comparison)
+        if not key or key not in by_claim:
+            deduplicated.append(comparison)
+            if key:
+                by_claim[key] = comparison
+            continue
+        existing = by_claim[key]
+        existing["evidence"] = list(dict.fromkeys([
+            *existing.get("evidence", []), *comparison.get("evidence", []),
+        ]))
+        if isinstance(comparison.get("confidence"), (int, float)):
+            existing["confidence"] = max(
+                float(existing.get("confidence", 0.0)),
+                float(comparison["confidence"]),
+            )
+        existing["uncertain"] = bool(
+            existing.get("uncertain") or comparison.get("uncertain")
+        )
+        existing["evidence_conflict"] = bool(
+            existing.get("evidence_conflict") or comparison.get("evidence_conflict")
+        )
+    return deduplicated
+
+
+def _add_nyquist_scale_comparison(value: dict) -> None:
+    scale_rows = []
+    for panel in value["panels"]:
+        if str(panel.get("graph_kind", "")).casefold() != "nyquist":
+            continue
+        x_exponent = _scientific_multiplier_exponent(panel["x_axis"])
+        y_exponent = _scientific_multiplier_exponent(panel["y_axis"])
+        group = str(panel.get("group", "")).strip()
+        if not group or x_exponent is None or x_exponent != y_exponent:
+            return
+        scale_rows.append((group, x_exponent))
+    if len(scale_rows) < 2:
+        return
+    largest_exponent = max(exponent for _, exponent in scale_rows)
+    largest = [row for row in scale_rows if row[1] == largest_exponent]
+    lower = [row for row in scale_rows if row[1] < largest_exponent]
+    if len(largest) != 1 or not lower:
+        return
+
+    largest_group = largest[0][0]
+    lower_phrases = [
+        f"{group} uses approximately \u00d710^{exponent}"
+        for group, exponent in lower
+    ]
+    if len(lower_phrases) == 1:
+        lower_text = lower_phrases[0]
+    else:
+        lower_text = ", ".join(lower_phrases[:-1]) + f", and {lower_phrases[-1]}"
+    comparison = {
+        "claim": (
+            f"{largest_group} has the larger overall impedance scale because its "
+            f"Re(Z) and -Im(Z) axes use approximately \u00d710^{largest_exponent}, "
+            f"while {lower_text}."
+        ),
+        "subject": largest_group,
+        "relation": "highest",
+        "metric": "overall impedance scale",
+        "evidence": ["vision"],
+        "confidence": 0.95,
+        "uncertain": False,
+        "evidence_conflict": False,
+    }
+    value["comparisons"] = [
+        item for item in value["comparisons"]
+        if "overallimpedancescale" not in _normal_name(
+            f"{item.get('metric', '')} {item.get('claim', '')}"
+        )
+    ]
+    value["comparisons"].append(comparison)
+
+
 def validate_graph(value: dict, evidence_text: str = "") -> dict:
     _require_keys(
         value,
@@ -1155,6 +1259,21 @@ def validate_graph(value: dict, evidence_text: str = "") -> dict:
             if combined_identity:
                 panel["panel"] = combined_identity.group(1)
                 panel["group"] = combined_identity.group(2)
+        x_axis, y_axis = panel.get("x_axis"), panel.get("y_axis")
+        looks_nyquist = str(panel.get("graph_kind", "")).casefold() == "nyquist"
+        if isinstance(x_axis, dict):
+            looks_nyquist = looks_nyquist or (
+                "re(z)" in str(x_axis.get("label", "")).casefold().replace(" ", "")
+            )
+        if looks_nyquist and isinstance(y_axis, dict):
+            y_axis["label"] = normalize_nyquist_axis_label(y_axis.get("label", ""))
+            for field in ("shape_features", "visible_trends"):
+                if isinstance(panel.get(field), list):
+                    panel[field] = [
+                        normalize_nyquist_axis_label(item)
+                        if isinstance(item, str) else item
+                        for item in panel[field]
+                    ]
         _validate_axis(panel["x_axis"], str(panel["panel"]), "x")
         _validate_axis(panel["y_axis"], str(panel["panel"]), "y")
         if not all(
@@ -1174,6 +1293,7 @@ def validate_graph(value: dict, evidence_text: str = "") -> dict:
         raise StructuredOutputError("Graph frequency direction evidence must be a list.")
     for comparison in value["comparisons"]:
         _validate_comparison(comparison, value["panels"], evidence_text)
+    value["comparisons"] = _deduplicate_graph_comparisons(value["comparisons"])
 
     is_nyquist = any(
         str(panel.get("graph_kind", "")).lower() == "nyquist"
@@ -1181,6 +1301,12 @@ def validate_graph(value: dict, evidence_text: str = "") -> dict:
         for panel in value["panels"]
     )
     if is_nyquist:
+        for comparison in value["comparisons"]:
+            for field in ("claim", "metric"):
+                if isinstance(comparison.get(field), str):
+                    comparison[field] = normalize_nyquist_axis_label(
+                        comparison[field]
+                    )
         panel_ids = [_normal_name(panel.get("panel", "")) for panel in value["panels"]]
         panel_groups = [
             _normal_name(panel.get("group", "")) for panel in value["panels"]
@@ -1191,6 +1317,10 @@ def validate_graph(value: dict, evidence_text: str = "") -> dict:
             )
         for panel in value["panels"]:
             _validate_nyquist_panel(panel)
+        _add_nyquist_scale_comparison(value)
+        for comparison in value["comparisons"]:
+            _validate_comparison(comparison, value["panels"], evidence_text)
+        value["comparisons"] = _deduplicate_graph_comparisons(value["comparisons"])
         deviation_subjects = {
             str(comparison.get("subject", "")).strip().lower()
             for comparison in value["comparisons"]
@@ -1526,10 +1656,14 @@ def _replace_nyquist_fit_comparison(
                 )
             ]
         location = "high Re(Z)" if side == "right" else "low Re(Z)"
-        panel["visible_trends"].append(
+        deviation_trend = (
             f"The largest visible model-data deviation is on the {side} side "
             f"at {location}."
         )
+        if _normal_name(deviation_trend) not in {
+            _normal_name(trend) for trend in panel["visible_trends"]
+        }:
+            panel["visible_trends"].append(deviation_trend)
     comparisons = [
         item for item in value["comparisons"]
         if not re.search(
@@ -2371,7 +2505,7 @@ def analyse_typed_image(
                 value = validate_typed_response(
                     visual_type, repaired_json, evidence_text
                 )
-                repaired_validation_result = "validated"
+                repaired_validation_result = "passed"
                 retry_kind = "grounded_topology_repair"
                 used_repair = True
             except StructuredOutputError as grounding_error:
@@ -2418,7 +2552,7 @@ def analyse_typed_image(
                 value = validate_typed_response(
                     visual_type, repaired_json, evidence_text
                 )
-                repaired_validation_result = "validated"
+                repaired_validation_result = "passed"
                 raw = retry_raw
                 used_repair = True
             except StructuredOutputError as second_error:
@@ -2432,7 +2566,7 @@ def analyse_typed_image(
                         value = validate_typed_response(
                             visual_type, repaired_json, evidence_text
                         )
-                        repaired_validation_result = "validated"
+                        repaired_validation_result = "passed"
                         raw = retry_raw
                         retry_kind = "targeted_topology_grounded_repair"
                         used_repair = True
@@ -2473,7 +2607,6 @@ def analyse_typed_image(
     if (
         visual_type == "graph"
         and fit_verification_images
-        and re.search(r"\b(?:closer|better)\b.{0,30}\bfit\b|\bfit\b.{0,30}\bcloser\b", question, re.IGNORECASE)
     ):
         value, fit_verification_raw, fit_verification_status = (
             verify_nyquist_fit_comparison(
@@ -2500,7 +2633,7 @@ def analyse_typed_image(
             "repaired_json": repaired_json,
             "repaired_validation_result": repaired_validation_result,
             "validated_json": value,
-            "validation_error": " | ".join(errors),
+            "validation_error": "",
             "retry_kind": retry_kind if errors else "",
             "final_answer_path": "validated_typed_vision",
             "final_answer_code_path": (

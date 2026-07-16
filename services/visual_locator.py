@@ -401,3 +401,38 @@ def clear_visual_target_state(state) -> None:
         "pending_visual_question", "visual_candidate_choice",
     ):
         state.pop(key, None)
+
+
+def clear_visual_conversation_state(state) -> None:
+    """Clear chat-scoped visual evidence without touching the local library."""
+    state["messages"] = []
+    state["last_user_question"] = ""
+    clear_visual_target_state(state)
+
+    # These names cover both current state and older/debug builds so a stale
+    # resolution cannot survive an application upgrade or a Streamlit rerun.
+    for key in (
+        "previous_pdf",
+        "previous_page",
+        "previous_figure",
+        "previous_table",
+        "previous_panel",
+        "previous_visual_target",
+        "previous_source_context",
+        "target_resolution",
+        "automatic_detection_candidates",
+        "pending_ambiguity_selection",
+        "rewritten_visual_query_context",
+        "pending_preferred_pdf_name",
+    ):
+        state.pop(key, None)
+
+    # Widget-backed values cannot safely be changed after their widgets have
+    # been instantiated. Apply this automatic preference reset at the start of
+    # the next rerun, before the preferred-PDF selectbox is created. Manual
+    # override controls deliberately remain untouched.
+    state["pending_preferred_pdf_name"] = "No preference"
+
+    for key in list(state):
+        if str(key).startswith(("vision_result_", "raw_vision_", "debug_chunk_")):
+            state.pop(key, None)

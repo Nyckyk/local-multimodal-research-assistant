@@ -12,7 +12,7 @@ from services.query_rewriter import rewrite_question
 from services.visual_fallback import resolve_with_visual_fallback
 from services.visual_index import load_or_build_visual_index, visual_index_needs_rebuild
 from services.visual_locator import (
-    clear_visual_target_state,
+    clear_visual_conversation_state,
     format_resolution_problem,
     manual_visual_resolution,
     resolve_visual_target,
@@ -242,9 +242,7 @@ with st.sidebar:
         "Clear conversation",
         use_container_width=True,
     ):
-        st.session_state.messages = []
-        st.session_state.last_user_question = ""
-        clear_visual_target_state(st.session_state)
+        clear_visual_conversation_state(st.session_state)
         st.rerun()
 
 
@@ -567,6 +565,13 @@ if question:
                         if vision_debug.get("validated_json"):
                             st.markdown("### Typed vision JSON")
                             st.json(vision_debug["validated_json"])
+                        if vision_debug.get("initial_validation_errors"):
+                            st.markdown("### Initial raw-output validation errors")
+                            st.code("\n".join(
+                                vision_debug["initial_validation_errors"]
+                            ))
+                            if vision_debug.get("repaired_validation_result") == "passed":
+                                st.markdown("### Repaired-output validation: passed")
                         if vision_debug.get("validation_error"):
                             st.markdown("### Vision validation error")
                             st.code(vision_debug["validation_error"])
@@ -578,9 +583,13 @@ if question:
                                 height=220,
                                 key=f"raw_vision_{len(st.session_state.messages)}",
                             )
-                        if vision_debug.get("final_answer_path"):
+                        final_answer_code_path = (
+                            vision_debug.get("final_answer_code_path")
+                            or vision_debug.get("final_answer_path")
+                        )
+                        if final_answer_code_path:
                             st.markdown("### Final answer code path")
-                            st.code(vision_debug["final_answer_path"])
+                            st.code(final_answer_code_path)
 
                 if sources:
                     retrieval_debug = sources[0].get("retrieval_debug")

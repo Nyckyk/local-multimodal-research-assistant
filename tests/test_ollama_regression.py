@@ -288,6 +288,9 @@ def _assert_figure_13(case, value, answer):
     assert _normal(by_panel["b"]["group"]) == "sample 7"
     assert all(_normal(panel["x_axis"]["scale"]) == "linear" for panel in value["panels"])
     assert all(_normal(panel["y_axis"]["scale"]) == "linear" for panel in value["panels"])
+    assert all("img(z)" not in _normal(panel["y_axis"]["label"]) for panel in value["panels"])
+    assert all("im(z)" in _normal(panel["y_axis"]["label"]) for panel in value["panels"])
+    assert "img(z)" not in _normal(json.dumps(value, ensure_ascii=False))
     for panel in value["panels"]:
         fit_text = json.dumps(
             [panel.get("shape_features", []), panel.get("visible_trends", [])],
@@ -340,6 +343,15 @@ def _assert_figure_13(case, value, answer):
         return max(float(str(tick).replace(",", "")) for tick in panel["x_axis"]["tick_labels"]) * factor
 
     assert physical_x_max(by_panel["a"]) > physical_x_max(by_panel["b"])
+    comparison_claims = [_normal(item["claim"]) for item in value["comparisons"]]
+    assert len(comparison_claims) == len(set(comparison_claims))
+    scale_comparison = next(
+        item for item in value["comparisons"]
+        if _contains(item.get("metric", ""), "overall impedance scale")
+    )
+    assert _contains(scale_comparison["subject"], "Sample 10")
+    assert "10^5" in scale_comparison["claim"]
+    assert "10^4" in scale_comparison["claim"]
     assert value["frequency_direction_evidence"] == []
     for phrase in case["prohibited_facts"]:
         assert not _contains(rendered + answer, phrase), f"unsupported direction inferred: {phrase}"

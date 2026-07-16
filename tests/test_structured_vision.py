@@ -581,21 +581,96 @@ class StructuredVisionTests(unittest.TestCase):
             "linear",
         )
 
-    def test_graph_complexity_must_be_between_zero_and_one(self):
+    def test_graph_complexity_boundaries_and_fraction_pass(self):
+        for complexity in (0, 0.2, 1):
+            with self.subTest(complexity=complexity):
+                result = {
+                    "figure_number": "13",
+                    "panels": [graph_panel(
+                        "a", "nyquist", "Sample 10",
+                        axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+                        complexity=complexity,
+                    )],
+                    "comparisons": [], "frequency_direction_evidence": [],
+                    "uncertain_values": [],
+                }
+                self.assertEqual(
+                    structured.validate_graph(result)["panels"][0]["complexity_score"],
+                    complexity,
+                )
+
+    def test_graph_complexity_outside_boundaries_fails(self):
+        for complexity in (-0.01, 1.01):
+            with self.subTest(complexity=complexity):
+                result = {
+                    "figure_number": "13",
+                    "panels": [graph_panel(
+                        "a", "nyquist", "Sample 10",
+                        axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
+                        complexity=complexity,
+                    )],
+                    "comparisons": [], "frequency_direction_evidence": [],
+                    "uncertain_values": [],
+                }
+                with self.assertRaisesRegex(
+                    structured.StructuredOutputError, "between 0 and 1"
+                ):
+                    structured.validate_graph(result)
+
+    def test_figure_thirteen_comparison_is_deduplicated_and_scale_grounded(self):
+        sample_ten = graph_panel(
+            "(a) Sample 10", "nyquist", None,
+            axis("Re(Z)", "ohm", "linear", ["0", "1", "2"], "x10^5"),
+            axis("-Img(Z)", "ohm", "linear", ["0", "1", "2"], "x10^5"),
+            0, 200000,
+            trends=["Raw data closely follow the fitted model."],
+        )
+        sample_seven = graph_panel(
+            "b", "nyquist", "Sample 7",
+            axis("Re(Z)", "ohm", "linear", ["0", "1", "2"], "x10^4"),
+            axis("\u2212Img(Z)", "ohm", "linear", ["0", "1", "2"], "x10^4"),
+            0, 20000,
+            trends=[
+                "Raw data closely follow the fitted model.",
+                "A visible local deviation occurs on the right at high Re(Z).",
+            ],
+        )
+        for panel in (sample_ten, sample_seven):
+            panel["series"] = ["Raw Data", "Fitted Model"]
+        duplicate = comparison(
+            "Both panels show good model fits.",
+            "Sample 10", "other", "fit quality",
+        )
         result = {
             "figure_number": "13",
-            "panels": [graph_panel(
-                "a", "nyquist", "Sample 10",
-                axis("Re(Z)", "ohm"), axis("-Im(Z)", "ohm"), 0, 2,
-                complexity=2.0,
-            )],
-            "comparisons": [], "frequency_direction_evidence": [],
+            "panels": [sample_ten, sample_seven],
+            "comparisons": [duplicate, dict(duplicate)],
+            "frequency_direction_evidence": [],
             "uncertain_values": [],
         }
-        with self.assertRaisesRegex(
-            structured.StructuredOutputError, "between 0 and 1"
-        ):
-            structured.validate_graph(result)
+        validated = structured.validate_graph(result)
+        by_panel = {panel["panel"]: panel for panel in validated["panels"]}
+        self.assertEqual(by_panel["a"]["group"], "Sample 10")
+        self.assertEqual(by_panel["b"]["group"], "Sample 7")
+        self.assertEqual(by_panel["a"]["y_axis"]["label"], "-Im(Z)")
+        self.assertEqual(by_panel["b"]["y_axis"]["label"], "-Im(Z)")
+        claims = [item["claim"] for item in validated["comparisons"]]
+        normalized_claims = [structured._normal_name(claim) for claim in claims]
+        self.assertEqual(len(normalized_claims), len(set(normalized_claims)))
+        scale = next(
+            item for item in validated["comparisons"]
+            if item["metric"] == "overall impedance scale"
+        )
+        self.assertEqual(scale["subject"], "Sample 10")
+        self.assertIn("\u00d710^5", scale["claim"])
+        self.assertIn("\u00d710^4", scale["claim"])
+        self.assertTrue(all(
+            any("good" in trend.lower() for trend in panel["visible_trends"])
+            for panel in validated["panels"]
+        ))
+        rendered = structured.format_structured_result("graph", validated)
+        self.assertNotIn("img(z)", rendered.lower())
+        self.assertNotRegex(rendered.lower(), r"higher?-frequency|lower?-frequency")
 
     def test_nyquist_visible_range_applies_scientific_multiplier(self):
         result = {
@@ -1030,6 +1105,41 @@ class StructuredVisionTests(unittest.TestCase):
             )
         self.assertIn("Figure 9", answer)
         self.assertEqual(call.call_count, 2)
+
+    def test_repaired_graph_does_not_retain_stale_final_validation_error(self):
+        repaired = {
+            "figure_number": "13",
+            "panels": [graph_panel(
+                "a", "nyquist", "Sample 10",
+                axis("Re(Z)", "ohm"), axis("-Img(Z)", "ohm"), 0, 2,
+                complexity=0.2,
+            )],
+            "comparisons": [], "frequency_direction_evidence": [],
+            "uncertain_values": [],
+        }
+        initial = json.loads(json.dumps(repaired))
+        initial["panels"][0]["complexity_score"] = 2.0
+        debug = {}
+        with patch.object(
+            structured,
+            "_call_model",
+            side_effect=[json.dumps(initial), json.dumps(repaired)],
+        ):
+            answer = structured.analyse_typed_image(
+                Path("figure13.png"), "graph",
+                "Compare Samples 10 and 7 in Figure 13.",
+                debug_info=debug,
+            )
+        self.assertIn("Graph complexity must be between 0 and 1", " ".join(
+            debug["initial_validation_errors"]
+        ))
+        self.assertEqual(debug["repaired_validation_result"], "passed")
+        self.assertEqual(debug["validation_error"], "")
+        self.assertEqual(
+            debug["final_answer_code_path"],
+            "validated_repaired_structured_vision",
+        )
+        self.assertIn("Figure 13", answer)
 
     def test_failed_validation_never_returns_unvalidated_model_text(self):
         debug = {}

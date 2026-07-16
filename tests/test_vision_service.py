@@ -154,6 +154,17 @@ class VisionPipelineTests(unittest.TestCase):
             [(20, 300.0), (300.0, 580)],
         )
 
+    def test_plain_named_sample_comparison_uses_tight_panel_verification(self):
+        self.assertTrue(vision._asks_for_two_panel_comparison(
+            "Compare Samples 10 and 7 in Figure 13."
+        ))
+        self.assertTrue(vision._asks_for_two_panel_comparison(
+            "Which fit is closer for Samples 10 and 7?"
+        ))
+        self.assertFalse(vision._asks_for_two_panel_comparison(
+            "Explain Sample 10 in Figure 13."
+        ))
+
     def test_overlapping_regions_are_evidence_not_ownership(self):
         regions = [
             regional("top", [item("Alpha", 0.35)]),

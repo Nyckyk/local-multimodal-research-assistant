@@ -238,6 +238,22 @@ def _two_panel_graph_labels(page_text: str) -> list[str]:
     return ordered if len(ordered) == 2 else []
 
 
+def _asks_for_two_panel_comparison(question: str) -> bool:
+    """Detect a named pair comparison that benefits from per-panel crops."""
+    names_pair = re.search(
+        r"\b(?:samples?|groups?)\s+[^.?!]{0,40}"
+        r"\b(?:and|versus|vs\.?)\b",
+        question,
+        re.IGNORECASE,
+    )
+    comparison_intent = re.search(
+        r"\b(?:compare|comparison|versus|vs\.?|difference|closer|better|fit|deviation)\b",
+        question,
+        re.IGNORECASE,
+    )
+    return bool(names_pair and comparison_intent)
+
+
 def _side_by_side_panel_clips(figure_clip: fitz.Rect) -> list[fitz.Rect]:
     midpoint = figure_clip.x0 + figure_clip.width / 2
     return [
@@ -1306,30 +1322,14 @@ def _analyse_typed_page(
     two_panel_labels = (
         _two_panel_graph_labels(page_text) if visual_type == "graph" else []
     )
-    asks_for_two_panel_fit = bool(
-        re.search(
-            r"\b(?:samples?|groups?)\s+[^.?!]{0,40}"
-            r"\b(?:and|versus|vs\.?)\b",
-            question,
-            re.IGNORECASE,
-        )
-        and re.search(
-            r"\b(?:closer|better|fit|deviation)\b",
-            question,
-            re.IGNORECASE,
-        )
-    )
-    if not two_panel_labels and asks_for_two_panel_fit:
+    asks_for_two_panel_comparison = _asks_for_two_panel_comparison(question)
+    if not two_panel_labels and asks_for_two_panel_comparison:
         two_panel_labels = ["panel_1", "panel_2"]
     if (
         len(two_panel_labels) == 2
         and clip.width > clip.height * 1.35
         and re.search(r"\bnyquist\b", combined_evidence, re.IGNORECASE)
-        and re.search(
-            r"\b(?:closer|better)\b.{0,30}\bfit\b|\bfit\b.{0,30}\bcloser\b",
-            question,
-            re.IGNORECASE,
-        )
+        and asks_for_two_panel_comparison
     ):
         fit_verification_clips = _side_by_side_panel_clips(clip)
         fit_verification_images = [

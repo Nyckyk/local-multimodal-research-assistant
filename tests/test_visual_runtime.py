@@ -8,7 +8,7 @@ import fitz
 from services.visual_index import load_or_build_visual_index
 from services.visual_locator import (
     VisualResolution,
-    clear_visual_target_state,
+    clear_visual_conversation_state,
     resolve_visual_target,
     should_activate_automatic_vision,
 )
@@ -144,31 +144,86 @@ def test_streamlit_runtime_repairs_exact_malformed_figure_three(tmp_path):
 
 
 def test_cleared_conversation_keeps_real_figure_one_ambiguous():
+    visual_index = load_or_build_visual_index()
+    figure_three = resolve_visual_target(QUESTION, visual_index)
+    assert figure_three.status == "resolved"
+    assert figure_three.pdf_name.startswith("Bioimpedance spectroscopy")
+
     state = {
         "messages": [{
             "role": "assistant",
-            "visual_target": {"pdf_name": "old.pdf", "target_number": "9"},
+            "content": "Validated Figure 3 analysis.",
+            "visual_target": figure_three.to_dict(),
+            "sources": [{"pdf": figure_three.pdf_name}],
         }],
-        "last_visual_target": {"pdf_name": "old.pdf", "target_number": "9"},
+        "last_user_question": QUESTION,
+        "last_visual_target": figure_three.to_dict(),
         "pending_visual_resolution": {"status": "resolved"},
-        "pending_visual_question": "Explain Figure 9",
-        "visual_candidate_choice": "old.pdf",
+        "pending_visual_question": QUESTION,
+        "visual_candidate_choice": figure_three.pdf_name,
+        "preferred_pdf_name": figure_three.pdf_name,
+        "previous_pdf": figure_three.pdf_name,
+        "previous_page": figure_three.page_number,
+        "previous_figure": "3",
+        "previous_panel": "a",
+        "previous_visual_target": figure_three.to_dict(),
+        "previous_source_context": [figure_three.pdf_name],
+        "target_resolution": figure_three.to_dict(),
+        "automatic_detection_candidates": figure_three.candidates,
+        "pending_ambiguity_selection": figure_three.pdf_name,
+        "rewritten_visual_query_context": QUESTION,
+        "vision_result_1": "old result",
+        "raw_vision_1": "old raw response",
     }
-    state["messages"] = []
-    clear_visual_target_state(state)
+    clear_visual_conversation_state(state)
+    state["preferred_pdf_name"] = state.pop("pending_preferred_pdf_name")
     resolution = resolve_visual_target(
         "Explain Figure 1.",
-        load_or_build_visual_index(),
+        visual_index,
         conversation_messages=state["messages"],
         current_source_names=[],
-        selected_pdf=None,
+        selected_pdf=(
+            None if state["preferred_pdf_name"] == "No preference"
+            else state["preferred_pdf_name"]
+        ),
     )
     assert resolution.status == "ambiguous"
     candidates = {candidate["pdf_name"] for candidate in resolution.candidates}
     assert "hall marks of aging.pdf" in candidates
     assert any(name.startswith("Bioimpedance spectroscopy") for name in candidates)
+    reasons = " ".join([
+        resolution.reason,
+        *[candidate["reason"] for candidate in resolution.candidates],
+    ]).lower()
+    assert "previous visual pdf" not in reasons
+    assert "conversation source context" not in reasons
     assert not should_activate_automatic_vision("Explain Figure 1.", resolution)
     with patch("services.visual_runtime.analyse_pdf_page") as analyse:
         if should_activate_automatic_vision("Explain Figure 1.", resolution):
             analyse_resolved_visual("Explain Figure 1.", resolution)
     analyse.assert_not_called()
+
+
+def test_uncleared_conversation_keeps_genuine_visual_followup_context():
+    visual_index = load_or_build_visual_index()
+    figure_three = resolve_visual_target(QUESTION, visual_index)
+    messages = [{
+        "role": "assistant",
+        "content": "Validated Figure 3 analysis.",
+        "visual_target": figure_three.to_dict(),
+        "sources": [{"pdf": figure_three.pdf_name}],
+    }]
+    followup = "Explain panel b."
+    resolution = resolve_visual_target(
+        followup,
+        visual_index,
+        conversation_messages=messages,
+        current_source_names=[figure_three.pdf_name],
+    )
+    assert resolution.status == "resolved"
+    assert resolution.pdf_name == figure_three.pdf_name
+    assert resolution.target_number == "3"
+    assert resolution.panel == "b"
+    assert "previous visual PDF" in resolution.reason
+    assert "conversation source context" in resolution.reason
+    assert should_activate_automatic_vision(followup, resolution)
