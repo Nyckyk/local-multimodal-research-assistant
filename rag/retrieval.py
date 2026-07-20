@@ -18,6 +18,73 @@ SUMMARY_FALLBACK_QUERIES = (
 )
 
 
+_LIMITATION_PATTERNS = (
+    (
+        "numerical_2d",
+        r"\b2D model\b",
+        "The work uses a numerical 2D model rather than an in-vivo experiment.",
+    ),
+    (
+        "fixed_tissue_properties",
+        r"\b(?:unalterable|unvarying|uniform and consistent)\b.{0,120}\b(?:thermal|dielectric|tissue)?\s*propert|"
+        r"\b(?:thermal|dielectric|tissue)?\s*propert\w*\b.{0,120}\b(?:unalterable|unvarying|fixed)\b",
+        "Tissue properties are fixed or unvarying in the model.",
+    ),
+    (
+        "no_phase_changes",
+        r"\bno alterations? in the phase\b|\bno phase changes?\b",
+        "Phase changes are excluded.",
+    ),
+    (
+        "no_chemical_reactions",
+        r"\babsence of chemical reactions?\b|\bno chemical reactions?\b",
+        "Chemical reactions are excluded.",
+    ),
+    (
+        "local_thermal_equilibrium",
+        r"\blocali[sz]ed thermal equilibrium\b.{0,100}\bblood\b.{0,100}\btissue\b",
+        "Local blood-tissue thermal equilibrium is assumed.",
+    ),
+    (
+        "uniform_incident_irradiance",
+        r"\buniform distribution of incident irradiance\b",
+        "Incident irradiance is uniform across the exposure area.",
+    ),
+    (
+        "simplified_environment",
+        r"\bunobstructed environment\b.{0,180}\b(?:lacks|without|no)\b.{0,80}\b(?:walls?|metallic enclosures?)\b",
+        "The environmental geometry is simplified and excludes surrounding walls or metallic enclosures.",
+    ),
+    (
+        "benchmark_validation",
+        r"\bvalidat(?:e|ed|ion)\b.{0,240}\b(?:previous|prior|published|benchmark|Torv[ey])\b|"
+        r"\b(?:previous|prior|published|benchmark|Torv[ey])\b.{0,240}\bvalidat(?:e|ed|ion)\b",
+        "Validation is against benchmarks or prior studies rather than new experimental human data.",
+    ),
+)
+
+
+def extract_inferred_limitations(documents: list[str]) -> dict:
+    """Derive modelling limitations only from explicit assumptions/validation text."""
+    text = re.sub(r"\s+", " ", "\n".join(documents))
+    if re.search(r"(?:^|\n)\s*(?:\d+(?:\.\d+)*\.?\s+)?limitations?\s*(?:\n|$)", "\n".join(documents), re.I):
+        return {}
+    items = [
+        {"key": key, "statement": statement}
+        for key, pattern, statement in _LIMITATION_PATTERNS
+        if re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+    ]
+    return {"items": items, "status": "inferred_from_stated_assumptions"} if items else {}
+
+
+def _limitation_keys(document: str) -> set[str]:
+    text = re.sub(r"\s+", " ", str(document or ""))
+    return {
+        key for key, pattern, _ in _LIMITATION_PATTERNS
+        if re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+    }
+
+
 def _clean_framework_item(value: str) -> str:
     item = re.sub(r"\s+", " ", value).strip(" .;:-")
     item = re.sub(r"^(?:and|or)\s+", "", item, flags=re.IGNORECASE)
@@ -642,13 +709,42 @@ def _retrieve_summary_context(question, collection, embedder, reranker, availabl
             "Only named_items may be presented as canonical framework items. "
             "Mechanisms discussed within their sections are not additional named items.\n"
         )
+    limitations_grounding = {}
+    limitations_block = ""
+    if re.search(r"\blimitations?\b", question, re.IGNORECASE):
+        limitations_grounding = extract_inferred_limitations(framework_documents)
+    if limitations_grounding:
+        diagnostics["inferred_limitations_grounding"] = limitations_grounding
+        limitations_block = (
+            "\n[INFERRED LIMITATIONS GROUNDING]\n"
+            f"{json.dumps(limitations_grounding, ensure_ascii=False)}\n"
+            "These are limitations inferred from explicit modelling assumptions "
+            "and validation statements. Label them as inferred; do not claim the "
+            "authors provided a dedicated limitations section.\n"
+        )
+        uncovered = {item["key"] for item in limitations_grounding["items"]}
+        for score, (document, metadata, section) in sorted(
+            scored_usable,
+            key=lambda row: len(_limitation_keys(row[1][0])),
+            reverse=True,
+        ):
+            covered = _limitation_keys(document).intersection(uncovered)
+            if not covered:
+                continue
+            page_key = (metadata.get("pdf", metadata.get("source")), metadata.get("page"))
+            if page_key not in seen_pages:
+                selected.append(_source_item(score, document, metadata, "assumptions"))
+                seen_pages.add(page_key)
+            uncovered.difference_update(covered)
+            if not uncovered:
+                break
     prefix = (
         "[DOCUMENT SUMMARY MODE]\n"
         f"Document type: {document_type}\n"
         "Summarize the whole document using representative evidence. For a review, "
         "cover purpose and scope, central framework, major themes, conclusions, "
         "implications and limitations; do not call review arguments experimental findings."
-        f"{framework_block}"
+        f"{framework_block}{limitations_block}"
     )
     diagnostics["final_selected_chunks"] = len(selected)
     diagnostics["final_selected_pages"] = [item["page"] for item in selected]
@@ -699,6 +795,84 @@ def _driver_variation_score(document: str, driver: str) -> float:
     ):
         score -= 1.0
     return score
+
+
+def _trim_nearby_to_figure_discussion(
+    caption: str, nearby_text: str, identifier: str
+) -> str:
+    """Drop a prior figure's paragraph when page-local text crosses a page break."""
+    nearby = str(nearby_text or "")
+    identifier = str(identifier)
+    discussion = re.search(
+        rf"\bfig(?:ure)?\.?\s*{re.escape(identifier)}\b"
+        r".{0,260}?\b(?:shows?|depicts?|displays?|illustrates?|representation)\b",
+        nearby,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if discussion:
+        nearby = nearby[discussion.start():]
+    # Page text commonly continues into the next figure discussion or repeats
+    # a different figure caption. Do not attach that later figure's narrative
+    # to the current indexed figure.
+    truncated_at_other_figure = False
+    for candidate in re.finditer(r"\bfig(?:ure)?\.?\s*(\d+(?:\.\d+)?)\b", nearby, re.I):
+        if candidate.group(1) == identifier:
+            continue
+        tail = nearby[candidate.start():candidate.start() + 280]
+        caption_like = bool(re.match(
+            r"\bfig(?:ure)?\.?\s*\d+(?:\.\d+)?\s*\.", tail, re.I
+        ))
+        narrative_like = bool(re.search(
+            r"\b(?:shows?|depicts?|displays?|illustrates?|representation|expound)\b",
+            tail,
+            re.I,
+        ))
+        if caption_like or narrative_like:
+            nearby = nearby[:candidate.start()].rstrip()
+            truncated_at_other_figure = True
+            break
+    if truncated_at_other_figure and nearby and nearby[-1] not in ".!?":
+        complete = re.search(r"^.*[.!?](?=\s|$)", nearby, re.DOTALL)
+        if complete:
+            nearby = complete.group(0).rstrip()
+    return "\n".join(part for part in (str(caption or ""), nearby) if part).strip()
+
+
+def _preceding_text_before_figure_discussion(
+    nearby_text: str, identifier: str
+) -> str:
+    """Recover a prior page's prose that continues before this figure begins."""
+    nearby = str(nearby_text or "")
+    discussion = re.search(
+        rf"\bfig(?:ure)?\.?\s*{re.escape(str(identifier))}\b"
+        r".{0,260}?\b(?:shows?|depicts?|displays?|illustrates?|representation)\b",
+        nearby,
+        re.IGNORECASE | re.DOTALL,
+    )
+    return nearby[:discussion.start()].strip() if discussion else ""
+
+
+def _has_later_figure_discussion(
+    nearby_text: str, identifier: str
+) -> bool:
+    """Tell whether this page has already moved to a later-numbered figure."""
+    try:
+        current = float(identifier)
+    except (TypeError, ValueError):
+        return False
+    for candidate in re.finditer(
+        r"\bfig(?:ure)?\.?\s*(\d+(?:\.\d+)?)\b", str(nearby_text or ""), re.I
+    ):
+        if float(candidate.group(1)) <= current:
+            continue
+        tail = str(nearby_text or "")[candidate.start():candidate.start() + 280]
+        if re.search(
+            r"\b(?:shows?|depicts?|displays?|illustrates?|representation|expound)\b",
+            tail,
+            re.I,
+        ):
+            return True
+    return False
 
 
 def _retrieve_multi_figure_context(
@@ -787,8 +961,29 @@ def _retrieve_multi_figure_context(
         indexed_figures = []
     indexed_rows = []
     for target in indexed_figures:
+        identifier = str(target.get("target_number"))
+        current_page = int(target.get("page_number") or 0)
+        spillover = ""
+        if not _has_later_figure_discussion(target.get("nearby_text", ""), identifier):
+            next_target = next((
+                candidate for candidate in sorted(
+                    indexed_figures,
+                    key=lambda item: int(item.get("page_number") or 0),
+                )
+                if int(candidate.get("page_number") or 0) == current_page + 1
+            ), None)
+            if next_target:
+                spillover = _preceding_text_before_figure_discussion(
+                    next_target.get("nearby_text", ""),
+                    str(next_target.get("target_number")),
+                )
+        figure_text = _trim_nearby_to_figure_discussion(
+            target.get("caption", ""), target.get("nearby_text", ""), identifier
+        )
+        if spillover:
+            figure_text = f"{figure_text}\n{spillover}".strip()
         indexed_rows.append((
-            f"{target.get('caption', '')}\n{target.get('nearby_text', '')}",
+            figure_text,
             {
                 "pdf": chosen_source,
                 "page": target.get("page_number"),
@@ -796,7 +991,7 @@ def _retrieve_multi_figure_context(
                 "visual_index_caption": True,
                 "driver_text": target.get("caption", ""),
             },
-            [str(target.get("target_number"))],
+            [identifier],
         ))
     if indexed_rows:
         # Exact caption occurrences plus their page-local results text provide
@@ -855,7 +1050,11 @@ def _retrieve_multi_figure_context(
         "nearby results support, and do not collapse the answer to one figure when "
         "the supplied evidence spans multiple figures. When the nearby results "
         "report maxima, minima, peaks, or other explicit extrema, name that kind "
-        "of evidence and preserve its reported values."
+        "of evidence and preserve its reported values. Keep every trend attached "
+        "to its measured quantity: a power-density trend is not a temperature "
+        "trend. Describe heating depth or penetration only as an inference from "
+        "the spatial absorbed-power or temperature contours unless depth is "
+        "directly measured. Never state opposite trends for the same quantity."
     )
     return _format_context(selected, prefix), selected
 

@@ -20,7 +20,7 @@ from services.visual_locator import (
     should_activate_automatic_vision,
 )
 from services.visual_reference_parser import has_visual_reference
-from services.visual_runtime import analyse_resolved_visual
+from services.visual_runtime import analyse_resolved_visual, build_visual_evidence
 from services.vision_service import COULD_NOT_VERIFY_MESSAGE
 from settings import MAX_HISTORY_MESSAGES, PAPERS_FOLDER
 
@@ -519,16 +519,9 @@ if question:
                         f"Source: **{selected_pdf.name}**, "
                         f"PDF page **{int(vision_page_number)}**."
                     )
-                evidence = {
-                    "summary": (
-                        "Local visual analysis of the selected page."
-                    ),
-                    "analysis_kind": "Visual analysis",
-                    "pdf": selected_pdf.name,
-                    "page": int(vision_page_number),
-                    "vision_result": visual_answer,
-                    "visual_target": resolution.to_dict(),
-                }
+                evidence = build_visual_evidence(
+                    resolution, visual_answer, vision_debug
+                )
             elif resolution.status == "ambiguous" and visual_reference_requested:
                 answer = format_resolution_problem(resolution)
                 st.session_state.pending_visual_resolution = resolution.to_dict()
@@ -629,7 +622,11 @@ if question:
                         if vision_debug.get("normalized_json"):
                             st.markdown("### Normalized vision JSON")
                             st.json(vision_debug["normalized_json"])
-                        if vision_debug.get("validated_json"):
+                        final_structured = vision_debug.get("final_structured_output")
+                        if final_structured is not None:
+                            st.markdown("### Final typed structured output")
+                            st.json(final_structured)
+                        elif vision_debug.get("validated_json"):
                             st.markdown("### Typed vision JSON")
                             st.json(vision_debug["validated_json"])
                         if vision_debug.get("initial_validation_errors"):
@@ -653,19 +650,9 @@ if question:
                             st.markdown("### Vision validation error")
                             st.code(vision_debug["validation_error"])
                         if vision_debug.get("raw_vision_response"):
-                            repaired_output = (
-                                vision_debug.get("initial_validation_errors")
-                                and vision_debug.get("repaired_validation_result") == "passed"
-                            )
-                            st.markdown(
-                                "### Repaired/final vision response"
-                                if repaired_output else "### Raw vision response"
-                            )
+                            st.markdown("### Raw vision response")
                             st.text_area(
-                                (
-                                    "Repaired/final structured output"
-                                    if repaired_output else "Raw structured output"
-                                ),
+                                "Raw model structured output",
                                 value=vision_debug["raw_vision_response"],
                                 height=220,
                                 key=f"raw_vision_{len(st.session_state.messages)}",

@@ -231,6 +231,63 @@ class StructuredVisionTests(unittest.TestCase):
         ):
             self.assertIn(phrase, explanation)
 
+    def test_grounded_coordinate_boundaries_are_declared_for_non_circuit_diagram(self):
+        result = {
+            "diagram_kind": "other",
+            "labels": ["Skin model", "Wave port", "Thermal insulation"],
+            "components": [{"name": "Skin model", "description": "2D domain"}],
+            "spatial_relationships": [{
+                "subject": "Top edge of model (y=H)",
+                "relationship": "bounds",
+                "object": "Skin model",
+            }],
+            "connections": [
+                {"from": "Left edge of model (x=0)", "to": "Skin model", "relationship": "bounds"},
+                {"from": "Right edge of model (x=W)", "to": "Skin model", "relationship": "bounds"},
+                {"from": "Bottom edge of model (y=0)", "to": "Skin model", "relationship": "bounds"},
+                {"from": "Top edge of model (y=H)", "to": "Skin model", "relationship": "bounds"},
+            ],
+            "circuit_topology": None,
+            "explanation": "The coordinate edges bound the skin model.",
+            "uncertain_items": [],
+        }
+        evidence = "The domain extends over x=0, x=W, y=0 and y=H."
+        validated = structured.validate_labelled_diagram(result, evidence)
+        self.assertEqual(
+            [connection["from"] for connection in validated["connections"]],
+            ["x = 0", "x = W", "y = 0", "y = H"],
+        )
+        self.assertTrue(
+            {"x = 0", "x = W", "y = 0", "y = H"}.issubset(validated["labels"])
+        )
+        self.assertEqual(validated["spatial_relationships"][0]["subject"], "y = H")
+
+    def test_boundary_coordinate_normalisation_does_not_touch_circuits(self):
+        circuit = {
+            "diagram_kind": "circuit",
+            "connections": [{"from": "x=0", "to": "R1"}],
+        }
+        self.assertIs(
+            structured.normalize_boundary_diagram_endpoints(circuit, "x=0"),
+            circuit,
+        )
+
+    def test_grounded_boundary_fallback_is_concise_and_equation_complete(self):
+        evidence = (
+            "The plane wave is transverse magnetic (TM mode). The wave-port boundary "
+            "governs the incident field. Scattering boundary conditions prevent "
+            "undesired reflections. At x = 0, -k dT(0,y,t)/dx = qmw . (9) "
+            "At x = W, dT(W,y,t)/dx = 0 . (10) At y = 0, "
+            "dT(x,0,t)/dy = 0 . (11) At y = H, dT(x,H,t)/dy = 0 . (12) "
+            "Data extraction line"
+        )
+        answer = structured.grounded_boundary_synthesis(evidence)
+        for phrase in (
+            "TM microwave field", "x=0", "x=W", "y=0", "y=H", "internal sampling",
+        ):
+            self.assertIn(phrase, answer)
+        self.assertNotIn("could not verify", answer.casefold())
+
     def test_non_circuit_relationship_endpoint_can_be_grounded_in_caption(self):
         result = {
             "diagram_kind": "other",

@@ -14,7 +14,7 @@ from services.visual_locator import (
     resolve_visual_target,
     should_activate_automatic_vision,
 )
-from services.visual_runtime import analyse_resolved_visual
+from services.visual_runtime import analyse_resolved_visual, build_visual_evidence
 
 
 QUESTION = (
@@ -258,12 +258,8 @@ def test_equation_eight_uses_text_path_and_never_invokes_figure_vision():
     )
 
     debug = {}
-    grounded_answer = (
-        "Equation 8 is the thermal-wave equation. Setting tau to zero removes "
-        "tau-dependent terms and yields the Pennes equation."
-    )
     with patch(
-        "services.equation_service.generate_answer", return_value=grounded_answer
+        "services.equation_service.generate_answer"
     ) as generate, patch(
         "services.visual_runtime.analyse_pdf_page"
     ) as vision:
@@ -271,20 +267,45 @@ def test_equation_eight_uses_text_path_and_never_invokes_figure_vision():
             question, resolution, conversation_history=previous, debug_info=debug
         )
 
-    assert answer.startswith(grounded_answer)
-    assert "Qmet is assumed zero" in answer
+    assert "Complete Equation 8" in answer
+    assert "Q_{met}=0" in answer
     assert "second-time-derivative term" in answer
     assert "time derivative of the external source" in answer
-    assert "Target Equation 8" in generate.call_args.args[1]
-    assert "Equation 7" in generate.call_args.args[1]
-    assert "Equation 4" in generate.call_args.args[1]
+    assert r"\rho c\frac{\partial T}{\partial t}" in answer
+    assert r"+\rho_b c_b\omega_b(T_b-T)+Q_{ext}" in answer
+    assert "c_p" not in answer and "T_a" not in answer
+    assert "steady-state" not in answer.casefold()
+    generate.assert_not_called()
     vision.assert_not_called()
     assert debug["final_answer_code_path"] == "validated_text_equation_analysis"
-    assert debug["grounded_zero_reduction_supplemented"] is True
+    assert debug["grounded_zero_reduction_supplemented"] is False
+    symbolic = debug["symbolic_equation"]
+    assert symbolic["sign_validation"] == "passed"
+    assert symbolic["paper_symbols"] == {
+        "specific_heat": "c", "blood_temperature": "T_b",
+    }
+    assert [(term["kind"], term["sign"]) for term in symbolic["target_terms"]] == [
+        ("second_time_derivative", "+"),
+        ("conduction", "+"),
+        ("tissue_temperature_perfusion", "-"),
+        ("first_time_derivative", "-"),
+        ("blood_temperature_perfusion", "+"),
+        ("external_source", "+"),
+        ("external_source_time_derivative", "+"),
+    ]
+    assert [(term["kind"], term["sign"]) for term in symbolic["rearranged_terms"]] == [
+        ("first_time_derivative", "+"),
+        ("conduction", "+"),
+        ("blood_minus_tissue_perfusion", "+"),
+        ("external_source", "+"),
+    ]
 
 
-def test_streamlit_runtime_accepts_non_circuit_boundary_diagram_without_topology():
-    question = "Using Figure 2, explain all boundary conditions applied to the skin model."
+def test_streamlit_runtime_accepts_grounded_coordinate_boundary_endpoints():
+    question = (
+        "Using Figure 2 in the thermal-wave paper, explain all boundary conditions "
+        "applied to the skin model."
+    )
     resolution = resolve_visual_target(question, load_or_build_visual_index())
     assert resolution.status == "resolved", resolution.to_dict()
     assert resolution.pdf_name.startswith("Thermal wave and Pennes")
@@ -295,9 +316,14 @@ def test_streamlit_runtime_accepts_non_circuit_boundary_diagram_without_topology
             "Wave port boundary condition", "Scattering boundary condition",
             "Thermal insulation condition", "Data extraction line",
         ],
-        "components": [],
+        "components": [{"name": "Skin model", "description": "2D layered domain"}],
         "spatial_relationships": [],
-        "connections": [],
+        "connections": [
+            {"from": "Left edge of the model (x=0)", "to": "Skin model", "relationship": "bounds"},
+            {"from": "Right edge of the model (x=W)", "to": "Skin model", "relationship": "bounds"},
+            {"from": "Bottom edge of the model (y=0)", "to": "Skin model", "relationship": "bounds"},
+            {"from": "Top edge of the model (y=H)", "to": "Skin model", "relationship": "bounds"},
+        ],
         # Deliberately omit circuit_topology: Figure 2 is not a circuit.
         "explanation": "The figure labels electromagnetic and thermal boundaries.",
         "uncertain_items": [],
@@ -311,11 +337,16 @@ def test_streamlit_runtime_accepts_non_circuit_boundary_diagram_without_topology
     assert debug["validated_json"]["circuit_topology"] is None
     assert debug["final_answer_code_path"] == "validated_structured_vision"
     for phrase in (
-        "wave-port", "scattering", "applied microwave heat flux",
+        "wave-port", "TM microwave", "scattering", "applied microwave heat flux",
         "thermal insulation", "internal sampling",
     ):
         assert phrase in answer
     assert answer.count("Thermal condition at") == 4
+    assert "could not verify" not in answer.casefold()
+    assert "ASSOCIATED EQUATIONS/NEARBY TEXT" not in answer
+    assert [item["from"] for item in debug["validated_json"]["connections"]] == [
+        "x = 0", "x = W", "y = 0", "y = H",
+    ]
 
 
 def test_streamlit_runtime_uses_validated_text_table_after_empty_vision_output():
@@ -336,6 +367,11 @@ def test_streamlit_runtime_uses_validated_text_table_after_empty_vision_output()
     assert table["unreadable_cells"] == []
     assert "Extra Fine was selected" in answer
     assert "refinement" in answer
+    assert table is debug["repaired_json"]
+    assert table is debug["final_structured_output"]
+    assert table is debug["rendered_structured_object"]
+    evidence = build_visual_evidence(resolution, answer, debug)
+    assert evidence["structured_result"] is table
 
 
 def test_matching_vision_table_keeps_grounded_text_selection_explanation():
@@ -374,3 +410,7 @@ def test_matching_vision_table_keeps_grounded_text_selection_explanation():
     assert debug["text_table_details_merged"] is True
     assert "0.0001 W/kg" in answer
     assert "58907" in answer and "182970" in answer
+    table = debug["validated_json"]
+    assert table is debug["repaired_json"]
+    assert table is debug["final_structured_output"]
+    assert table is debug["rendered_structured_object"]

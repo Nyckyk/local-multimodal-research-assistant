@@ -104,3 +104,106 @@ def test_validated_framework_items_are_completed_with_exact_grounded_names():
     assert debug["initial_missing_grounded_items"] == ["genomic instability"]
     assert debug["final_missing_grounded_items"] == []
     assert debug["grounded_items_appended"] == []
+
+
+def test_grounded_inferred_limitations_are_completed_and_clearly_labelled():
+    items = [
+        {"key": "numerical_2d", "statement": "The work uses a numerical 2D model rather than an in-vivo experiment."},
+        {"key": "fixed_tissue_properties", "statement": "Tissue properties are fixed or unvarying in the model."},
+        {"key": "no_phase_changes", "statement": "Phase changes are excluded."},
+        {"key": "no_chemical_reactions", "statement": "Chemical reactions are excluded."},
+        {"key": "local_thermal_equilibrium", "statement": "Local blood-tissue thermal equilibrium is assumed."},
+        {"key": "uniform_incident_irradiance", "statement": "Incident irradiance is uniform across the exposure area."},
+        {"key": "simplified_environment", "statement": "The environmental geometry is simplified and excludes surrounding walls or metallic enclosures."},
+        {"key": "benchmark_validation", "statement": "Validation is against benchmarks or prior studies rather than new experimental human data."},
+    ]
+    context = (
+        "[DOCUMENT SUMMARY MODE]\n[INFERRED LIMITATIONS GROUNDING]\n"
+        + __import__("json").dumps({
+            "items": items,
+            "status": "inferred_from_stated_assumptions",
+        })
+        + "\nEvidence"
+    )
+    debug = {}
+    with patch(
+        "services.ollama_service.ollama.chat",
+        side_effect=[
+            _response(
+                "Research question: Q. Methods: M. Main results: R. "
+                "Limitations: The modelling constraints require care."
+            ),
+            _response("The available assumptions delimit interpretation."),
+        ],
+    ) as chat:
+        answer = generate_answer(
+            "Summarise the research question, methods, main results and limitations.",
+            context,
+            [],
+            debug,
+        )
+
+    assert chat.call_count == 2
+    assert "Limitations inferred from stated assumptions" in answer
+    assert "numerical 2D model" in answer
+    assert "new experimental human data" in answer
+    assert debug["initial_missing_inferred_limitations"] == [
+        item["key"] for item in items
+    ]
+    assert debug["final_missing_inferred_limitations"] == []
+
+
+def test_grounded_transient_comparison_is_preserved_after_summary_generation():
+    context = (
+        "[DOCUMENT SUMMARY MODE]\n"
+        "Source: paper.pdf, page 16\n"
+        "It reveals that initially, TWMBT forecasts a lower heat rise than "
+        "Pennes' equation. As exposure progresses toward a steady state, "
+        "TWMBT predictions converge with Pennes' equation."
+    )
+    debug = {}
+    with patch(
+        "services.ollama_service.ollama.chat",
+        return_value=_response(
+            "Research question: Q. Methods: M. Main results: The models converge. "
+            "Limitations: L."
+        ),
+    ):
+        answer = generate_answer(
+            "Summarise the research question, methods, main results and limitations.",
+            context,
+            [],
+            debug,
+        )
+    assert "TWMBT initially forecasts lower heat rise than Pennes' equation" in answer
+    assert debug["grounded_transient_comparison_appended"] is True
+
+
+def test_multi_figure_completion_keeps_trends_attached_to_their_figure():
+    context = (
+        "[MULTI-FIGURE EVIDENCE MODE]\n"
+        "Source: paper.pdf, page 9, section figure evidence\n"
+        "Fig. 5 shows absorbed power dissipation near the incident boundary. "
+        "As frequency increases, at 4 GHz the heated area becomes small.\n"
+        "Source: paper.pdf, page 10, section figure evidence\n"
+        "Fig. 6 shows isothermal contours. At 0.9 GHz, 1.8 GHz, 2.45 GHz and 4 GHz, the "
+        "maximal temperature values are 39.12 °C, 39.23 °C, 39.35 °C and "
+        "39.52 °C, respectively."
+    )
+    debug = {}
+    with patch(
+        "services.ollama_service.ollama.chat",
+        return_value=_response(
+            "Figure 5 shows absorbed power. Temperature diminishes as frequency "
+            "increases. Figure 6 shows isotherms."
+        ),
+    ):
+        answer = generate_answer("Compare the figure evidence.", context, [], debug)
+    assert "Temperature diminishes" not in answer
+    assert "Figure 5" in answer and "localized near the incident boundary" in answer
+    assert "inference" in answer and "not a direct depth measurement" in answer
+    assert "reported peak temperatures increase" in answer
+    assert "39.12 °C at 0.9 GHz" in answer
+    assert "39.52 °C at 4 GHz" in answer
+    assert debug["multi_figure_contradiction_removed"] is True
+    assert debug["multi_figure_depth_language_qualified"] is False

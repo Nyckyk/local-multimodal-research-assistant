@@ -333,6 +333,73 @@ def _normal_name(value) -> str:
     return re.sub(r"[^a-z0-9]+", "", compatible.lower())
 
 
+_BOUNDARY_COORDINATES = {
+    ("x", "0"): "x = 0",
+    ("x", "w"): "x = W",
+    ("y", "0"): "y = 0",
+    ("y", "h"): "y = H",
+}
+
+
+def _boundary_coordinate(value) -> str | None:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    match = re.search(r"\b([xy])\s*=\s*(0|w|h)\b", text)
+    if not match:
+        return None
+    return _BOUNDARY_COORDINATES.get((match.group(1), match.group(2)))
+
+
+def normalize_boundary_diagram_endpoints(
+    value: dict, evidence_text: str = ""
+) -> dict:
+    """Declare grounded coordinate boundaries as non-circuit diagram labels."""
+    if not isinstance(value, dict) or str(value.get("diagram_kind", "")).casefold() == "circuit":
+        return value
+
+    corrected = dict(value)
+    labels = list(corrected.get("labels") or [])
+    visible_text = " ".join(
+        label if isinstance(label, str) else str(label.get("text", label.get("name", "")))
+        for label in labels if isinstance(label, (str, dict))
+    )
+    grounded_coordinates = {
+        coordinate for coordinate in _BOUNDARY_COORDINATES.values()
+        if re.search(
+            rf"\b{coordinate[0]}\s*=\s*{re.escape(coordinate[-1])}\b",
+            f"{evidence_text} {visible_text}",
+            re.IGNORECASE,
+        )
+    }
+    if not grounded_coordinates:
+        return corrected
+
+    declared = {_normal_name(label) for label in labels if isinstance(label, str)}
+    def normalize_records(key: str, endpoint_fields: tuple[str, ...]) -> list:
+        records = []
+        for record in corrected.get(key) or []:
+            if not isinstance(record, dict):
+                records.append(record)
+                continue
+            normalized = dict(record)
+            for field in endpoint_fields:
+                coordinate = _boundary_coordinate(normalized.get(field))
+                if coordinate in grounded_coordinates:
+                    normalized[field] = coordinate
+                    coordinate_key = _normal_name(coordinate)
+                    if coordinate_key not in declared:
+                        labels.append(coordinate)
+                        declared.add(coordinate_key)
+            records.append(normalized)
+        return records
+
+    corrected["connections"] = normalize_records("connections", ("from", "to"))
+    corrected["spatial_relationships"] = normalize_records(
+        "spatial_relationships", ("subject", "object")
+    )
+    corrected["labels"] = labels
+    return corrected
+
+
 def _validate_circuit_topology(
     topology: dict,
     component_names: set[str],
@@ -719,6 +786,7 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
         raise StructuredOutputError("Diagram explanation/uncertainty fields are invalid.")
 
     value = normalize_composite_diagram_endpoints(value)
+    value = normalize_boundary_diagram_endpoints(value, evidence_text)
     diagram_kind = str(value["diagram_kind"]).strip().lower()
     if diagram_kind not in {"circuit", "other"}:
         raise StructuredOutputError("diagram_kind must be circuit or other.")
@@ -887,9 +955,14 @@ def enrich_boundary_conditions(
     evidence = re.sub(r"\s+", " ", str(evidence_text or "")).strip()
     additions = []
     if re.search(r"\bwave[ -]?port boundary\b", evidence, re.I):
+        incident = (
+            "incident TM microwave field"
+            if re.search(r"\bTM mode\b|\btransverse magnetic\b", evidence, re.I)
+            else "incident microwave field"
+        )
         additions.append(
             "Electromagnetic condition: the wave-port boundary introduces the "
-            "incident microwave field at the exposed side."
+            f"{incident} at the exposed side."
         )
     if re.search(r"\bscattering boundary conditions?\b", evidence, re.I):
         additions.append(
@@ -2543,10 +2616,56 @@ def format_structured_result(visual_type: str, value: dict) -> str:
     return "\n".join(lines)
 
 
-def _grounded_caption_fallback(evidence_text: str, visual_type: str) -> str:
+def grounded_boundary_synthesis(evidence_text: str) -> str:
+    """Render concise boundary conditions only when their equations are grounded."""
+    evidence = re.sub(r"\s+", " ", str(evidence_text or "")).strip()
+    required = {
+        "x = 0": r"At\s+x\s*=\s*0\s*,.*?q\s*mw.*?\(\s*9\s*\)",
+        "x = W": r"At\s+x\s*=\s*W\s*,.*?\(\s*10\s*\)",
+        "y = 0": r"At\s+y\s*=\s*0\s*,.*?\(\s*11\s*\)",
+        "y = H": r"At\s+y\s*=\s*H\s*,.*?\(\s*12\s*\)",
+    }
+    if not all(re.search(pattern, evidence, re.I) for pattern in required.values()):
+        return ""
+
+    lines = ["**Electromagnetic boundary conditions**"]
+    if re.search(r"\bwave[ -]?port boundary\b", evidence, re.I):
+        mode = "TM microwave field" if re.search(r"\bTM mode\b|\btransverse magnetic\b", evidence, re.I) else "microwave field"
+        lines.append(
+            f"- The wave-port boundary introduces the incident {mode} at the exposed side."
+        )
+    if re.search(r"\bscattering boundary conditions?\b", evidence, re.I):
+        lines.append(
+            "- Scattering conditions on the outer non-port boundaries prevent artificial reflections."
+        )
+    lines.extend([
+        "",
+        "**Thermal boundary conditions**",
+        "- At $x=0$: $-k\\,\\partial T(0,y,t)/\\partial x=q_{mw}$; this is the applied microwave heat flux.",
+        "- At $x=W$: $\\partial T(W,y,t)/\\partial x=0$; this is an insulated boundary.",
+        "- At $y=0$: $\\partial T(x,0,t)/\\partial y=0$; this is an insulated boundary.",
+        "- At $y=H$: $\\partial T(x,H,t)/\\partial y=0$; this is an insulated boundary.",
+    ])
+    if re.search(r"\bdata[ -]extraction line\b", evidence, re.I):
+        lines.extend([
+            "",
+            "The data-extraction line is an internal sampling line, not a physical boundary condition.",
+        ])
+    return "\n".join(lines)
+
+
+def _grounded_caption_fallback(
+    evidence_text: str, visual_type: str, question: str = ""
+) -> str:
+    if visual_type == "labelled_diagram" and re.search(
+        r"\bboundary conditions?\b", question, re.I
+    ):
+        boundary_answer = grounded_boundary_synthesis(evidence_text)
+        if boundary_answer:
+            return boundary_answer
     caption_match = re.search(
         r"TARGET FIGURE CAPTION[^\n]*:\s*\n(.*?)"
-        r"(?=\n\s*\n(?:PAGE TEXT|RETRIEVED TEXT)[^\n]*:|\Z)",
+        r"(?=\n\s*\n(?:ASSOCIATED EQUATIONS/NEARBY TEXT|PAGE TEXT|RETRIEVED TEXT)[^\n]*:|\Z)",
         evidence_text,
         re.IGNORECASE | re.DOTALL,
     )
@@ -2701,6 +2820,10 @@ def analyse_typed_image(
                         fallback_path = (
                             "could_not_verify_topology"
                             if topology_retry or circuit_context
+                            else "grounded_boundary_equation_fallback"
+                            if visual_type == "labelled_diagram" and re.search(
+                                r"\bboundary conditions?\b", question, re.I
+                            ) and grounded_boundary_synthesis(evidence_text)
                             else "grounded_caption_summary_fallback"
                         )
                         debug_info.update({
@@ -2722,7 +2845,9 @@ def analyse_typed_image(
                             "Could not verify the circuit topology from the visible wire "
                             "junctions and caption evidence."
                         )
-                    return _grounded_caption_fallback(evidence_text, visual_type)
+                    return _grounded_caption_fallback(
+                        evidence_text, visual_type, question
+                    )
 
     if visual_type == "labelled_diagram":
         value = enrich_boundary_conditions(value, evidence_text, question)

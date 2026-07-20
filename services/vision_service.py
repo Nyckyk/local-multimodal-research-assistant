@@ -16,6 +16,7 @@ from services.structured_vision import (
     detect_compact_graph_panel_ids,
     detect_visual_type,
     format_structured_result,
+    validate_table,
 )
 from services.text_table import compare_tables, extract_text_table
 from services.visual_reference_parser import parse_visual_reference
@@ -1429,10 +1430,23 @@ def _analyse_typed_page(
             debug_info=analysis_debug,
             fit_verification_images=fit_verification_images,
         )
-        if visual_type != "table" or text_table is None:
+        if visual_type != "table":
             return answer
 
         vision_table = analysis_debug.get("validated_json")
+        if text_table is None:
+            if isinstance(vision_table, dict):
+                return _finalize_table_result(
+                    analysis_debug,
+                    vision_table,
+                    final_answer_path=analysis_debug.get(
+                        "final_answer_path", "validated_typed_vision"
+                    ),
+                    final_answer_code_path=analysis_debug.get(
+                        "final_answer_code_path", "validated_structured_vision"
+                    ),
+                )
+            return answer
         cross_check = (
             compare_tables(vision_table, text_table)
             if isinstance(vision_table, dict)
@@ -1452,27 +1466,61 @@ def _analyse_typed_page(
                     comparisons.append(comparison)
                     comparison_keys.add(key)
             merged_table["comparisons"] = comparisons
-            analysis_debug["validated_json"] = merged_table
             analysis_debug["text_table_details_merged"] = bool(
                 comparisons != list(vision_table.get("comparisons") or [])
             )
-            return format_structured_result("table", merged_table)
+            return _finalize_table_result(
+                analysis_debug,
+                merged_table,
+                final_answer_path=analysis_debug.get(
+                    "final_answer_path", "validated_typed_vision"
+                ),
+                final_answer_code_path=analysis_debug.get(
+                    "final_answer_code_path", "validated_structured_vision"
+                ),
+            )
 
         vision_error = analysis_debug.get("validation_error", "")
         analysis_debug.update({
             "vision_table_validation_error": vision_error,
-            "validated_json": text_table,
-            "validation_error": "",
-            "repaired_validation_result": "passed",
-            "final_answer_path": "validated_text_table_fallback",
-            "final_answer_code_path": "validated_text_table_fallback",
         })
-        return format_structured_result("table", text_table)
+        return _finalize_table_result(
+            analysis_debug,
+            text_table,
+            final_answer_path="validated_text_table_fallback",
+            final_answer_code_path="validated_text_table_fallback",
+            repaired=True,
+        )
     finally:
         if not save_crops:
             image_path.unlink(missing_ok=True)
             for _, path in fit_verification_images:
                 path.unlink(missing_ok=True)
+
+
+def _finalize_table_result(
+    debug_info: dict,
+    table: dict,
+    *,
+    final_answer_path: str,
+    final_answer_code_path: str,
+    repaired: bool = False,
+) -> str:
+    """Validate, render and expose one authoritative final table object."""
+    final_table = validate_table(table)
+    debug_info.update({
+        "validated_json": final_table,
+        "repaired_json": final_table,
+        "final_structured_output": final_table,
+        "rendered_structured_object": final_table,
+        "final_validation_result": "passed",
+        "validation_error": "",
+        "final_answer_path": final_answer_path,
+        "final_answer_code_path": final_answer_code_path,
+    })
+    if repaired:
+        debug_info["repaired_validation_result"] = "passed"
+    return format_structured_result("table", final_table)
 
 
 def analyse_pdf_page(

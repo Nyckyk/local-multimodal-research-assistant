@@ -16,7 +16,7 @@ from services.ollama_service import generate_answer
 from services.structured_vision import StructuredOutputError, TruncatedJSONError
 from services.visual_index import load_or_build_visual_index
 from services.visual_locator import resolve_visual_target
-from services.visual_runtime import analyse_resolved_visual
+from services.visual_runtime import analyse_resolved_visual, build_visual_evidence
 from settings import PAPERS_FOLDER
 
 
@@ -73,7 +73,7 @@ def _write_debug(artifact_writer, case_id, debug, error=None, answer=""):
         if isinstance(value, str) and value and value not in raw_parts:
             raw_parts.append(value)
     raw = "\n\n--- MODEL RESPONSE ---\n\n".join(raw_parts) or answer
-    structured = debug.get("validated_json") or {
+    structured = debug.get("final_structured_output") or debug.get("validated_json") or {
         key: value for key, value in debug.items()
         if key not in {"raw_vision_response", "retry_response", "raw_panel_responses"}
     }
@@ -166,6 +166,24 @@ def _run_summary_case(case, artifact_writer):
                 }, f"validated framework category mismatch: {group}"
         for section in expected.get("requested_sections", []):
             assert _contains(answer, section), f"summary section missing: {section}"
+        if case["case_id"] == "thermal_document_summary":
+            assert _contains(answer, "limitations inferred from stated assumptions")
+            normalized_answer = _normal(answer)
+            limitation_patterns = {
+                "numerical 2D model": r"(?:numerical.{0,30}2d|2d.{0,30}(?:numerical|model))",
+                "fixed tissue properties": r"(?:fixed.{0,50}tissue properties|tissue properties.{0,50}fixed)",
+                "phase changes": r"phase changes",
+                "chemical reactions": r"chemical reactions",
+                "blood-tissue thermal equilibrium": r"blood.tissue thermal equilibrium",
+                "uniform incident irradiance": r"(?:uniform.{0,50}incident irradiance|incident irradiance.{0,50}uniform)",
+                "simplified environment": r"(?:walls|metallic enclosures|simplified environmental geometry)",
+                "no new human experiment": r"new experimental human data",
+            }
+            for limitation, pattern in limitation_patterns.items():
+                assert re.search(pattern, normalized_answer, re.DOTALL), (
+                    f"thermal summary missing grounded inferred limitation: {limitation}"
+                )
+            assert debug["final_missing_inferred_limitations"] == []
         expected_stem = Path(case["pdf_filename"]).stem.casefold()
         assert all(
             Path(str(source["source"])).stem.casefold() == expected_stem
@@ -202,6 +220,28 @@ def _run_multi_figure_case(case, artifact_writer):
             for identifier in source.get("figure_identifiers", [])
         }
         assert len(identifiers) >= case["expected_structured_fields"]["minimum_figures"]
+        if case["case_id"] == "thermal_multi_figure_frequency_evidence":
+            normalized = _normal(answer)
+            assert re.search(r"39\.12.{0,240}39\.52", normalized, re.DOTALL), (
+                "Figure 6 peak temperatures were not preserved"
+            )
+            assert re.search(
+                r"(?:locali[sz]|concentrat).{0,180}(?:incident|exposure)",
+                normalized,
+                re.DOTALL,
+            ), "Figure 5 spatial localisation was not described"
+            assert not re.search(
+                r"temperature.{0,100}(?:diminish|decreas).{0,100}frequency.{0,40}increas|"
+                r"frequency.{0,40}increas.{0,100}temperature.{0,100}(?:diminish|decreas)",
+                normalized,
+                re.DOTALL,
+            ), "an absorbed-power trend was incorrectly presented as a temperature trend"
+            for sentence in re.split(r"(?<=[.!?])\s+", normalized):
+                if "heating depth" in sentence or "penetration" in sentence:
+                    assert any(
+                        qualifier in sentence
+                        for qualifier in ("infer", "contour", "absorbed power", "spatial")
+                    ), "depth/localisation claim was not qualified as an inference"
         expected_stem = Path(case["pdf_filename"]).stem.casefold()
         assert all(Path(str(source["source"])).stem.casefold() == expected_stem for source in sources)
         artifact_writer(case["case_id"], raw=answer, structured={
@@ -245,6 +285,29 @@ def _run_equation_case(case, artifact_writer):
         for fact in case["prohibited_facts"]:
             assert not _contains(answer, fact), f"prohibited fact present: {fact}"
         assert debug["final_answer_code_path"] == case["expected_structured_fields"]["final_answer_path"]
+        symbolic = debug.get("symbolic_equation")
+        assert isinstance(symbolic, dict), "symbolic Equation 8 validation did not run"
+        assert symbolic["sign_validation"] == "passed"
+        assert symbolic["paper_symbols"] == {
+            "specific_heat": "c", "blood_temperature": "T_b",
+        }
+        assert [(term["kind"], term["sign"]) for term in symbolic["target_terms"]] == [
+            ("second_time_derivative", "+"),
+            ("conduction", "+"),
+            ("tissue_temperature_perfusion", "-"),
+            ("first_time_derivative", "-"),
+            ("blood_temperature_perfusion", "+"),
+            ("external_source", "+"),
+            ("external_source_time_derivative", "+"),
+        ]
+        assert [(term["kind"], term["sign"]) for term in symbolic["rearranged_terms"]] == [
+            ("first_time_derivative", "+"),
+            ("conduction", "+"),
+            ("blood_minus_tissue_perfusion", "+"),
+            ("external_source", "+"),
+        ]
+        assert "c_p" not in answer and "T_a" not in answer
+        assert "steady-state" not in answer.casefold()
         artifact_writer(case["case_id"], raw=answer, structured={
             "answer": answer, "resolution": resolution.to_dict(), "debug": debug,
         })
@@ -297,6 +360,11 @@ def _run_vision_case(case, artifact_writer):
             "thermal_table_2", "thermal_table_3_text_fallback",
         }:
             _assert_exact_text_table(case, value, answer)
+            assert value is debug["repaired_json"]
+            assert value is debug["final_structured_output"]
+            assert value is debug["rendered_structured_object"]
+            evidence = build_visual_evidence(resolution, answer, debug)
+            assert evidence["structured_result"] is value
         _write_debug(artifact_writer, case["case_id"], debug, answer=answer)
     except BaseException as error:
         _write_debug(artifact_writer, case["case_id"], debug, error, answer)
@@ -322,6 +390,9 @@ def _assert_thermal_boundary_figure(case, value, answer):
     expected = case["expected_structured_fields"]
     assert value["diagram_kind"] == expected["diagram_kind"]
     assert value["circuit_topology"] is expected["circuit_topology"]
+    assert "TM microwave" in answer
+    assert "could not verify" not in answer.casefold()
+    assert "ASSOCIATED EQUATIONS/NEARBY TEXT" not in answer
 
 
 def _assert_exact_text_table(case, value, answer):
