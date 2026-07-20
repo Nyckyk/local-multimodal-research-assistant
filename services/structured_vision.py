@@ -2628,29 +2628,73 @@ def grounded_boundary_synthesis(evidence_text: str) -> str:
     if not all(re.search(pattern, evidence, re.I) for pattern in required.values()):
         return ""
 
+    has_wave_port = bool(re.search(r"\bwave[ -]?port boundary\b", evidence, re.I))
+    has_scattering = bool(re.search(r"\bscattering boundary conditions?\b", evidence, re.I))
     lines = ["**Electromagnetic boundary conditions**"]
-    if re.search(r"\bwave[ -]?port boundary\b", evidence, re.I):
+    if has_wave_port:
         mode = "TM microwave field" if re.search(r"\bTM mode\b|\btransverse magnetic\b", evidence, re.I) else "microwave field"
         lines.append(
             f"- The wave-port boundary introduces the incident {mode} at the exposed side."
         )
-    if re.search(r"\bscattering boundary conditions?\b", evidence, re.I):
+    if has_scattering:
         lines.append(
-            "- Scattering conditions on the outer non-port boundaries prevent artificial reflections."
+            "- Scattering conditions on the non-port exterior (the scattering "
+            "boundaries) suppress artificial electromagnetic reflections."
         )
     lines.extend([
         "",
         "**Thermal boundary conditions**",
         "- At $x=0$: $-k\\,\\partial T(0,y,t)/\\partial x=q_{mw}$; this is the applied microwave heat flux.",
-        "- At $x=W$: $\\partial T(W,y,t)/\\partial x=0$; this is an insulated boundary.",
-        "- At $y=0$: $\\partial T(x,0,t)/\\partial y=0$; this is an insulated boundary.",
-        "- At $y=H$: $\\partial T(x,H,t)/\\partial y=0$; this is an insulated boundary.",
+        "- At $x=W$: $\\partial T(W,y,t)/\\partial x=0$; this is an insulated boundary (thermal insulation).",
+        "- At $y=0$: $\\partial T(x,0,t)/\\partial y=0$; this is an insulated boundary (thermal insulation).",
+        "- At $y=H$: $\\partial T(x,H,t)/\\partial y=0$; this is an insulated boundary (thermal insulation).",
     ])
+    if has_wave_port or has_scattering:
+        lines.extend([
+            "",
+            "Electromagnetic and thermal conditions may apply to the same geometric "
+            "edge because they govern different physics interfaces.",
+        ])
     if re.search(r"\bdata[ -]extraction line\b", evidence, re.I):
         lines.extend([
             "",
-            "The data-extraction line is an internal sampling line, not a physical boundary condition.",
+            "**Internal sampling**",
+            "- The data-extraction line is an internal sampling line, not a physical boundary condition.",
         ])
+    return "\n".join(lines)
+
+
+def format_boundary_condition_result(value: dict, evidence_text: str) -> str:
+    """Render multiphysics boundaries without repeating the model explanation."""
+    synthesis = grounded_boundary_synthesis(evidence_text)
+    if not synthesis:
+        return ""
+    visible_structure = " ".join([
+        *[
+            label if isinstance(label, str) else str(label.get("text", label.get("name", "")))
+            for label in value.get("labels", [])
+            if isinstance(label, (str, dict))
+        ],
+        *[
+            " ".join(str(item.get(field, "")) for field in ("from", "to", "relationship"))
+            for item in value.get("connections", [])
+            if isinstance(item, dict)
+        ],
+    ])
+    if (
+        "**Internal sampling**" not in synthesis
+        and re.search(r"\bdata[ -]extraction line\b", visible_structure, re.I)
+    ):
+        synthesis += (
+            "\n\n**Internal sampling**\n"
+            "- The data-extraction line is an internal sampling line, not a physical "
+            "boundary condition."
+        )
+    lines = [synthesis]
+    if value.get("uncertain_items"):
+        lines.append(
+            "\n**Uncertain:** " + ", ".join(map(str, value["uncertain_items"]))
+        )
     return "\n".join(lines)
 
 
@@ -2891,4 +2935,10 @@ def analyse_typed_image(
                 if used_repair else "validated_structured_vision"
             ),
         })
+    if visual_type == "labelled_diagram" and re.search(
+        r"\bboundary conditions?\b", question, re.I
+    ):
+        boundary_rendering = format_boundary_condition_result(value, evidence_text)
+        if boundary_rendering:
+            return boundary_rendering
     return format_structured_result(visual_type, value)

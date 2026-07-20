@@ -341,7 +341,9 @@ def test_streamlit_runtime_accepts_grounded_coordinate_boundary_endpoints():
         "thermal insulation", "internal sampling",
     ):
         assert phrase in answer
-    assert answer.count("Thermal condition at") == 4
+    assert answer.count("**Electromagnetic boundary conditions**") == 1
+    assert answer.count("**Thermal boundary conditions**") == 1
+    assert "same geometric edge" in answer
     assert "could not verify" not in answer.casefold()
     assert "ASSOCIATED EQUATIONS/NEARBY TEXT" not in answer
     assert [item["from"] for item in debug["validated_json"]["connections"]] == [

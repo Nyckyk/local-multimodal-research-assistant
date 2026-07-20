@@ -288,6 +288,44 @@ class StructuredVisionTests(unittest.TestCase):
             self.assertIn(phrase, answer)
         self.assertNotIn("could not verify", answer.casefold())
 
+    def test_boundary_rendering_separates_physics_and_suppresses_duplicate_explanation(self):
+        value = {
+            "diagram_kind": "other",
+            "labels": ["Wave port", "Scattering boundary", "Data extraction line"],
+            "components": [],
+            "spatial_relationships": [],
+            "connections": [
+                {"from": "x = 0", "relationship": "bounds", "to": "Skin model"},
+                {"from": "Data extraction line", "relationship": "samples", "to": "Skin model"},
+            ],
+            "circuit_topology": None,
+            "explanation": (
+                "On the top and bottom edges, scattering boundary conditions prevent "
+                "reflections. The complete thermal explanation is repeated here."
+            ),
+            "uncertain_items": [],
+        }
+        evidence = (
+            "The wave-port boundary governs the incident plane microwaves in TM mode. "
+            "Scattering boundary conditions prevent undesired reflections. "
+            "At x = 0, -k dT(0,y,t)/dx = qmw . (9) At x = W, "
+            "dT(W,y,t)/dx = 0 . (10) At y = 0, dT(x,0,t)/dy = 0 . (11) "
+            "At y = H, dT(x,H,t)/dy = 0 . (12) Data extraction line"
+        )
+        rendered = structured.format_boundary_condition_result(value, evidence)
+        self.assertEqual(rendered.count("**Electromagnetic boundary conditions**"), 1)
+        self.assertEqual(rendered.count("**Thermal boundary conditions**"), 1)
+        self.assertIn("incident TM microwave field", rendered)
+        self.assertIn("artificial electromagnetic reflections", rendered)
+        self.assertIn("same geometric edge", rendered)
+        for coordinate in ("$x=0$", "$x=W$", "$y=0$", "$y=H$"):
+            self.assertIn(coordinate, rendered)
+        self.assertEqual(rendered.count("data-extraction line"), 1)
+        self.assertIn("**Internal sampling**", rendered)
+        self.assertNotIn("**Structured connections:**", rendered)
+        self.assertNotIn("On the top and bottom edges", rendered)
+        self.assertNotIn("x = 0 â€” bounds", rendered)
+
     def test_non_circuit_relationship_endpoint_can_be_grounded_in_caption(self):
         result = {
             "diagram_kind": "other",
