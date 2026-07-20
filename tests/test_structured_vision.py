@@ -177,6 +177,60 @@ class StructuredVisionTests(unittest.TestCase):
             "other",
         )
 
+    def test_non_circuit_may_omit_optional_circuit_topology(self):
+        result = {
+            "diagram_kind": "other",
+            "labels": ["Boundary"],
+            "components": [],
+            "spatial_relationships": [],
+            "connections": [],
+            "explanation": "A non-circuit boundary diagram.",
+            "uncertain_items": [],
+        }
+        validated = structured.validate_labelled_diagram(result)
+        self.assertIsNone(validated["circuit_topology"])
+
+    def test_circuit_still_requires_strict_topology_when_field_is_omitted(self):
+        result = {
+            "diagram_kind": "circuit",
+            "labels": ["R1"],
+            "components": [{"name": "R1", "description": "resistor"}],
+            "spatial_relationships": [],
+            "connections": [],
+            "explanation": "A circuit.",
+            "uncertain_items": [],
+        }
+        with self.assertRaisesRegex(
+            structured.StructuredOutputError, "circuit_topology"
+        ):
+            structured.validate_labelled_diagram(result)
+
+    def test_boundary_enrichment_uses_grounded_conditions_and_excludes_sampling_line(self):
+        value = {
+            "diagram_kind": "other",
+            "labels": ["Wave port boundary", "Data extraction line"],
+            "components": [], "spatial_relationships": [], "connections": [],
+            "explanation": "The figure shows the domain.",
+            "uncertain_items": [], "circuit_topology": None,
+        }
+        evidence = (
+            "Scattering boundary conditions prevent undesired reflections. "
+            "Wave port boundary condition governs the incident plane microwaves. "
+            "At x = 0, -k dT(0,y,t)/dx = qmw . (9) "
+            "At x = W, dT(W,y,t)/dx = 0 . (10) "
+            "At y = 0, dT(x,0,t)/dy = 0 . (11) "
+            "At y = H, dT(x,H,t)/dy = 0 . (12) Data extraction line"
+        )
+        enriched = structured.enrich_boundary_conditions(
+            value, evidence, "Explain all boundary conditions."
+        )
+        explanation = enriched["explanation"]
+        for phrase in (
+            "wave-port", "scattering", "x = 0", "x = W", "y = 0", "y = H",
+            "applied microwave heat flux", "thermal insulation", "internal sampling",
+        ):
+            self.assertIn(phrase, explanation)
+
     def test_non_circuit_relationship_endpoint_can_be_grounded_in_caption(self):
         result = {
             "diagram_kind": "other",

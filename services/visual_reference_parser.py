@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 
 _IDENTIFIER = r"(?:[A-Za-z]\.)?\d+(?:\.\d+)?|[A-Za-z]\d+"
 _TARGET_WORD = r"fig(?:ure)?\.?|table"
+_EQUATION_WORD = r"eq(?:uation)?\.?"
 
 
 @dataclass(frozen=True)
@@ -32,7 +33,12 @@ def canonical_identifier(identifier: str | None) -> str:
 
 
 def _target_type(word: str) -> str:
-    return "table" if word.casefold().startswith("table") else "figure"
+    lowered = word.casefold()
+    if lowered.startswith("table"):
+        return "table"
+    if lowered.startswith("eq"):
+        return "equation"
+    return "figure"
 
 
 def _remaining_query(question: str, start: int, end: int) -> str:
@@ -43,6 +49,22 @@ def _remaining_query(question: str, start: int, end: int) -> str:
 def parse_visual_reference(question: str) -> VisualReference:
     """Parse one visual target without treating unrelated numbers as targets."""
     text = str(question or "")
+
+    equation = re.search(
+        rf"\b(?P<kind>{_EQUATION_WORD})\s*\(?\s*"
+        r"(?P<number>\d+(?:\.\d+)?[a-z]?)\s*\)?"
+        r"(?![A-Za-z0-9])",
+        text,
+        re.IGNORECASE,
+    )
+    if equation:
+        return VisualReference(
+            target_type="equation",
+            target_number=equation.group("number"),
+            explicit_reference=True,
+            raw_reference=equation.group(0),
+            remaining_query=_remaining_query(text, *equation.span()),
+        )
 
     panel_prefix = re.search(
         rf"\bpanel\s+(?P<panel>[A-Za-z])\s+(?:of|in)\s+"
@@ -101,6 +123,17 @@ def parse_visual_reference(question: str) -> VisualReference:
             target_type="table",
             raw_reference=table_followup.group(0),
             remaining_query=_remaining_query(text, *table_followup.span()),
+            followup_kind="previous",
+        )
+
+    equation_followup = re.search(
+        r"\b(?:that|this|the)\s+equation\b", text, re.I
+    )
+    if equation_followup:
+        return VisualReference(
+            target_type="equation",
+            raw_reference=equation_followup.group(0),
+            remaining_query=_remaining_query(text, *equation_followup.span()),
             followup_kind="previous",
         )
 

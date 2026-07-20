@@ -15,7 +15,10 @@ from services.structured_vision import (
     analyse_typed_image,
     detect_compact_graph_panel_ids,
     detect_visual_type,
+    format_structured_result,
 )
+from services.text_table import compare_tables, extract_text_table
+from services.visual_reference_parser import parse_visual_reference
 
 
 VALID_POSITIONS = {"top", "middle", "bottom", "left", "right", "unknown"}
@@ -28,6 +31,29 @@ VISUAL_IDENTIFIER_PATTERN = r"(?:[A-Za-z]\.)?\d+(?:\.\d+)?|[A-Za-z]\d+"
 
 class StructuredVisionError(ValueError):
     """Raised when a structured vision response cannot be trusted."""
+
+
+def _boundary_excerpt(text: str) -> str:
+    match = re.search(r"\bboundary and initial conditions?\b", text, re.I)
+    if match:
+        return text[max(0, match.start() - 350):match.start() + 3600]
+    if re.search(r"\b(?:wave[ -]?port|scattering) boundary\b", text, re.I):
+        position = re.search(
+            r"\b(?:wave[ -]?port|scattering) boundary\b", text, re.I
+        ).start()
+        return text[max(0, position - 900):position + 2400]
+    return ""
+
+
+def _associated_boundary_text(document, page_index: int) -> str:
+    parts = []
+    for index in (page_index - 1, page_index + 1):
+        if not 0 <= index < len(document):
+            continue
+        excerpt = _boundary_excerpt(document[index].get_text("text") or "")
+        if excerpt:
+            parts.append(f"Associated PDF page {index + 1}:\n{excerpt}")
+    return "\n\n".join(parts)
 
 
 def _render_page_image(
@@ -1197,15 +1223,34 @@ def _analyse_typed_page(
         else None
     )
     page_text = page.get_text("text")
+    reference = parse_visual_reference(question)
+    try:
+        text_table = (
+            extract_text_table(page, reference.target_number, question)
+            if visual_type == "table" and reference.target_number
+            else None
+        )
+    except Exception:
+        # Text extraction is a fallback/cross-check. It must never prevent the
+        # primary structured-vision attempt from running.
+        text_table = None
     caption_evidence = (
         f"TARGET FIGURE CAPTION (authoritative for this crop):\n{target_caption[1]}\n\n"
         if target_caption
         else ""
     )
-    combined_evidence = (
-        f"{caption_evidence}PAGE TEXT CROSS-CHECK:\n{page_text}\n\n"
-        f"RETRIEVED TEXT CROSS-CHECK:\n{text_evidence}"
-    )
+    if visual_type == "labelled_diagram" and re.search(
+        r"\bboundary conditions?\b", question, re.I
+    ):
+        combined_evidence = (
+            f"{caption_evidence}ASSOCIATED EQUATIONS/NEARBY TEXT:\n{text_evidence}\n\n"
+            f"PAGE TEXT CROSS-CHECK:\n{page_text}"
+        )
+    else:
+        combined_evidence = (
+            f"{caption_evidence}PAGE TEXT CROSS-CHECK:\n{page_text}\n\n"
+            f"RETRIEVED TEXT CROSS-CHECK:\n{text_evidence}"
+        )
 
     panel_labels = _multi_panel_labels(page_text) if visual_type == "graph" else []
     panel_detection_raw = ""
@@ -1375,14 +1420,54 @@ def _analyse_typed_page(
                 ]],
             })
     try:
-        return analyse_typed_image(
+        analysis_debug = debug_info if debug_info is not None else {}
+        answer = analyse_typed_image(
             image_path=image_path,
             visual_type=visual_type,
             question=question,
             evidence_text=combined_evidence,
-            debug_info=debug_info,
+            debug_info=analysis_debug,
             fit_verification_images=fit_verification_images,
         )
+        if visual_type != "table" or text_table is None:
+            return answer
+
+        vision_table = analysis_debug.get("validated_json")
+        cross_check = (
+            compare_tables(vision_table, text_table)
+            if isinstance(vision_table, dict)
+            else {"matched": False, "mismatches": ["no validated vision table"]}
+        )
+        analysis_debug["text_table_cross_check"] = cross_check
+        if isinstance(vision_table, dict) and cross_check["matched"]:
+            merged_table = dict(vision_table)
+            comparisons = list(merged_table.get("comparisons") or [])
+            comparison_keys = {
+                re.sub(r"\W+", " ", str(item).casefold()).strip()
+                for item in comparisons
+            }
+            for comparison in text_table.get("comparisons") or []:
+                key = re.sub(r"\W+", " ", str(comparison).casefold()).strip()
+                if key and key not in comparison_keys:
+                    comparisons.append(comparison)
+                    comparison_keys.add(key)
+            merged_table["comparisons"] = comparisons
+            analysis_debug["validated_json"] = merged_table
+            analysis_debug["text_table_details_merged"] = bool(
+                comparisons != list(vision_table.get("comparisons") or [])
+            )
+            return format_structured_result("table", merged_table)
+
+        vision_error = analysis_debug.get("validation_error", "")
+        analysis_debug.update({
+            "vision_table_validation_error": vision_error,
+            "validated_json": text_table,
+            "validation_error": "",
+            "repaired_validation_result": "passed",
+            "final_answer_path": "validated_text_table_fallback",
+            "final_answer_code_path": "validated_text_table_fallback",
+        })
+        return format_structured_result("table", text_table)
     finally:
         if not save_crops:
             image_path.unlink(missing_ok=True)
@@ -1410,6 +1495,13 @@ def analyse_pdf_page(
         page = document.load_page(page_number - 1)
         page_text = page.get_text("text")
         visual_type = detect_visual_type(question, page_text)
+        analysis_text_evidence = text_evidence
+        if re.search(r"\bboundary conditions?\b", question, re.I):
+            associated = _associated_boundary_text(document, page_number - 1)
+            if associated:
+                analysis_text_evidence = (
+                    f"{associated}\n\n{analysis_text_evidence}"
+                ).strip()
 
         # Graphs and tables must be dispatched before the legacy grouping
         # keyword check because their legends/rows commonly contain "groups".
@@ -1421,7 +1513,7 @@ def analyse_pdf_page(
                 page,
                 question,
                 visual_type,
-                text_evidence,
+                analysis_text_evidence,
                 debug_info,
             )
 

@@ -8,6 +8,7 @@ import unicodedata
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
+from services.document_matching import explicit_document_matches
 from services.structured_vision import detect_visual_type
 from services.visual_index import flatten_visual_targets
 from services.visual_reference_parser import (
@@ -111,20 +112,7 @@ def _embedding_relevance(question: str, captions: list[str], embedder=None) -> l
 
 
 def _question_names_pdf(question: str, pdf_name: str) -> bool:
-    question_key = re.sub(r"[^a-z0-9]+", " ", question.casefold())
-    stem_tokens = [
-        token for token in _tokens(Path(pdf_name).stem)
-        if len(token) >= 4
-    ]
-    if Path(pdf_name).name.casefold() in question.casefold():
-        return True
-    if not stem_tokens:
-        return False
-    overlap = set(stem_tokens) & set(question_key.split())
-    return (
-        len(overlap) >= min(2, len(stem_tokens))
-        or any(len(token) >= 8 for token in overlap)
-    )
+    return pdf_name in explicit_document_matches(question, [pdf_name])
 
 
 def _previous_target(messages: list[dict], target_type: str | None = None) -> dict | None:
@@ -149,7 +137,7 @@ def _previous_target(messages: list[dict], target_type: str | None = None) -> di
             page_number = candidate.get("page_number")
             if status not in (None, "resolved"):
                 continue
-            if candidate_type not in {"figure", "table"}:
+            if candidate_type not in {"figure", "table", "equation"}:
                 continue
             if not isinstance(candidate_number, str) or not candidate_number.strip():
                 continue
@@ -208,7 +196,11 @@ def apply_conversation_reference(
     return reference, None, "no unambiguous conversation target"
 
 
-def choose_visual_type(reference: VisualReference, question: str, caption: str) -> str:
+def choose_visual_type(
+    reference: VisualReference, question: str, caption: str
+) -> str | None:
+    if reference.target_type == "equation":
+        return None
     if reference.target_type == "table":
         return "table"
     detected = detect_visual_type(question, caption)
@@ -287,9 +279,18 @@ def resolve_visual_target(
         ):
             deduplicated[key] = candidate
     candidates = list(deduplicated.values())
+    explicit_names = explicit_document_matches(
+        question, [candidate["pdf_name"] for candidate in candidates]
+    )
     captions = [candidate.get("caption", "") for candidate in candidates]
     embedding_relevance = _embedding_relevance(question, captions, embedder)
-    lexical_relevance = [_lexical_relevance(question, caption) for caption in captions]
+    lexical_relevance = [
+        _lexical_relevance(
+            question,
+            f"{caption} {candidate.get('nearby_text', '')[:3000]}",
+        )
+        for caption, candidate in zip(captions, candidates)
+    ]
     relevance = [
         max(embedding_score, lexical_score)
         for embedding_score, lexical_score in zip(
@@ -301,34 +302,55 @@ def resolve_visual_target(
     previous_name = previous.get("pdf_name") if previous else None
     source_stems = {Path(name).stem.casefold() for name in (current_source_names or [])}
     scored = []
-    for candidate, caption_score, unique_score in zip(
-        candidates, relevance, unique_coverage
+    for candidate, caption_score, unique_score, lexical_score in zip(
+        candidates, relevance, unique_coverage, lexical_relevance
     ):
-        score = 0.78 if candidate["match_kind"] == "caption" else 0.46
-        reasons = ["exact caption identifier" if candidate["match_kind"] == "caption" else "exact in-page reference"]
-        if _question_names_pdf(question, candidate["pdf_name"]):
-            score += 0.50
-            reasons.append("PDF named in question")
-        if selected_name and candidate["pdf_name"].casefold() == selected_name.casefold():
+        if candidate["match_kind"] == "caption":
+            score = 0.78
+            reasons = ["exact caption identifier"]
+        elif candidate["match_kind"] == "equation":
+            score = 0.82
+            reasons = ["exact displayed equation identifier"]
+        else:
+            score = 0.46
+            reasons = ["exact in-page reference"]
+        explicitly_named = candidate["pdf_name"] in explicit_names
+        if explicitly_named:
+            score += 0.80
+            reasons.append("document title explicitly identified in question")
+        if (
+            not explicit_names and selected_name
+            and candidate["pdf_name"].casefold() == selected_name.casefold()
+        ):
             score += 0.04
             reasons.append("selected PDF preference")
-        if previous_name and candidate["pdf_name"].casefold() == str(previous_name).casefold():
+        if (
+            not explicit_names and previous_name
+            and candidate["pdf_name"].casefold() == str(previous_name).casefold()
+        ):
             score += 0.04
             reasons.append("previous visual PDF")
-        if Path(candidate["pdf_name"]).stem.casefold() in source_stems:
+        if (
+            not explicit_names
+            and Path(candidate["pdf_name"]).stem.casefold() in source_stems
+        ):
             score += 0.02
             reasons.append("conversation source context")
-        score += min(0.30, caption_score * 0.30)
-        if caption_score:
-            reasons.append("caption relevance")
-        score += min(0.15, unique_score * 0.15)
-        if unique_score:
-            reasons.append("distinctive caption terms")
+        if reference.target_type != "equation":
+            score += min(0.30, caption_score * 0.30)
+            if caption_score:
+                reasons.append("caption relevance")
+            score += min(0.15, unique_score * 0.15)
+            if unique_score:
+                reasons.append("distinctive caption terms")
         scored.append({
             **candidate,
             "rank_score": score,
             "score": min(1.0, score),
             "score_reasons": reasons,
+            "caption_relevance_score": caption_score,
+            "lexical_relevance_score": lexical_score,
+            "unique_caption_coverage": unique_score,
         })
     scored.sort(key=lambda row: (-row["rank_score"], row["pdf_name"].casefold(), row["page_number"]))
     top = scored[0]
@@ -346,10 +368,28 @@ def resolve_visual_target(
     explicit_or_context_tie_break = any(
         reason in top["score_reasons"]
         for reason in (
-            "PDF named in question",
+            "document title explicitly identified in question",
             "selected PDF preference",
             "previous visual PDF",
             "conversation source context",
+        )
+    )
+    strong_distinctive_terminology = (
+        (
+            "distinctive caption terms" in top.get("score_reasons", [])
+            and (
+                top.get("unique_caption_coverage", 0.0) >= 0.30
+                or second is None
+                or top["rank_score"] - second["rank_score"] >= 0.04
+            )
+        )
+        or (
+            top.get("lexical_relevance_score", 0.0) >= 0.20
+            and (
+                second is None
+                or top.get("lexical_relevance_score", 0.0)
+                > second.get("lexical_relevance_score", 0.0) + 0.10
+            )
         )
     )
     if (
@@ -357,6 +397,7 @@ def resolve_visual_target(
         and top["pdf_name"] != second["pdf_name"]
         and top["rank_score"] - second["rank_score"] < VISUAL_AMBIGUITY_MARGIN
         and not explicit_or_context_tie_break
+        and not strong_distinctive_terminology
     ):
         return VisualResolution(
             status="ambiguous",
@@ -403,20 +444,24 @@ def resolve_visual_target(
 def resolved_analysis_question(question: str, resolution: VisualResolution) -> str:
     if resolution.status != "resolved" or not resolution.target_number:
         return question
-    label = "Table" if resolution.target_type == "table" else "Figure"
+    label = {
+        "table": "Table", "equation": "Equation",
+    }.get(resolution.target_type, "Figure")
     panel = f", panel {resolution.panel}" if resolution.panel else ""
     return f"{question}\nResolved visual target: {label} {resolution.target_number}{panel}."
 
 
 def should_activate_automatic_vision(question: str, resolution: VisualResolution) -> bool:
     reference = parse_visual_reference(question)
-    return resolution.status == "resolved" and (
+    return resolution.target_type != "equation" and resolution.status == "resolved" and (
         reference.explicit_reference or reference.followup_kind is not None
     )
 
 
 def format_resolution_problem(resolution: VisualResolution) -> str:
-    label = "Table" if resolution.target_type == "table" else "Figure"
+    label = {
+        "table": "Table", "equation": "Equation",
+    }.get(resolution.target_type, "Figure")
     identifier = f" {resolution.target_number}" if resolution.target_number else ""
     if resolution.status == "ambiguous":
         low_confidence = "confidence" in resolution.reason.casefold()

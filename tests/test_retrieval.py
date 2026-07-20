@@ -115,6 +115,50 @@ class NegativeSummaryReranker:
         return [-10.0 - (index * 0.1) for index, _ in enumerate(pairs)]
 
 
+class MultiFigureCollection:
+    rows = [
+        (
+            "Figure 5. Spatial localization and penetration-depth evidence for effect A.",
+            {"pdf": "Descriptive thermal study.pdf", "page": 9, "chunk": 0},
+        ),
+        (
+            "Figure 6. Isothermal contours and peak-temperature evidence for effect B.",
+            {"pdf": "Descriptive thermal study.pdf", "page": 10, "chunk": 0},
+        ),
+        (
+            "Figure 2. An unrelated result in another paper.",
+            {"pdf": "Other study.pdf", "page": 4, "chunk": 0},
+        ),
+    ]
+
+    def count(self):
+        return len(self.rows)
+
+    def query(self, **kwargs):
+        return {
+            "documents": [[row[0] for row in self.rows]],
+            "metadatas": [[row[1] for row in self.rows]],
+            "distances": [[0.1] * len(self.rows)],
+        }
+
+
+class MultiFigureReranker:
+    def predict(self, pairs):
+        scores = []
+        for query, document in pairs:
+            if "effect A" in query and "Figure 5" in document:
+                scores.append(1.0)
+            elif "effect B" in query and "Figure 6" in document:
+                scores.append(1.0)
+            elif "Descriptive thermal" in query and "unrelated" not in document:
+                scores.append(0.8)
+            elif "unrelated" in document:
+                scores.append(-1.0)
+            else:
+                scores.append(0.5)
+        return scores
+
+
 class FallbackCollection(SummaryCollection):
     def query(self, **kwargs):
         self.query_calls += 1
@@ -160,6 +204,25 @@ class TextRetrievalTests(unittest.TestCase):
         self.assertEqual(sources[0]["page"], 2)
         self.assertNotIn("DOCUMENT SUMMARY MODE", context)
         self.assertEqual(collection.query_calls, 1)
+
+    def test_multi_figure_evidence_retrieval_keeps_distinct_effects(self):
+        context, sources = retrieve_context(
+            question=(
+                "Which figures in the Descriptive thermal paper provide the strongest "
+                "evidence for both effect A and effect B?"
+            ),
+            previous_question="",
+            collection=MultiFigureCollection(),
+            embedder=FakeEmbedder(),
+            reranker=MultiFigureReranker(),
+        )
+        self.assertIn("MULTI-FIGURE EVIDENCE MODE", context)
+        selected = {
+            identifier for source in sources
+            for identifier in source["figure_identifiers"]
+        }
+        self.assertEqual(selected, {"5", "6"})
+        self.assertTrue(all(source["source"] == "Descriptive thermal study.pdf" for source in sources))
 
     def test_summary_excludes_bibliography_and_prioritizes_overview_sections(self):
         collection = SummaryCollection()

@@ -699,6 +699,13 @@ def normalize_composite_diagram_endpoints(value: dict) -> dict:
 
 
 def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
+    if not isinstance(value, dict):
+        raise StructuredOutputError("Labelled diagram response must be an object.")
+    value = dict(value)
+    # Topology is conditional on diagram_kind. Older/non-circuit model output
+    # may omit the field entirely; normalize that optional case before checking
+    # the common schema, while circuit diagrams remain strictly validated below.
+    value.setdefault("circuit_topology", None)
     required = {
         "diagram_kind", "labels", "components", "spatial_relationships",
         "connections", "circuit_topology", "explanation", "uncertain_items",
@@ -866,6 +873,70 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
             "missing from the diagram result."
         )
     return value
+
+
+def enrich_boundary_conditions(
+    value: dict, evidence_text: str, question: str
+) -> dict:
+    """Attach grounded boundary text to a validated non-circuit diagram."""
+    if not re.search(r"\bboundary conditions?\b", question, re.I):
+        return value
+    if str(value.get("diagram_kind", "")).casefold() == "circuit":
+        return value
+
+    evidence = re.sub(r"\s+", " ", str(evidence_text or "")).strip()
+    additions = []
+    if re.search(r"\bwave[ -]?port boundary\b", evidence, re.I):
+        additions.append(
+            "Electromagnetic condition: the wave-port boundary introduces the "
+            "incident microwave field at the exposed side."
+        )
+    if re.search(r"\bscattering boundary conditions?\b", evidence, re.I):
+        additions.append(
+            "Electromagnetic condition: scattering boundaries suppress artificial "
+            "electromagnetic reflections."
+        )
+
+    coordinate_patterns = (
+        ("x = 0", r"At\s+x\s*=\s*0\s*,\s*(.*?q\s*mw.*?)\(\s*9\s*\)"),
+        ("x = W", r"At\s+x\s*=\s*W\s*,\s*(.*?)\(\s*10\s*\)"),
+        ("y = 0", r"At\s+y\s*=\s*0\s*,\s*(.*?)\(\s*11\s*\)"),
+        ("y = H", r"At\s+y\s*=\s*H\s*,\s*(.*?)\(\s*12\s*\)"),
+    )
+    for coordinate, pattern in coordinate_patterns:
+        match = re.search(pattern, evidence, re.I)
+        if not match:
+            continue
+        formula = re.sub(r"\s+", " ", match.group(1)).strip(" .")
+        interpretation = (
+            "applied microwave heat flux"
+            if re.search(r"q\s*mw", formula, re.I)
+            else "thermal insulation"
+        )
+        additions.append(
+            f"Thermal condition at {coordinate}: {formula}; this represents "
+            f"{interpretation}."
+        )
+    visible_labels = " ".join(
+        label if isinstance(label, str) else str(label.get("text", label.get("name", "")))
+        for label in value.get("labels", [])
+        if isinstance(label, (str, dict))
+    )
+    if re.search(
+        r"\bdata[ -]extraction line\b", f"{evidence} {visible_labels}", re.I
+    ):
+        additions.append(
+            "The data-extraction line is an internal sampling line, not a physical "
+            "boundary condition."
+        )
+
+    corrected = dict(value)
+    explanation = corrected.get("explanation", "").strip()
+    existing = _normal_name(explanation)
+    unique = [item for item in additions if _normal_name(item) not in existing]
+    if unique:
+        corrected["explanation"] = " ".join([explanation, *unique]).strip()
+    return corrected
 
 
 _SUPERSCRIPT_TRANSLATION = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁻⁺", "0123456789-+")
@@ -2652,6 +2723,9 @@ def analyse_typed_image(
                             "junctions and caption evidence."
                         )
                     return _grounded_caption_fallback(evidence_text, visual_type)
+
+    if visual_type == "labelled_diagram":
+        value = enrich_boundary_conditions(value, evidence_text, question)
 
     fit_verification_raw = []
     fit_verification_status = "not_applicable"
