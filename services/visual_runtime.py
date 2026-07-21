@@ -46,3 +46,22 @@ def analyse_resolved_visual(
             "runtime_error": "",
         })
     return answer
+
+
+def build_visual_evidence(
+    resolution: VisualResolution,
+    visual_answer: str,
+    debug_info: dict | None = None,
+) -> dict:
+    """Build conversation evidence from the same final object used to render."""
+    debug = debug_info if isinstance(debug_info, dict) else {}
+    final_structured = debug.get("final_structured_output")
+    return {
+        "summary": "Local visual analysis of the selected page.",
+        "analysis_kind": "Visual analysis",
+        "pdf": resolution.pdf_name,
+        "page": int(resolution.page_number),
+        "vision_result": visual_answer,
+        "structured_result": final_structured,
+        "visual_target": resolution.to_dict(),
+    }

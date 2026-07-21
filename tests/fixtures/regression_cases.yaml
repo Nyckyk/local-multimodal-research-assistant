@@ -32,6 +32,135 @@ cases:
     timeout: 180
     maximum_retry_count: 1
 
+  - case_id: thermal_document_summary
+    pdf_filename: Thermal wave and Pennes’ models of bioheat transfer in human.pdf
+    pdf_page: null
+    question: Summarise the thermal wave and pennes paper, including its research question, methods, main results and limitations.
+    expected_response_type: rag_summary
+    required_facts:
+      - research question
+      - methods
+      - main results
+      - limitations
+      - two-dimensional
+      - finite element method
+      - Pennes
+      - thermal wave
+      - TWMBT initially forecasts lower heat rise
+      - steady-state
+    prohibited_facts: []
+    expected_structured_fields:
+      requested_sections: [research question, methods, main results, limitations]
+      minimum_pages: 3
+      minimum_chunks: 5
+    allowed_uncertainty: []
+    timeout: 240
+    maximum_retry_count: 1
+
+  - case_id: thermal_figure_2_boundary_conditions
+    pdf_filename: Thermal wave and Pennes’ models of bioheat transfer in human.pdf
+    pdf_page: 5
+    question: Using Figure 2, explain all boundary conditions applied to the skin model.
+    expected_response_type: labelled_diagram
+    required_facts:
+      - wave-port boundary
+      - scattering boundaries
+      - x = 0
+      - qmw
+      - x = W
+      - y = 0
+      - y = H
+      - thermal insulation
+      - internal sampling line
+    prohibited_facts:
+      - data-extraction line is a physical boundary
+    expected_structured_fields:
+      diagram_kind: other
+      circuit_topology: null
+      final_answer_path: validated_typed_vision
+    allowed_uncertainty: []
+    timeout: 180
+    maximum_retry_count: 1
+
+  - case_id: thermal_table_2
+    pdf_filename: Thermal wave and Pennes’ models of bioheat transfer in human.pdf
+    pdf_page: 5
+    question: Extract every row and column from Table 2 in the thermal paper.
+    expected_response_type: table
+    required_facts: [Epidermis, Dermis, Subcutaneous, Inner tissue]
+    prohibited_facts: []
+    expected_structured_fields:
+      columns: [Layer, 0.9 GHz εr, 0.9 GHz σ, 1.8 GHz εr, 1.8 GHz σ, 2.45 GHz εr, 2.45 GHz σ, 4 GHz εr, 4 GHz σ]
+      rows:
+        - [Epidermis, '3.02', '0.011', '4.08', '0.12', '4.01', '0.010', '3.07', '0.111']
+        - [Dermis, '5.12', '0.242', '5.11', '0.66', '5.00', '0.383', '4.68', '0.498']
+        - [Subcutaneous, '4.81', '0.033', '4.20', '0.32', '4.68', '0.091', '3.98', '0.130']
+        - [Inner tissue, '27.85', '0.345', '24.70', '0.98', '24.32', '0.965', '25.40', '1.415']
+      unreadable_cells: []
+      allowed_final_answer_paths:
+        - validated_typed_vision
+        - validated_text_table_fallback
+    allowed_uncertainty: []
+    timeout: 180
+    maximum_retry_count: 1
+
+  - case_id: thermal_table_3_text_fallback
+    pdf_filename: Thermal wave and Pennes’ models of bioheat transfer in human.pdf
+    pdf_page: 8
+    question: Extract Table 3 from the thermal paper and explain why the authors selected the Extra Fine mesh.
+    expected_response_type: table
+    required_facts: [Extra Fine, Extremely Fine, 0.0001 W/kg]
+    prohibited_facts: []
+    expected_structured_fields:
+      columns: [Mesh type, Normal, Fine, Finer, Extra Fine, Extremely Fine]
+      rows:
+        - [Degrees of freedom, '20463', '22546', '29507', '58907', '182970']
+        - [Elements, '2072', '2277', '2938', '5890', '18257']
+        - [SAR (W/Kg), '357.5132', '357.8341', '358.0154', '358.1013', '358.1014']
+      unreadable_cells: []
+      allowed_final_answer_paths:
+        - validated_typed_vision
+        - validated_text_table_fallback
+    allowed_uncertainty: []
+    timeout: 180
+    maximum_retry_count: 1
+
+  - case_id: thermal_equation_8
+    pdf_filename: Thermal wave and Pennes’ models of bioheat transfer in human.pdf
+    pdf_page: 6
+    question: Explain Equation 8 and show how it reduces to the Pennes equation when relaxation time is zero.
+    expected_response_type: equation
+    required_facts:
+      - Qmet is assumed zero
+      - second-time-derivative
+      - τ-dependent
+      - time derivative of the external source
+      - ρc
+      - K∇²T
+      - ρb cb ωb
+      - Qext
+      - Pennes equation
+    prohibited_facts:
+      - Figure 5 analysis
+    expected_structured_fields:
+      final_answer_path: validated_text_equation_analysis
+    allowed_uncertainty: []
+    timeout: 180
+    maximum_retry_count: 1
+
+  - case_id: thermal_multi_figure_frequency_evidence
+    pdf_filename: Thermal wave and Pennes’ models of bioheat transfer in human.pdf
+    pdf_page: null
+    question: Which figures provide the strongest evidence that microwave frequency affects both heating depth and temperature?
+    expected_response_type: rag_multi_figure
+    required_facts: [Figure 5, Figure 6, absorbed power, peak temperature]
+    prohibited_facts: []
+    expected_structured_fields:
+      minimum_figures: 2
+    allowed_uncertainty: []
+    timeout: 180
+    maximum_retry_count: 1
+
   - case_id: figure_6_auto_hallmarks
     pdf_filename: hall marks of aging.pdf
     pdf_page: 46
@@ -140,6 +269,34 @@ cases:
     maximum_retry_count: 1
 
 visual_resolution_cases:
+  - case_id: resolve_thermal_table_2
+    question: Extract Table 2 in the thermal paper.
+    target_type: table
+    target_number: "2"
+    expected_pdf: Thermal wave and Pennes’ models of bioheat transfer in human.pdf
+    expected_page: 5
+
+  - case_id: resolve_bioimpedance_table_2
+    question: Extract Table 2 in the bioimpedance paper.
+    target_type: table
+    target_number: "2"
+    expected_pdf: Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf
+    expected_page: 8
+
+  - case_id: resolve_thermal_figure_2
+    question: Using Figure 2, explain all boundary conditions applied to the skin model.
+    target_type: figure
+    target_number: "2"
+    expected_pdf: Thermal wave and Pennes’ models of bioheat transfer in human.pdf
+    expected_page: 5
+
+  - case_id: resolve_thermal_table_3
+    question: Extract Table 3 from the thermal paper and explain why the authors selected the Extra Fine mesh.
+    target_type: table
+    target_number: "3"
+    expected_pdf: Thermal wave and Pennes’ models of bioheat transfer in human.pdf
+    expected_page: 8
+
   - case_id: resolve_hallmarks_figure_6
     question: How does Figure 6 distinguish primary, antagonistic and integrative hallmarks?
     target_type: figure
@@ -169,7 +326,7 @@ visual_resolution_cases:
     expected_page: 8
 
   - case_id: resolve_bioimpedance_table_1
-    question: Extract all rows from Table 1.
+    question: Extract all rows from Table 1 in the bioimpedance paper.
     target_type: table
     target_number: "1"
     expected_pdf: Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf

@@ -7,6 +7,7 @@ from rag.database import get_collection
 from rag.embeddings import load_embedder, load_reranker
 from rag.ingestion import index_pdf
 from rag.retrieval import retrieve_context
+from services.equation_service import analyse_resolved_equation
 from services.ollama_service import generate_answer
 from services.query_rewriter import rewrite_question
 from services.visual_fallback import resolve_with_visual_fallback
@@ -19,7 +20,7 @@ from services.visual_locator import (
     should_activate_automatic_vision,
 )
 from services.visual_reference_parser import has_visual_reference
-from services.visual_runtime import analyse_resolved_visual
+from services.visual_runtime import analyse_resolved_visual, build_visual_evidence
 from services.vision_service import COULD_NOT_VERIFY_MESSAGE
 from settings import MAX_HISTORY_MESSAGES, PAPERS_FOLDER
 
@@ -281,8 +282,9 @@ for message in st.session_state.messages:
         if message_sources or evidence:
             with st.expander("Sources"):
                 if evidence:
+                    evidence_kind = evidence.get("analysis_kind", "Visual analysis")
                     st.write(
-                        f"- Visual analysis: {evidence.get('pdf', 'unknown source')}, "
+                        f"- {evidence_kind}: {evidence.get('pdf', 'unknown source')}, "
                         f"page {evidence.get('page', 'unknown')}"
                     )
 
@@ -360,9 +362,13 @@ if question:
             )
 
             visual_answer = ""
+            equation_answer = ""
             vision_error = ""
+            equation_error = ""
             visual_context = ""
             vision_debug = {"_save_crops": vision_debug_enabled}
+            equation_debug = {}
+            text_generation_debug = {}
             resolution_fallback_debug = {}
             previous_visual_evidence = next(
                 (
@@ -398,7 +404,7 @@ if question:
                     current_source_names=previous_sources,
                     embedder=embedder,
                 )
-                if has_visual_reference(question) and (
+                if resolution.target_type != "equation" and has_visual_reference(question) and (
                     resolution.status == "not_found"
                     or (
                         resolution.status == "ambiguous"
@@ -416,11 +422,21 @@ if question:
             else:
                 resolution = resolve_visual_target(question, {"files": {}})
 
-            use_vision = manual_visual_override or should_activate_automatic_vision(
-                question, resolution
-            )
+            use_vision = (
+                manual_visual_override and resolution.target_type != "equation"
+            ) or should_activate_automatic_vision(question, resolution)
             selected_pdf = Path(resolution.pdf_path) if resolution.pdf_path else None
             vision_page_number = resolution.page_number or 1
+            if resolution.status == "resolved" and resolution.target_type == "equation":
+                try:
+                    equation_answer = analyse_resolved_equation(
+                        question,
+                        resolution,
+                        conversation_history=conversation_history,
+                        debug_info=equation_debug,
+                    )
+                except Exception as error:
+                    equation_error = str(error)
             if use_vision and selected_pdf is not None:
                 if not manual_visual_override:
                     st.info(
@@ -464,7 +480,20 @@ if question:
             evidence = None
             visual_reference_requested = has_visual_reference(question)
 
-            if visual_answer:
+            if equation_answer:
+                answer = (
+                    f"{equation_answer}\n\n"
+                    f"Source: **{resolution.pdf_name}**, "
+                    f"PDF page **{int(resolution.page_number)}**."
+                )
+                evidence = {
+                    "summary": "Grounded analysis of an explicitly numbered equation.",
+                    "analysis_kind": "Equation analysis",
+                    "pdf": resolution.pdf_name,
+                    "page": int(resolution.page_number),
+                    "visual_target": resolution.to_dict(),
+                }
+            elif visual_answer:
                 cross_visual_comparison = bool(
                     previous_visual_evidence
                     and re.search(r"\b(?:compare|versus|vs\.?|difference)\b", question, re.I)
@@ -482,6 +511,7 @@ if question:
                         question=question,
                         context=comparison_context,
                         conversation_history=conversation_history,
+                        debug_info=text_generation_debug,
                     )
                 else:
                     answer = (
@@ -489,15 +519,9 @@ if question:
                         f"Source: **{selected_pdf.name}**, "
                         f"PDF page **{int(vision_page_number)}**."
                     )
-                evidence = {
-                    "summary": (
-                        "Local visual analysis of the selected page."
-                    ),
-                    "pdf": selected_pdf.name,
-                    "page": int(vision_page_number),
-                    "vision_result": visual_answer,
-                    "visual_target": resolution.to_dict(),
-                }
+                evidence = build_visual_evidence(
+                    resolution, visual_answer, vision_debug
+                )
             elif resolution.status == "ambiguous" and visual_reference_requested:
                 answer = format_resolution_problem(resolution)
                 st.session_state.pending_visual_resolution = resolution.to_dict()
@@ -505,6 +529,8 @@ if question:
                 answer = format_resolution_problem(resolution)
             elif use_vision and selected_pdf is not None and vision_error:
                 answer = COULD_NOT_VERIFY_MESSAGE
+            elif resolution.target_type == "equation" and equation_error:
+                answer = "Could not verify the requested equation from indexed PDF text."
             elif not context:
                 answer = (
                     "No relevant information was found "
@@ -515,6 +541,7 @@ if question:
                     question=question,
                     context=context,
                     conversation_history=conversation_history,
+                    debug_info=text_generation_debug,
                 )
 
             st.markdown(answer)
@@ -522,8 +549,9 @@ if question:
             if sources or evidence:
                 with st.expander("Sources"):
                     if evidence:
+                        evidence_kind = evidence.get("analysis_kind", "Visual analysis")
                         st.write(
-                            f"- Visual analysis: {evidence['pdf']}, "
+                            f"- {evidence_kind}: {evidence['pdf']}, "
                             f"page {evidence['page']}"
                         )
 
@@ -594,7 +622,11 @@ if question:
                         if vision_debug.get("normalized_json"):
                             st.markdown("### Normalized vision JSON")
                             st.json(vision_debug["normalized_json"])
-                        if vision_debug.get("validated_json"):
+                        final_structured = vision_debug.get("final_structured_output")
+                        if final_structured is not None:
+                            st.markdown("### Final typed structured output")
+                            st.json(final_structured)
+                        elif vision_debug.get("validated_json"):
                             st.markdown("### Typed vision JSON")
                             st.json(vision_debug["validated_json"])
                         if vision_debug.get("initial_validation_errors"):
@@ -618,19 +650,9 @@ if question:
                             st.markdown("### Vision validation error")
                             st.code(vision_debug["validation_error"])
                         if vision_debug.get("raw_vision_response"):
-                            repaired_output = (
-                                vision_debug.get("initial_validation_errors")
-                                and vision_debug.get("repaired_validation_result") == "passed"
-                            )
-                            st.markdown(
-                                "### Repaired/final vision response"
-                                if repaired_output else "### Raw vision response"
-                            )
+                            st.markdown("### Raw vision response")
                             st.text_area(
-                                (
-                                    "Repaired/final structured output"
-                                    if repaired_output else "Raw structured output"
-                                ),
+                                "Raw model structured output",
                                 value=vision_debug["raw_vision_response"],
                                 height=220,
                                 key=f"raw_vision_{len(st.session_state.messages)}",
@@ -642,6 +664,16 @@ if question:
                         if final_answer_code_path:
                             st.markdown("### Final answer code path")
                             st.code(final_answer_code_path)
+
+                if equation_debug:
+                    st.markdown("### Equation analysis")
+                    if equation_error:
+                        st.error(equation_error)
+                    st.json(equation_debug)
+
+                if text_generation_debug:
+                    st.markdown("### Text generation")
+                    st.json(text_generation_debug)
 
                 if sources:
                     retrieval_debug = sources[0].get("retrieval_debug")

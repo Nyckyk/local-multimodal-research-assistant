@@ -177,6 +177,155 @@ class StructuredVisionTests(unittest.TestCase):
             "other",
         )
 
+    def test_non_circuit_may_omit_optional_circuit_topology(self):
+        result = {
+            "diagram_kind": "other",
+            "labels": ["Boundary"],
+            "components": [],
+            "spatial_relationships": [],
+            "connections": [],
+            "explanation": "A non-circuit boundary diagram.",
+            "uncertain_items": [],
+        }
+        validated = structured.validate_labelled_diagram(result)
+        self.assertIsNone(validated["circuit_topology"])
+
+    def test_circuit_still_requires_strict_topology_when_field_is_omitted(self):
+        result = {
+            "diagram_kind": "circuit",
+            "labels": ["R1"],
+            "components": [{"name": "R1", "description": "resistor"}],
+            "spatial_relationships": [],
+            "connections": [],
+            "explanation": "A circuit.",
+            "uncertain_items": [],
+        }
+        with self.assertRaisesRegex(
+            structured.StructuredOutputError, "circuit_topology"
+        ):
+            structured.validate_labelled_diagram(result)
+
+    def test_boundary_enrichment_uses_grounded_conditions_and_excludes_sampling_line(self):
+        value = {
+            "diagram_kind": "other",
+            "labels": ["Wave port boundary", "Data extraction line"],
+            "components": [], "spatial_relationships": [], "connections": [],
+            "explanation": "The figure shows the domain.",
+            "uncertain_items": [], "circuit_topology": None,
+        }
+        evidence = (
+            "Scattering boundary conditions prevent undesired reflections. "
+            "Wave port boundary condition governs the incident plane microwaves. "
+            "At x = 0, -k dT(0,y,t)/dx = qmw . (9) "
+            "At x = W, dT(W,y,t)/dx = 0 . (10) "
+            "At y = 0, dT(x,0,t)/dy = 0 . (11) "
+            "At y = H, dT(x,H,t)/dy = 0 . (12) Data extraction line"
+        )
+        enriched = structured.enrich_boundary_conditions(
+            value, evidence, "Explain all boundary conditions."
+        )
+        explanation = enriched["explanation"]
+        for phrase in (
+            "wave-port", "scattering", "x = 0", "x = W", "y = 0", "y = H",
+            "applied microwave heat flux", "thermal insulation", "internal sampling",
+        ):
+            self.assertIn(phrase, explanation)
+
+    def test_grounded_coordinate_boundaries_are_declared_for_non_circuit_diagram(self):
+        result = {
+            "diagram_kind": "other",
+            "labels": ["Skin model", "Wave port", "Thermal insulation"],
+            "components": [{"name": "Skin model", "description": "2D domain"}],
+            "spatial_relationships": [{
+                "subject": "Top edge of model (y=H)",
+                "relationship": "bounds",
+                "object": "Skin model",
+            }],
+            "connections": [
+                {"from": "Left edge of model (x=0)", "to": "Skin model", "relationship": "bounds"},
+                {"from": "Right edge of model (x=W)", "to": "Skin model", "relationship": "bounds"},
+                {"from": "Bottom edge of model (y=0)", "to": "Skin model", "relationship": "bounds"},
+                {"from": "Top edge of model (y=H)", "to": "Skin model", "relationship": "bounds"},
+            ],
+            "circuit_topology": None,
+            "explanation": "The coordinate edges bound the skin model.",
+            "uncertain_items": [],
+        }
+        evidence = "The domain extends over x=0, x=W, y=0 and y=H."
+        validated = structured.validate_labelled_diagram(result, evidence)
+        self.assertEqual(
+            [connection["from"] for connection in validated["connections"]],
+            ["x = 0", "x = W", "y = 0", "y = H"],
+        )
+        self.assertTrue(
+            {"x = 0", "x = W", "y = 0", "y = H"}.issubset(validated["labels"])
+        )
+        self.assertEqual(validated["spatial_relationships"][0]["subject"], "y = H")
+
+    def test_boundary_coordinate_normalisation_does_not_touch_circuits(self):
+        circuit = {
+            "diagram_kind": "circuit",
+            "connections": [{"from": "x=0", "to": "R1"}],
+        }
+        self.assertIs(
+            structured.normalize_boundary_diagram_endpoints(circuit, "x=0"),
+            circuit,
+        )
+
+    def test_grounded_boundary_fallback_is_concise_and_equation_complete(self):
+        evidence = (
+            "The plane wave is transverse magnetic (TM mode). The wave-port boundary "
+            "governs the incident field. Scattering boundary conditions prevent "
+            "undesired reflections. At x = 0, -k dT(0,y,t)/dx = qmw . (9) "
+            "At x = W, dT(W,y,t)/dx = 0 . (10) At y = 0, "
+            "dT(x,0,t)/dy = 0 . (11) At y = H, dT(x,H,t)/dy = 0 . (12) "
+            "Data extraction line"
+        )
+        answer = structured.grounded_boundary_synthesis(evidence)
+        for phrase in (
+            "TM microwave field", "x=0", "x=W", "y=0", "y=H", "internal sampling",
+        ):
+            self.assertIn(phrase, answer)
+        self.assertNotIn("could not verify", answer.casefold())
+
+    def test_boundary_rendering_separates_physics_and_suppresses_duplicate_explanation(self):
+        value = {
+            "diagram_kind": "other",
+            "labels": ["Wave port", "Scattering boundary", "Data extraction line"],
+            "components": [],
+            "spatial_relationships": [],
+            "connections": [
+                {"from": "x = 0", "relationship": "bounds", "to": "Skin model"},
+                {"from": "Data extraction line", "relationship": "samples", "to": "Skin model"},
+            ],
+            "circuit_topology": None,
+            "explanation": (
+                "On the top and bottom edges, scattering boundary conditions prevent "
+                "reflections. The complete thermal explanation is repeated here."
+            ),
+            "uncertain_items": [],
+        }
+        evidence = (
+            "The wave-port boundary governs the incident plane microwaves in TM mode. "
+            "Scattering boundary conditions prevent undesired reflections. "
+            "At x = 0, -k dT(0,y,t)/dx = qmw . (9) At x = W, "
+            "dT(W,y,t)/dx = 0 . (10) At y = 0, dT(x,0,t)/dy = 0 . (11) "
+            "At y = H, dT(x,H,t)/dy = 0 . (12) Data extraction line"
+        )
+        rendered = structured.format_boundary_condition_result(value, evidence)
+        self.assertEqual(rendered.count("**Electromagnetic boundary conditions**"), 1)
+        self.assertEqual(rendered.count("**Thermal boundary conditions**"), 1)
+        self.assertIn("incident TM microwave field", rendered)
+        self.assertIn("artificial electromagnetic reflections", rendered)
+        self.assertIn("same geometric edge", rendered)
+        for coordinate in ("$x=0$", "$x=W$", "$y=0$", "$y=H$"):
+            self.assertIn(coordinate, rendered)
+        self.assertEqual(rendered.count("data-extraction line"), 1)
+        self.assertIn("**Internal sampling**", rendered)
+        self.assertNotIn("**Structured connections:**", rendered)
+        self.assertNotIn("On the top and bottom edges", rendered)
+        self.assertNotIn("x = 0 â€” bounds", rendered)
+
     def test_non_circuit_relationship_endpoint_can_be_grounded_in_caption(self):
         result = {
             "diagram_kind": "other",

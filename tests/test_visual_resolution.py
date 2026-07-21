@@ -35,6 +35,7 @@ def _index(*records):
                 "printed_page_number": None,
                 "captions": [],
                 "references": [],
+                "equations": [],
                 "nearby_text": caption,
             }
             file_record["pages"].append(page)
@@ -46,9 +47,12 @@ def _index(*records):
         if match_kind == "caption":
             row["caption"] = caption
             page["captions"].append(row)
+        elif match_kind == "equation":
+            row["caption"] = caption
+            page["equations"].append(row)
         else:
             page["references"].append(row)
-    return {"version": 2, "files": files}
+    return {"version": 3, "files": files}
 
 
 def _previous(target_type="figure", target_number="9", panel=None, pdf_name="one.pdf", page=8):
@@ -333,6 +337,72 @@ def test_duplicate_figure_one_without_context_is_ambiguous():
     assert {row["pdf_name"] for row in result.candidates[:2]} == {"aging.pdf", "tissue.pdf"}
 
 
+def test_title_derived_paper_descriptors_override_previous_context():
+    thermal = "Thermal wave and Pennes models of bioheat transfer.pdf"
+    bio = "Bioimpedance spectroscopy for tissue structure.pdf"
+    index = _index(
+        (thermal, 5, "table", "2", "Table 2. Dielectric properties", "caption"),
+        (bio, 8, "table", "2", "Table 2. Cole-Cole parameters", "caption"),
+    )
+    previous = _previous(pdf_name=bio, page=8)
+
+    for wording in ("thermal paper", "thermal-wave paper", "Pennes paper"):
+        result = resolve_visual_target(
+            f"Extract Table 2 in the {wording}.",
+            index,
+            conversation_messages=previous,
+        )
+        assert (result.status, result.pdf_name, result.page_number) == (
+            "resolved", thermal, 5,
+        )
+
+    bio_result = resolve_visual_target(
+        "Extract Table 2 in the bioimpedance paper.", index
+    )
+    assert (bio_result.pdf_name, bio_result.page_number) == (bio, 8)
+
+
+def test_explicit_equation_forms_parse_without_inheriting_previous_figure():
+    for question in (
+        "Explain Equation 8", "Explain equation (8)",
+        "Explain Eq. 8", "Explain Eq. (8)",
+    ):
+        reference = parse_visual_reference(question)
+        assert reference.target_type == "equation"
+        assert reference.target_number == "8"
+        assert reference.explicit_reference
+
+    thermal = "Thermal wave and Pennes models.pdf"
+    other = "Other equations.pdf"
+    index = _index(
+        (thermal, 6, "equation", "8", "Equation 8 thermal relaxation", "equation"),
+        (other, 9, "equation", "8", "Equation 8 unrelated", "equation"),
+    )
+    result = resolve_visual_target(
+        "Explain Equation 8.",
+        index,
+        conversation_messages=_previous(
+            target_number="5", pdf_name=thermal, page=9
+        ),
+    )
+    assert (result.status, result.target_type, result.pdf_name, result.page_number) == (
+        "resolved", "equation", thermal, 6,
+    )
+    assert not should_activate_automatic_vision("Explain Equation 8.", result)
+
+
+def test_equation_number_is_ambiguous_without_document_context():
+    index = _index(
+        ("one.pdf", 4, "equation", "8", "Equation 8 first", "equation"),
+        ("two.pdf", 7, "equation", "8", "Equation 8 second", "equation"),
+    )
+    result = resolve_visual_target("Explain Equation 8.", index)
+    assert result.status == "ambiguous"
+    assert {candidate["pdf_name"] for candidate in result.candidates} == {
+        "one.pdf", "two.pdf",
+    }
+
+
 def test_generic_identifier_score_gap_below_configured_margin_is_ambiguous():
     index = _index(
         ("one.pdf", 2, "figure", "1", "Figure 1. First topic", "caption"),
@@ -357,6 +427,27 @@ def test_real_figure_one_explicit_bioimpedance_name_resolves_page_two():
     assert result.status == "resolved", result.to_dict()
     assert result.pdf_name.startswith("Bioimpedance spectroscopy")
     assert result.page_number == 2
+
+
+def test_real_table_two_document_descriptors_select_the_named_paper():
+    index = load_or_build_visual_index()
+    thermal = resolve_visual_target("Extract Table 2 in the thermal paper.", index)
+    bio = resolve_visual_target("Extract Table 2 in the bioimpedance paper.", index)
+    assert thermal.status == "resolved", thermal.to_dict()
+    assert thermal.pdf_name.startswith("Thermal wave and Pennes")
+    assert thermal.page_number == 5
+    assert bio.status == "resolved", bio.to_dict()
+    assert bio.pdf_name.startswith("Bioimpedance spectroscopy")
+    assert bio.page_number == 8
+
+
+def test_real_three_paper_figure_one_without_context_is_ambiguous():
+    result = resolve_visual_target("Explain Figure 1.", load_or_build_visual_index())
+    assert result.status == "ambiguous"
+    names = {candidate["pdf_name"] for candidate in result.candidates}
+    assert any(name.startswith("Thermal wave and Pennes") for name in names)
+    assert any(name.startswith("Bioimpedance spectroscopy") for name in names)
+    assert "hall marks of aging.pdf" in names
 
 
 def test_real_figure_one_hallmarks_terminology_resolves_page_thirty_seven():
@@ -526,7 +617,9 @@ def test_real_pdf_resolution_mappings(visual_resolution_cases):
 def test_existing_real_vision_questions_resolve_without_manual_page(regression_cases):
     index = load_or_build_visual_index()
     for case in regression_cases:
-        if case["expected_response_type"] == "rag_summary":
+        if case["expected_response_type"] in {
+            "rag_summary", "rag_multi_figure", "equation",
+        }:
             continue
         result = resolve_visual_target(case["question"], index)
         assert result.status == "resolved", (case["case_id"], result.to_dict())

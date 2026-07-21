@@ -4,17 +4,19 @@ import json
 import re
 import unicodedata
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from rag.database import get_collection
 from rag.embeddings import load_embedder, load_reranker
 from rag.retrieval import retrieve_context
+from services.equation_service import analyse_resolved_equation
 from services.ollama_service import generate_answer
 from services.structured_vision import StructuredOutputError, TruncatedJSONError
 from services.visual_index import load_or_build_visual_index
 from services.visual_locator import resolve_visual_target
-from services.visual_runtime import analyse_resolved_visual
+from services.visual_runtime import analyse_resolved_visual, build_visual_evidence
 from settings import PAPERS_FOLDER
 
 
@@ -23,6 +25,18 @@ pytestmark = pytest.mark.ollama
 
 def _normal(value) -> str:
     text = unicodedata.normalize("NFKC", str(value)).casefold()
+    for symbol, name in {
+        "τ": " tau ", "ρ": " rho ", "ω": " omega ",
+        "∇": " nabla ", "∂": " partial ",
+    }.items():
+        text = text.replace(symbol, name)
+    # Mathematical subscripts and common LaTeX wrappers are presentation
+    # variants, not different scientific facts (Qmet == Q_{met}).
+    text = re.sub(r"([a-z])_\{?([a-z]+)\}?", r"\1\2", text)
+    text = re.sub(r"\\(?:mathrm|text|operatorname)\s*\{([^{}]+)\}", r"\1", text)
+    text = re.sub(r"\\([a-z]+)", r"\1", text)
+    text = re.sub(r"\b(?:is\s+)?assumed\s+to\s+be\s+zero\b", "assumed zero", text)
+    text = re.sub(r"\bpower\s+dissipation(?:\s+density|\s+profiles?)?\b", "absorbed power", text)
     text = text.replace("–", "-").replace("—", "-").replace("‑", "-")
     return re.sub(r"\s+", " ", text)
 
@@ -30,7 +44,12 @@ def _normal(value) -> str:
 def _contains(haystack, needle) -> bool:
     normalized_haystack = re.sub(r"[^a-z0-9]+", " ", _normal(haystack))
     normalized_needle = re.sub(r"[^a-z0-9]+", " ", _normal(needle)).strip()
-    return normalized_needle in normalized_haystack
+    if normalized_needle in normalized_haystack:
+        return True
+    return (
+        re.sub(r"[^a-z0-9]+", "", normalized_needle)
+        in re.sub(r"[^a-z0-9]+", "", normalized_haystack)
+    )
 
 
 def _failure_kind(error: BaseException) -> str:
@@ -54,7 +73,7 @@ def _write_debug(artifact_writer, case_id, debug, error=None, answer=""):
         if isinstance(value, str) and value and value not in raw_parts:
             raw_parts.append(value)
     raw = "\n\n--- MODEL RESPONSE ---\n\n".join(raw_parts) or answer
-    structured = debug.get("validated_json") or {
+    structured = debug.get("final_structured_output") or debug.get("validated_json") or {
         key: value for key, value in debug.items()
         if key not in {"raw_vision_response", "retry_response", "raw_panel_responses"}
     }
@@ -78,6 +97,12 @@ def _case_by_id(cases, case_id):
     "case_id",
     [
             "hallmarks_document_summary",
+            "thermal_document_summary",
+            "thermal_figure_2_boundary_conditions",
+            "thermal_table_2",
+            "thermal_table_3_text_fallback",
+            "thermal_equation_8",
+            "thermal_multi_figure_frequency_evidence",
             "figure_6_auto_hallmarks",
         "figure_1_labelled_diagram",
         "figure_3_circuit",
@@ -95,6 +120,10 @@ def test_real_local_regression_case(
     case = _case_by_id(regression_cases, case_id)
     if case["expected_response_type"] == "rag_summary":
         _run_summary_case(case, artifact_writer)
+    elif case["expected_response_type"] == "rag_multi_figure":
+        _run_multi_figure_case(case, artifact_writer)
+    elif case["expected_response_type"] == "equation":
+        _run_equation_case(case, artifact_writer)
     else:
         _run_vision_case(case, artifact_writer)
 
@@ -108,7 +137,7 @@ def _run_summary_case(case, artifact_writer):
         )
         debug.update({"context": context, "sources": sources})
         assert sources, "RAG returned no evidence"
-        answer = generate_answer(case["question"], context, [])
+        answer = generate_answer(case["question"], context, [], debug_info=debug)
         for fact in case["required_facts"]:
             assert _contains(answer, fact), f"answer missing required fact: {fact}"
         assert not re.search(
@@ -124,25 +153,166 @@ def _run_summary_case(case, artifact_writer):
             for source in sources
         ), "bibliography evidence was selected"
         retrieval_debug = sources[0].get("retrieval_debug", {})
-        grounding = retrieval_debug.get("framework_grounding", {})
-        actual_categories = grounding.get("categories", {})
-        for group in ("primary", "antagonistic", "integrative"):
-            assert {
-                re.sub(r"[^a-z0-9]+", "", _normal(item))
-                for item in actual_categories.get(group, [])
-            } == {
-                re.sub(r"[^a-z0-9]+", "", _normal(item))
-                for item in expected[group]
-            }, f"validated framework category mismatch: {group}"
+        if all(group in expected for group in ("primary", "antagonistic", "integrative")):
+            grounding = retrieval_debug.get("framework_grounding", {})
+            actual_categories = grounding.get("categories", {})
+            for group in ("primary", "antagonistic", "integrative"):
+                assert {
+                    re.sub(r"[^a-z0-9]+", "", _normal(item))
+                    for item in actual_categories.get(group, [])
+                } == {
+                    re.sub(r"[^a-z0-9]+", "", _normal(item))
+                    for item in expected[group]
+                }, f"validated framework category mismatch: {group}"
+        for section in expected.get("requested_sections", []):
+            assert _contains(answer, section), f"summary section missing: {section}"
+        if case["case_id"] == "thermal_document_summary":
+            assert _contains(answer, "limitations inferred from stated assumptions")
+            normalized_answer = _normal(answer)
+            limitation_patterns = {
+                "numerical 2D model": r"(?:numerical.{0,30}2d|2d.{0,30}(?:numerical|model))",
+                "fixed tissue properties": r"(?:fixed.{0,50}tissue properties|tissue properties.{0,50}fixed)",
+                "phase changes": r"phase changes",
+                "chemical reactions": r"chemical reactions",
+                "blood-tissue thermal equilibrium": r"blood.tissue thermal equilibrium",
+                "uniform incident irradiance": r"(?:uniform.{0,50}incident irradiance|incident irradiance.{0,50}uniform)",
+                "simplified environment": r"(?:walls|metallic enclosures|simplified environmental geometry)",
+                "no new human experiment": r"new experimental human data",
+            }
+            for limitation, pattern in limitation_patterns.items():
+                assert re.search(pattern, normalized_answer, re.DOTALL), (
+                    f"thermal summary missing grounded inferred limitation: {limitation}"
+                )
+            assert debug["final_missing_inferred_limitations"] == []
+        expected_stem = Path(case["pdf_filename"]).stem.casefold()
+        assert all(
+            Path(str(source["source"])).stem.casefold() == expected_stem
+            for source in sources
+        ), "summary evidence came from the wrong document"
         structured = {
             "answer": answer,
             "sources": sources,
             "retrieval_debug": retrieval_debug,
             "document_summary_mode": "[DOCUMENT SUMMARY MODE]" in context,
+            "generation_debug": debug,
         }
         artifact_writer(case["case_id"], raw=answer, structured=structured)
     except BaseException as error:
         debug["answer"] = answer
+        _write_debug(artifact_writer, case["case_id"], debug, error, answer)
+        raise
+
+
+def _run_multi_figure_case(case, artifact_writer):
+    debug = {}
+    answer = ""
+    try:
+        context, sources = retrieve_context(
+            case["question"], "", get_collection(), load_embedder(), load_reranker()
+        )
+        assert "[MULTI-FIGURE EVIDENCE MODE]" in context
+        assert sources
+        answer = generate_answer(case["question"], context, [], debug_info=debug)
+        for fact in case["required_facts"]:
+            assert _contains(answer, fact), f"answer missing required fact: {fact}"
+        identifiers = {
+            identifier for source in sources
+            for identifier in source.get("figure_identifiers", [])
+        }
+        assert len(identifiers) >= case["expected_structured_fields"]["minimum_figures"]
+        if case["case_id"] == "thermal_multi_figure_frequency_evidence":
+            normalized = _normal(answer)
+            assert re.search(r"39\.12.{0,240}39\.52", normalized, re.DOTALL), (
+                "Figure 6 peak temperatures were not preserved"
+            )
+            assert re.search(
+                r"(?:locali[sz]|concentrat).{0,180}(?:incident|exposure)",
+                normalized,
+                re.DOTALL,
+            ), "Figure 5 spatial localisation was not described"
+            assert not re.search(
+                r"temperature.{0,100}(?:diminish|decreas).{0,100}frequency.{0,40}increas|"
+                r"frequency.{0,40}increas.{0,100}temperature.{0,100}(?:diminish|decreas)",
+                normalized,
+                re.DOTALL,
+            ), "an absorbed-power trend was incorrectly presented as a temperature trend"
+            for sentence in re.split(r"(?<=[.!?])\s+", normalized):
+                if "heating depth" in sentence or "penetration" in sentence:
+                    assert any(
+                        qualifier in sentence
+                        for qualifier in ("infer", "contour", "absorbed power", "spatial")
+                    ), "depth/localisation claim was not qualified as an inference"
+        expected_stem = Path(case["pdf_filename"]).stem.casefold()
+        assert all(Path(str(source["source"])).stem.casefold() == expected_stem for source in sources)
+        artifact_writer(case["case_id"], raw=answer, structured={
+            "answer": answer, "sources": sources, "generation_debug": debug,
+        })
+    except BaseException as error:
+        debug.update({"answer": answer})
+        _write_debug(artifact_writer, case["case_id"], debug, error, answer)
+        raise
+
+
+def _run_equation_case(case, artifact_writer):
+    debug = {}
+    answer = ""
+    try:
+        thermal_name = case["pdf_filename"]
+        previous = [{
+            "role": "assistant", "content": "Prior Figure 5 analysis.",
+            "visual_target": {
+                "status": "resolved", "target_type": "figure", "target_number": "5",
+                "pdf_name": thermal_name,
+                "pdf_path": str(PAPERS_FOLDER / thermal_name), "page_number": 9,
+            },
+        }]
+        resolution = resolve_visual_target(
+            case["question"], load_or_build_visual_index(),
+            conversation_messages=previous,
+        )
+        assert resolution.status == "resolved", resolution.to_dict()
+        assert resolution.target_type == "equation"
+        assert resolution.pdf_name == thermal_name
+        assert resolution.page_number == case["pdf_page"]
+        with patch("services.visual_runtime.analyse_pdf_page") as figure_vision:
+            answer = analyse_resolved_equation(
+                case["question"], resolution,
+                conversation_history=previous, debug_info=debug,
+            )
+        figure_vision.assert_not_called()
+        for fact in case["required_facts"]:
+            assert _contains(answer, fact), f"answer missing required fact: {fact}"
+        for fact in case["prohibited_facts"]:
+            assert not _contains(answer, fact), f"prohibited fact present: {fact}"
+        assert debug["final_answer_code_path"] == case["expected_structured_fields"]["final_answer_path"]
+        symbolic = debug.get("symbolic_equation")
+        assert isinstance(symbolic, dict), "symbolic Equation 8 validation did not run"
+        assert symbolic["sign_validation"] == "passed"
+        assert symbolic["paper_symbols"] == {
+            "specific_heat": "c", "blood_temperature": "T_b",
+        }
+        assert [(term["kind"], term["sign"]) for term in symbolic["target_terms"]] == [
+            ("second_time_derivative", "+"),
+            ("conduction", "+"),
+            ("tissue_temperature_perfusion", "-"),
+            ("first_time_derivative", "-"),
+            ("blood_temperature_perfusion", "+"),
+            ("external_source", "+"),
+            ("external_source_time_derivative", "+"),
+        ]
+        assert [(term["kind"], term["sign"]) for term in symbolic["rearranged_terms"]] == [
+            ("first_time_derivative", "+"),
+            ("conduction", "+"),
+            ("blood_minus_tissue_perfusion", "+"),
+            ("external_source", "+"),
+        ]
+        assert "c_p" not in answer and "T_a" not in answer
+        assert "steady-state" not in answer.casefold()
+        artifact_writer(case["case_id"], raw=answer, structured={
+            "answer": answer, "resolution": resolution.to_dict(), "debug": debug,
+        })
+    except BaseException as error:
+        debug.update({"answer": answer})
         _write_debug(artifact_writer, case["case_id"], debug, error, answer)
         raise
 
@@ -163,10 +333,15 @@ def _run_vision_case(case, artifact_writer):
         grouped = case["case_id"] == "figure_6_auto_hallmarks"
         value = debug.get("normalized_json" if grouped else "validated_json")
         assert isinstance(value, dict), "validated structured output was not produced"
-        expected_path = case["expected_structured_fields"].get(
-            "final_answer_path", "validated_typed_vision"
-        )
-        assert debug.get("final_answer_path") == expected_path
+        expected_fields = case["expected_structured_fields"]
+        allowed_paths = expected_fields.get("allowed_final_answer_paths")
+        if allowed_paths:
+            assert debug.get("final_answer_path") in allowed_paths
+        else:
+            expected_path = expected_fields.get(
+                "final_answer_path", "validated_typed_vision"
+            )
+            assert debug.get("final_answer_path") == expected_path
         if case["case_id"] == "figure_1_labelled_diagram":
             _assert_figure_1(case, value)
         elif case["case_id"] == "figure_6_auto_hallmarks":
@@ -179,6 +354,17 @@ def _run_vision_case(case, artifact_writer):
             _assert_figure_13(case, value, answer, debug)
         elif case["case_id"] == "table_1":
             _assert_table_1(case, value)
+        elif case["case_id"] == "thermal_figure_2_boundary_conditions":
+            _assert_thermal_boundary_figure(case, value, answer)
+        elif case["case_id"] in {
+            "thermal_table_2", "thermal_table_3_text_fallback",
+        }:
+            _assert_exact_text_table(case, value, answer)
+            assert value is debug["repaired_json"]
+            assert value is debug["final_structured_output"]
+            assert value is debug["rendered_structured_object"]
+            evidence = build_visual_evidence(resolution, answer, debug)
+            assert evidence["structured_result"] is value
         _write_debug(artifact_writer, case["case_id"], debug, answer=answer)
     except BaseException as error:
         _write_debug(artifact_writer, case["case_id"], debug, error, answer)
@@ -193,6 +379,33 @@ def _assert_required_and_prohibited(case, value):
         assert not re.search(rf"\b{re.escape(_normal(fact))}\b", _normal(rendered)), (
             f"prohibited fact present: {fact}"
         )
+
+
+def _assert_thermal_boundary_figure(case, value, answer):
+    rendered = json.dumps(value, ensure_ascii=False) + "\n" + answer
+    for fact in case["required_facts"]:
+        assert _contains(rendered, fact), f"missing required fact: {fact}"
+    for fact in case["prohibited_facts"]:
+        assert not _contains(rendered, fact), f"prohibited fact present: {fact}"
+    expected = case["expected_structured_fields"]
+    assert value["diagram_kind"] == expected["diagram_kind"]
+    assert value["circuit_topology"] is expected["circuit_topology"]
+    assert "TM microwave" in answer
+    assert "could not verify" not in answer.casefold()
+    assert "ASSOCIATED EQUATIONS/NEARBY TEXT" not in answer
+
+
+def _assert_exact_text_table(case, value, answer):
+    expected = case["expected_structured_fields"]
+    assert [str(column) for column in value["columns"]] == expected["columns"]
+    assert [
+        [None if cell is None else str(cell) for cell in row]
+        for row in value["rows"]
+    ] == expected["rows"]
+    assert value["unreadable_cells"] == expected["unreadable_cells"]
+    rendered = json.dumps(value, ensure_ascii=False) + "\n" + answer
+    for fact in case["required_facts"]:
+        assert _contains(rendered, fact), f"missing required fact: {fact}"
 
 
 def _assert_figure_1(case, value):

@@ -14,7 +14,7 @@ from services.visual_reference_parser import canonical_identifier
 from settings import PAPERS_FOLDER, VISUAL_INDEX_PATH
 
 
-INDEX_VERSION = 2
+INDEX_VERSION = 3
 _IDENTIFIER = r"(?:[A-Za-z]\.)?\d+(?:\.\d+)?|[A-Za-z]\d+"
 _FIGURE_CAPTION_PATTERN = re.compile(
     rf"^\s*(?P<kind>fig(?:ure)?\.?)\s*(?P<number>{_IDENTIFIER})\s*[.:]",
@@ -35,6 +35,10 @@ _REFERENCE_VERBS = re.compile(
 )
 _REFERENCE_PATTERN = re.compile(
     rf"\b(?P<kind>fig(?:ure)?\.?|table)\s*(?P<number>{_IDENTIFIER})\b",
+    re.IGNORECASE,
+)
+_EQUATION_NUMBER_PATTERN = re.compile(
+    r"(?m)^\s*\((?P<number>\d+(?:\.\d+)?[a-z]?)\)\s*$",
     re.IGNORECASE,
 )
 
@@ -67,6 +71,27 @@ def _quick_signature_matches(path: Path, cached: dict) -> bool:
 
 def _clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _equation_records(text: str) -> list[dict]:
+    """Index displayed equation numbers and their immediate text context."""
+    records = []
+    seen = set()
+    for match in _EQUATION_NUMBER_PATTERN.finditer(text or ""):
+        number = match.group("number")
+        key = canonical_identifier(number)
+        if key in seen:
+            continue
+        seen.add(key)
+        start = max(0, match.start() - 900)
+        end = min(len(text), match.end() + 900)
+        records.append({
+            "target_type": "equation",
+            "target_number": number,
+            "caption": _clean_text(text[start:end])[:1800],
+            "confidence": 0.92,
+        })
+    return records
 
 
 def _printed_page_number(page: fitz.Page) -> str | None:
@@ -127,6 +152,7 @@ def _caption_blocks(page: fitz.Page) -> list[dict]:
 def extract_page_record(page: fitz.Page, page_number: int) -> dict:
     text = page.get_text("text") or ""
     captions = _caption_blocks(page)
+    equations = _equation_records(text)
     caption_keys = {
         (row["target_type"], canonical_identifier(row["target_number"]))
         for row in captions
@@ -159,6 +185,7 @@ def extract_page_record(page: fitz.Page, page_number: int) -> dict:
         ],
         "captions": captions,
         "references": references,
+        "equations": equations,
         "nearby_text": _clean_text(text)[:6000],
         "confidence": max([row["confidence"] for row in captions] or [0.25]),
     }
@@ -207,7 +234,7 @@ def _load_cache(cache_path: Path) -> dict:
         }
     if not isinstance(value.get("files"), dict):
         value["files"] = {}
-    value["version"] = INDEX_VERSION
+    value.setdefault("version", 0)
     return value
 
 
@@ -221,12 +248,16 @@ def load_or_build_visual_index(
     papers_folder = Path(papers_folder)
     cache_path = Path(cache_path)
     cached = _load_cache(cache_path)
+    schema_changed = cached.get("version") != INDEX_VERSION
     current_files = sorted(papers_folder.glob("*.pdf"), key=lambda path: path.name.casefold())
     updated_files = {}
-    changed = force or set(cached["files"]) != {path.name for path in current_files}
+    changed = (
+        force or schema_changed
+        or set(cached["files"]) != {path.name for path in current_files}
+    )
     for position, path in enumerate(current_files, start=1):
         old = cached["files"].get(path.name, {})
-        if not force and _quick_signature_matches(path, old):
+        if not force and not schema_changed and _quick_signature_matches(path, old):
             updated_files[path.name] = old
         else:
             signature = _file_signature(path)
@@ -254,6 +285,8 @@ def visual_index_needs_rebuild(
     cache_path: Path = VISUAL_INDEX_PATH,
 ) -> bool:
     cached = _load_cache(Path(cache_path))
+    if cached.get("version") != INDEX_VERSION:
+        return True
     paths = sorted(Path(papers_folder).glob("*.pdf"), key=lambda path: path.name.casefold())
     if set(cached.get("files", {})) != {path.name for path in paths}:
         return True
@@ -287,5 +320,15 @@ def flatten_visual_targets(index: dict, papers_folder: Path = PAPERS_FOLDER) -> 
                     "printed_page_number": page.get("printed_page_number"),
                     "nearby_text": page.get("nearby_text", ""),
                     "match_kind": "reference",
+                })
+            for equation in page.get("equations", []):
+                targets.append({
+                    **equation,
+                    "pdf_name": filename,
+                    "pdf_path": str(Path(papers_folder) / filename),
+                    "page_number": int(page["pdf_page"]),
+                    "printed_page_number": page.get("printed_page_number"),
+                    "nearby_text": page.get("nearby_text", ""),
+                    "match_kind": "equation",
                 })
     return targets
