@@ -15,6 +15,7 @@ from services.visual_reference_parser import (
     VisualReference,
     canonical_identifier,
     parse_visual_reference,
+    parse_visual_references,
 )
 from settings import PAPERS_FOLDER, VISUAL_AMBIGUITY_MARGIN
 
@@ -37,6 +38,7 @@ class VisualResolution:
     target_number: str | None = None
     panel: str | None = None
     caption: str = ""
+    nearby_text: str = ""
     visual_type: str | None = None
     confidence: float = 0.0
     candidate_count: int = 0
@@ -235,9 +237,10 @@ def resolve_visual_target(
     current_source_names: list[str] | None = None,
     embedder=None,
     papers_folder: Path = PAPERS_FOLDER,
+    reference_override: VisualReference | None = None,
 ) -> VisualResolution:
     reference, previous, context_reason = apply_conversation_reference(
-        parse_visual_reference(question), conversation_messages or []
+        reference_override or parse_visual_reference(question), conversation_messages or []
     )
     if not reference.target_number or reference.target_type == "unknown":
         return VisualResolution(
@@ -432,6 +435,7 @@ def resolve_visual_target(
         target_number=reference.target_number,
         panel=reference.panel,
         caption=top.get("caption", ""),
+        nearby_text=top.get("nearby_text", ""),
         visual_type=visual_type,
         confidence=round(top["score"], 3),
         candidate_count=len(scored),
@@ -439,6 +443,21 @@ def resolve_visual_target(
         candidates=public_candidates,
         reference=reference.to_dict(),
     )
+
+
+def resolve_visual_targets(question: str, index: dict, **kwargs) -> list[VisualResolution]:
+    """Resolve every explicit target independently in request order."""
+    references = parse_visual_references(question)
+    if len(references) <= 1:
+        return [resolve_visual_target(question, index, **kwargs)]
+    clean_kwargs = dict(kwargs)
+    clean_kwargs.pop("reference_override", None)
+    return [
+        resolve_visual_target(
+            question, index, reference_override=reference, **clean_kwargs
+        )
+        for reference in references
+    ]
 
 
 def resolved_analysis_question(question: str, resolution: VisualResolution) -> str:

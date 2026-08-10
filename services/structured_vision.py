@@ -10,6 +10,8 @@ from pathlib import Path
 import fitz
 import ollama
 
+from services.scientific_metrics import grounded_table_trends, infer_metric_semantics
+
 from settings import NYQUIST_LOCAL_DEVIATION_THRESHOLD, VISION_MODEL
 
 STRUCTURED_NUM_PREDICT = 1800
@@ -17,7 +19,11 @@ COMPACT_PANEL_NUM_PREDICT = 650
 COMPACT_COMPARISON_NUM_PREDICT = 350
 AXIS_LABEL_NUM_PREDICT = 220
 NYQUIST_FIT_NUM_PREDICT = 260
-VISUAL_TYPES = {"labelled_diagram", "graph", "table"}
+DIAGRAM_TYPES = {
+    "labelled_diagram", "anatomical_schematic", "circuit", "flowchart",
+    "microscopy_photo", "contour_heatmap",
+}
+VISUAL_TYPES = {*DIAGRAM_TYPES, "graph", "table"}
 VISUAL_IDENTIFIER_PATTERN = r"(?:[A-Za-z]\.)?\d+(?:\.\d+)?|[A-Za-z]\d+"
 
 
@@ -130,11 +136,24 @@ def detect_visual_type(question: str, page_text: str = "") -> str | None:
         if caption:
             relevant_text += " " + caption.group(0).lower()
 
+    if re.search(r"\b(contour|heatmap|isothermal|spatial distribution)\b", relevant_text):
+        return "contour_heatmap"
+    if re.search(r"\b(micrograph|microscopy|histology|photograph|photo)\b", relevant_text):
+        return "microscopy_photo"
+    if re.search(r"\b(flowchart|workflow|decision tree|process flow)\b", relevant_text):
+        return "flowchart"
+    if re.search(r"\b(circuit|resistor|capacitor|impedance topology)\b", relevant_text):
+        return "labelled_diagram"
     if re.search(
-        r"\b(graph|plot|chart|bode|nyquist|axis|axes|curve|trend|panel|spectrum)\b",
+        r"\b(graph|plot|chart|boxplot|bode|nyquist|axis|axes|curve|trend|spectrum)\b",
         relevant_text,
     ):
         return "graph"
+    if re.search(
+        r"\b(anatomical|head model|tissue model|brain|skull|scalp|organ|layer model)\b",
+        relevant_text,
+    ):
+        return "anatomical_schematic"
     if re.search(
         r"\b(diagram|schematic|circuit|topology|component|connection|labelled|labeled)\b",
         relevant_text,
@@ -146,7 +165,7 @@ def detect_visual_type(question: str, page_text: str = "") -> str | None:
 
 
 def _schema_text(visual_type: str) -> str:
-    if visual_type == "labelled_diagram":
+    if visual_type in DIAGRAM_TYPES:
         return """{
   "diagram_kind": "circuit|other",
   "labels": ["..."],
@@ -198,6 +217,7 @@ def _schema_text(visual_type: str) -> str:
       "uncertain": false, "evidence_conflict": false
     }
   ],
+  "metric_semantics": {"metric": {"objective": "minimize|maximize|target_value|range|unknown", "target_value": null}},
   "frequency_direction_evidence": ["..."],
   "uncertain_values": ["..."]
 }"""
@@ -205,6 +225,8 @@ def _schema_text(visual_type: str) -> str:
         return """{
   "table_number": "...",
   "title": "...",
+  "header_rows": [["...", null]],
+  "header_spans": [{"row": 0, "start_column": 0, "end_column": 1, "label": "..."}],
   "columns": ["..."],
   "rows": [["...", null]],
   "units": {"column name": "unit or null"},
@@ -219,9 +241,10 @@ def build_structured_prompt(
     question: str,
     evidence_text: str = "",
 ) -> str:
-    evidence = evidence_text[:6000]
-    type_rules = {
-        "labelled_diagram": (
+    # Multi-panel scientific plots may need both an earlier metric definition
+    # and a later statistical table. Keep both local evidence blocks available.
+    evidence = evidence_text[:16000]
+    diagram_rule = (
             "Identify visible labels/components and explicit spatial or connective "
             "relationships. In a circuit, every connection endpoint must name a listed "
             "component, node or branch. In a biological diagram, a relationship endpoint "
@@ -234,7 +257,9 @@ def build_structured_prompt(
             "components into one edge string. Connections may reference component IDs, "
             "visible biological labels, node IDs or branch IDs. For a non-circuit, set "
             "circuit_topology to null. Ignore anything outside the cropped target figure."
-        ),
+        )
+    type_rules = {
+        **{name: diagram_rule for name in DIAGRAM_TYPES},
         "graph": (
             "Treat each visible panel independently. Preserve exact readable axis variable "
             "labels. Record visible tick labels and any scientific-notation multiplier "
@@ -765,6 +790,88 @@ def normalize_composite_diagram_endpoints(value: dict) -> dict:
     return corrected
 
 
+def extract_caption_panel_mappings(evidence_text: str) -> list[dict]:
+    """Recover panel-scoped symbol definitions from an explicit figure caption."""
+    evidence = str(evidence_text or "")
+    caption = evidence
+    marker = "TARGET FIGURE CAPTION (authoritative for this crop):"
+    if marker in evidence:
+        caption = evidence.split(marker, 1)[1].split("PAGE TEXT CROSS-CHECK:", 1)[0]
+    panel_matches = list(re.finditer(r"\(([A-Za-z])\)", caption))
+    mappings = []
+    for index, panel_match in enumerate(panel_matches):
+        body = caption[
+            panel_match.end():
+            panel_matches[index + 1].start() if index + 1 < len(panel_matches) else len(caption)
+        ]
+        definition = re.search(
+            r"((?:S\s*\d+\s*,?\s*(?:and\s*)?)+)\s+are\s+the\s+"
+            r"interfaces?\s+between\s+(.+?),\s*respectively",
+            body,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not definition:
+            continue
+        labels = re.findall(r"S\s*(\d+)", definition.group(1), re.IGNORECASE)
+        interfaces = [
+            re.sub(r"\s+", " ", item).strip(" ,.;")
+            for item in re.split(r"\s*,\s*(?:and\s+)?|\s+and\s+", definition.group(2))
+            if item.strip(" ,.;")
+        ]
+        if len(labels) != len(interfaces):
+            continue
+        mappings.append({
+            "panel": panel_match.group(1).upper(),
+            "mappings": [
+                {"label": f"S{number}", "interface": interface}
+                for number, interface in zip(labels, interfaces)
+            ],
+            "source": "caption",
+        })
+    return mappings
+
+
+def apply_caption_panel_mappings(value: dict, evidence_text: str) -> dict:
+    """Make explicit caption mappings authoritative without mixing panel scopes."""
+    mappings = extract_caption_panel_mappings(evidence_text)
+    if not mappings:
+        return value
+    corrected = deepcopy(value)
+    corrected["panel_mappings"] = mappings
+    corrected["connections"] = [
+        connection for connection in corrected.get("connections", [])
+        if not (
+            isinstance(connection, dict)
+            and any(
+                re.fullmatch(r"S\s*\d+", str(connection.get(field, "")).strip(), re.I)
+                for field in ("from", "to")
+            )
+        )
+    ]
+    sentences = re.split(r"(?<=[.!?])\s+", str(corrected.get("explanation", "")))
+    sentences = [
+        sentence for sentence in sentences
+        if not (
+            re.search(r"\bS\s*\d+\b", sentence, re.I)
+            and re.search(r"\b(?:interface|corresponds?|means?|panel)\b|=", sentence, re.I)
+        )
+    ]
+    mapping_text = " ".join(
+        f"Panel {panel['panel']}: "
+        + "; ".join(
+            f"{item['label']} = {item['interface']}" for item in panel["mappings"]
+        )
+        + "."
+        for panel in mappings
+    )
+    base = " ".join(sentence.strip() for sentence in sentences if sentence.strip())
+    corrected["explanation"] = (
+        f"{base}\n\nCaption-defined panel mappings: {mapping_text}" if base
+        else f"Caption-defined panel mappings: {mapping_text}"
+    )
+    return corrected
+
+
 def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
     if not isinstance(value, dict):
         raise StructuredOutputError("Labelled diagram response must be an object.")
@@ -787,6 +894,15 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
 
     value = normalize_composite_diagram_endpoints(value)
     value = normalize_boundary_diagram_endpoints(value, evidence_text)
+    for relationship in value["spatial_relationships"]:
+        if not isinstance(relationship, dict):
+            continue
+        relation = _normal_name(relationship.get("relationship", ""))
+        if relation in {"contains", "contain", "encloses", "enclose", "holds", "hold"}:
+            relationship["subject"], relationship["object"] = (
+                relationship.get("object"), relationship.get("subject")
+            )
+            relationship["relationship"] = "within"
     diagram_kind = str(value["diagram_kind"]).strip().lower()
     if diagram_kind not in {"circuit", "other"}:
         raise StructuredOutputError("diagram_kind must be circuit or other.")
@@ -940,7 +1056,7 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
             "Caption/text states a component-specific series relationship "
             "missing from the diagram result."
         )
-    return value
+    return apply_caption_panel_mappings(value, evidence_text)
 
 
 def enrich_boundary_conditions(
@@ -1525,6 +1641,22 @@ def validate_graph(value: dict, evidence_text: str = "") -> dict:
             raise StructuredOutputError(
                 "Nyquist frequency direction was inferred without arrows, labels or grounded text."
             )
+    grounded_semantics = infer_metric_semantics(evidence_text)
+    if grounded_semantics:
+        value["metric_semantics"] = grounded_semantics
+    else:
+        value.setdefault("metric_semantics", {})
+    table_trends = grounded_table_trends(evidence_text)
+    value["grounded_trends"] = table_trends
+    if table_trends:
+        for panel in value["panels"]:
+            metric = str(panel.get("y_axis", {}).get("label", ""))
+            matching = [row for row in table_trends.values() if row["metric"].casefold() in metric.casefold()]
+            if matching:
+                panel["visible_trends"] = [
+                    f"{row['series']}: {row['classification']}; maximum at {row['maximum_position']}."
+                    for row in matching
+                ]
     return value
 
 
@@ -1545,11 +1677,22 @@ def validate_table(value: dict) -> dict:
             )
     if not isinstance(value["comparisons"], list) or not isinstance(value["unreadable_cells"], list):
         raise StructuredOutputError("Table comparison/unreadable fields are invalid.")
+    header_rows = value.get("header_rows", [])
+    if header_rows:
+        if not isinstance(header_rows, list) or not all(isinstance(row, list) for row in header_rows):
+            raise StructuredOutputError("Table header_rows must be a list of rows.")
+        raw_widths = {len(row) for row in header_rows}
+        if len(raw_widths) != 1:
+            raise StructuredOutputError("Hierarchical table header rows must have equal raw widths.")
+        if next(iter(raw_widths)) != len(value["columns"]):
+            raise StructuredOutputError("Expanded logical columns do not match the header width.")
+    if not isinstance(value.get("header_spans", []), list):
+        raise StructuredOutputError("Table header_spans must be a list.")
     return value
 
 
 def validate_typed_response(visual_type: str, value: dict, evidence_text: str = "") -> dict:
-    if visual_type == "labelled_diagram":
+    if visual_type in DIAGRAM_TYPES:
         return validate_labelled_diagram(value, evidence_text)
     if visual_type == "graph":
         return validate_graph(value, evidence_text)
@@ -2544,19 +2687,83 @@ Previous response: {raw[:4000]}
 """
 
 
+def _markdown_table(columns: list, rows: list[list]) -> list[str]:
+    lines = [" | ".join(map(str, columns)), " | ".join(["---"] * len(columns))]
+    lines.extend(
+        " | ".join("unreadable" if cell is None else str(cell) for cell in row)
+        for row in rows
+    )
+    return lines
+
+
+def _format_hierarchical_table(value: dict) -> list[str] | None:
+    """Split a very wide spanning-header table into readable sibling subtables."""
+    columns = value.get("columns") or []
+    header_rows = value.get("header_rows") or []
+    spans = [span for span in value.get("header_spans") or [] if span.get("row") == 0]
+    if len(columns) <= 8 or not header_rows or len(spans) < 2:
+        return None
+    covered = {
+        index for span in spans
+        for index in range(int(span["start_column"]), int(span["end_column"]) + 1)
+    }
+    descriptors = [index for index in range(len(columns)) if index not in covered]
+    lines = []
+    for span in spans:
+        indices = [
+            *descriptors,
+            *range(int(span["start_column"]), int(span["end_column"]) + 1),
+        ]
+        leaf = header_rows[-1]
+        subcolumns = [
+            (leaf[index] or columns[index].split("/")[-1].strip())
+            if index < len(leaf) else columns[index]
+            for index in indices
+        ]
+        if descriptors:
+            subcolumns[0] = "Metric"
+        lines.extend([
+            f"**{span['label']}**",
+            "",
+            *_markdown_table(
+                subcolumns,
+                [[row[index] for index in indices] for row in value["rows"]],
+            ),
+            "",
+        ])
+    return lines[:-1]
+
+
 def format_structured_result(visual_type: str, value: dict) -> str:
     if visual_type == "table":
         title = value.get("title") or f"Table {value.get('table_number', '')}".strip()
-        lines = [f"**{title}**", "", " | ".join(map(str, value["columns"]))]
-        lines.append(" | ".join(["---"] * len(value["columns"])))
-        for row in value["rows"]:
-            lines.append(" | ".join("unreadable" if cell is None else str(cell) for cell in row))
+        if value.get("header_rows"):
+            first_group = next(
+                (str(cell).strip() for cell in value["header_rows"][0] if cell),
+                "",
+            )
+            if first_group and first_group in title:
+                title = title.split(first_group, 1)[0].rstrip(" .")
+        hierarchical = _format_hierarchical_table(value)
+        lines = [f"**{title}**", ""]
+        lines.extend(hierarchical or _markdown_table(value["columns"], value["rows"]))
         if value["comparisons"]:
             lines.extend(["", *[f"- {item}" for item in value["comparisons"]]])
         return "\n".join(lines)
     if visual_type == "graph":
         figure_label = _display_figure_label(value.get("figure_number"))
         lines = [f"**{figure_label} graph analysis**"]
+        if value.get("show_metric_definitions") and value.get("metric_semantics"):
+            lines.extend(["", "**Metric definitions:**"])
+            for metric, semantics in value["metric_semantics"].items():
+                definition = str(semantics.get("definition", "")).strip()
+                target = semantics.get("target_value")
+                if not definition or not isinstance(target, (int, float)):
+                    continue
+                lines.append(
+                    f"- **{metric}:** {definition}; target = {target:g} "
+                    f"(closer to {target:g} is better)."
+                )
         for panel in value["panels"]:
             lines.append(
                 f"\n- **{_display_panel_label(panel.get('panel'), panel.get('group'))}**"
@@ -2579,6 +2786,16 @@ def format_structured_result(visual_type: str, value: dict) -> str:
             lines.append("\n**Uncertain:** " + ", ".join(map(str, value["uncertain_values"])))
         return "\n".join(lines)
     lines = [value["explanation"]]
+    if value.get("panel_mappings"):
+        lines.append("\n**Caption-defined panel mappings:**")
+        for panel in value["panel_mappings"]:
+            lines.append(
+                f"- Panel {panel['panel']}: "
+                + "; ".join(
+                    f"{item['label']} = {item['interface']}"
+                    for item in panel["mappings"]
+                )
+            )
     if value["components"]:
         if value.get("circuit_topology"):
             lines.append("\n**Components:**")
@@ -2739,7 +2956,7 @@ def analyse_typed_image(
     fit_verification_images: list[tuple[str, Path]] | None = None,
 ) -> str:
     prompt = build_structured_prompt(visual_type, question, evidence_text)
-    circuit_context = visual_type == "labelled_diagram" and bool(re.search(
+    circuit_context = visual_type in DIAGRAM_TYPES and bool(re.search(
         r"\b(?:circuit|resistor|capacitor|impedance)\b",
         question,
         re.IGNORECASE,
@@ -2777,7 +2994,7 @@ def analyse_typed_image(
         errors.append(str(first_error))
         initial_validation_errors.append(str(first_error))
         topology_retry = (
-            visual_type == "labelled_diagram"
+            visual_type in DIAGRAM_TYPES
             and isinstance(parsed, dict)
             and str(parsed.get("diagram_kind", "")).lower() == "circuit"
             and _is_topology_error(first_error)
@@ -2865,7 +3082,7 @@ def analyse_typed_image(
                             "could_not_verify_topology"
                             if topology_retry or circuit_context
                             else "grounded_boundary_equation_fallback"
-                            if visual_type == "labelled_diagram" and re.search(
+                            if visual_type in DIAGRAM_TYPES and re.search(
                                 r"\bboundary conditions?\b", question, re.I
                             ) and grounded_boundary_synthesis(evidence_text)
                             else "grounded_caption_summary_fallback"
@@ -2893,7 +3110,7 @@ def analyse_typed_image(
                         evidence_text, visual_type, question
                     )
 
-    if visual_type == "labelled_diagram":
+    if visual_type in DIAGRAM_TYPES:
         value = enrich_boundary_conditions(value, evidence_text, question)
 
     fit_verification_raw = []
@@ -2935,7 +3152,7 @@ def analyse_typed_image(
                 if used_repair else "validated_structured_vision"
             ),
         })
-    if visual_type == "labelled_diagram" and re.search(
+    if visual_type in DIAGRAM_TYPES and re.search(
         r"\bboundary conditions?\b", question, re.I
     ):
         boundary_rendering = format_boundary_condition_result(value, evidence_text)

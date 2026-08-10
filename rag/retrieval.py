@@ -77,6 +77,73 @@ def extract_inferred_limitations(documents: list[str]) -> dict:
     return {"items": items, "status": "inferred_from_stated_assumptions"} if items else {}
 
 
+def extract_explicit_limitations(documents: list[str]) -> dict:
+    """Collect every distinct adverse claim from an author-labelled limitation block."""
+    text = re.sub(r"[ \t]+", " ", "\n".join(str(item or "") for item in documents))
+    start = re.search(
+        r"\b(?:there (?:are|were)|we (?:identify|acknowledge))\s+(?:some\s+)?"
+        r"limitations?\b|(?:^|\n)\s*limitations?\s*(?:\n|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if not start:
+        return {}
+    tail = text[start.start():]
+    stop = re.search(
+        r"\n\s*(?:\d+(?:\.\d+)*\s+)?(?:conclusions?|future work|"
+        r"data availability|author contributions|funding|references)\b",
+        tail,
+        re.IGNORECASE,
+    )
+    block = tail[:stop.start()] if stop else tail[:5000]
+    sentences = [
+        re.sub(r"\s+", " ", sentence).strip(" \n-;:")
+        for sentence in re.split(r"(?<=[.!?])\s+", block)
+    ]
+    adverse = re.compile(
+        r"\b(?:more\s+time[ -]?consuming|more\s+complex|slower|costlier|"
+        r"computationally expensive|difficult(?:y)?|drawback|requires?\s+additional|"
+        r"cannot|unable|limited by)\b",
+        re.IGNORECASE,
+    )
+    items = []
+    seen_signatures = []
+    for index, sentence in enumerate(sentences):
+        if not adverse.search(sentence):
+            continue
+        if items and re.match(r"^(?:hence|therefore|thus)\b", sentence, re.IGNORECASE):
+            continue
+        cleaned = re.sub(
+            r"^(?:there (?:are|were).*?addressed\.\s*)|^(?:first|second|third|also),?\s*",
+            "",
+            sentence,
+            flags=re.IGNORECASE,
+        ).strip()
+        if len(cleaned.split()) < 5:
+            continue
+        signature = {
+            token for token in re.findall(r"[a-z][a-z-]{3,}", cleaned.casefold())
+            if token not in {"than", "more", "method", "study", "hybrid"}
+        }
+        if any(
+            signature and existing
+            and len(signature.intersection(existing)) / min(len(signature), len(existing)) >= 0.7
+            for existing in seen_signatures
+        ):
+            continue
+        evidence = [cleaned]
+        if index + 1 < len(sentences) and re.search(
+            r"\b(?:for example|approximately|about|times|same DOF)\b",
+            sentences[index + 1],
+            re.IGNORECASE,
+        ):
+            evidence.append(sentences[index + 1])
+        key = "explicit_" + "_".join(sorted(signature)[:5])
+        items.append({"key": key, "statement": cleaned, "evidence": evidence})
+        seen_signatures.append(signature)
+    return {"items": items, "status": "explicit_author_limitations"} if items else {}
+
+
 def _limitation_keys(document: str) -> set[str]:
     text = re.sub(r"\s+", " ", str(document or ""))
     return {
@@ -309,6 +376,128 @@ def is_multi_figure_evidence_question(question: str) -> bool:
     )
 
 
+def is_section_aware_question(question: str) -> bool:
+    return bool(re.search(
+        r"\b(?:limitations?|future work|future research|recommendations?|"
+        r"conclusions?|discussion|authors?' stated assumptions?)\b",
+        str(question or ""), re.I,
+    ))
+
+
+def is_reported_trend_question(question: str) -> bool:
+    return bool(
+        re.search(r"\bwhy\b", str(question or ""), re.I)
+        and re.search(r"\b(?:error|trend|increase|decrease|jump|deviation)\b", str(question or ""), re.I)
+    )
+
+
+def resolve_followup_retrieval_query(question: str, previous_question: str) -> str:
+    """Resolve a high-confidence possessive referent without paraphrasing terms."""
+    current = str(question or "")
+    previous = str(previous_question or "")
+    if not previous or not re.search(r"\b(?:its|it)\b", current, re.I):
+        return current
+    subjects = re.findall(
+        r"\b((?:hybrid\s+)?[A-Z]*[A-Za-z-]*(?:\s+[A-Z]*[A-Za-z-]+){0,3}\s+method)\b",
+        previous, re.I,
+    )
+    if not subjects:
+        return current
+    subject = max(subjects, key=len).strip()
+    subject = re.sub(
+        r"^(?:(?:why|how)\s+)?(?:does|do|did)\s+(?:the\s+)?|^the\s+",
+        "", subject, flags=re.I,
+    )
+    return re.sub(r"\bits\b", f"the {subject}'s", current, count=1, flags=re.I)
+
+
+def _retrieve_section_context(
+    question, collection, embedder, reranker, available_chunks,
+    selected_source=None,
+):
+    queries = [question, f"{question} conclusion discussion future work limitations"]
+    candidates, _ = _query_candidates(
+        queries, collection, embedder, min(max(INITIAL_RESULTS, 24), available_chunks)
+    )
+    if not candidates:
+        return "", []
+    names = [metadata.get("pdf", metadata.get("source", "")) for _, metadata in candidates.values()]
+    explicit = explicit_document_matches(question, names)
+    if selected_source:
+        target = _source_identity({"source": str(selected_source)})
+    elif explicit:
+        target = _source_identity({"source": next(iter(explicit))})
+    else:
+        scored = reranker.predict([[question, document] for document, _ in candidates.values()])
+        best = max(zip(scored, candidates.values()), key=lambda row: float(row[0]))[1][1]
+        target = _source_identity(best)
+    _expand_target_document_candidates(collection, candidates, target)
+    rows = [
+        (document, metadata, infer_section(document))
+        for document, metadata in candidates.values()
+        if _source_identity(metadata) == target and not _is_reference_or_metadata(document)
+    ]
+    terms = {
+        token for token in re.findall(r"[a-z][a-z-]{4,}", question.casefold())
+        if token not in {"what", "authors", "explicitly", "identify", "their"}
+    }
+    ranked = []
+    model_scores = reranker.predict([[question, document] for document, _, _ in rows]) if rows else []
+    for score, (document, metadata, section) in zip(model_scores, rows):
+        lower = document.casefold()
+        exact_hits = sum(term in lower for term in terms)
+        section_boost = 4 if section in {"conclusion", "discussion"} else 0
+        future_boost = 4 if re.search(r"\bfuture (?:work|research)\b|\bwill (?:also )?(?:be )?(?:investigated|considered|used)\b", lower) else 0
+        ranked.append((float(score) + exact_hits + section_boost + future_boost, document, metadata, section))
+    ranked.sort(reverse=True, key=lambda row: row[0])
+    if ranked and isinstance(ranked[0][2].get("page"), int):
+        anchor_page = ranked[0][2]["page"]
+        adjacent = [
+            row for row in ranked
+            if isinstance(row[2].get("page"), int)
+            and abs(row[2]["page"] - anchor_page) <= 1
+        ]
+        if len(adjacent) >= 2:
+            ranked = adjacent
+    selected, pages = [], set()
+    for score, document, metadata, section in ranked:
+        page = metadata.get("page")
+        if page in pages and len(selected) >= 2:
+            continue
+        selected.append(_source_item(score, document, metadata, section))
+        pages.add(page)
+        if len(selected) >= FINAL_RESULTS:
+            break
+    explicit_limitations = {}
+    if re.search(r"\blimitations?\b", question, re.IGNORECASE):
+        ordered_documents = [
+            document for document, metadata, _ in sorted(
+                rows,
+                key=lambda row: (
+                    int(row[1].get("page", 0)) if isinstance(row[1].get("page"), int) else 0,
+                    int(row[1].get("chunk", 0)) if isinstance(row[1].get("chunk"), int) else 0,
+                ),
+            )
+        ]
+        explicit_limitations = extract_explicit_limitations(ordered_documents)
+    limitations_block = ""
+    if explicit_limitations:
+        limitations_block = (
+            "\n[EXPLICIT AUTHOR LIMITATIONS]\n"
+            f"{json.dumps(explicit_limitations, ensure_ascii=False)}\n"
+            "For a plural limitations question, include every item exactly once. "
+            "Keep these author-stated limitations separate from any inference.\n"
+        )
+    prefix = (
+        "[SECTION-AWARE AUTHOR EVIDENCE]\n"
+        "Continue through the supplied discussion/conclusion evidence. Separate "
+        "author-stated limitations and explicit future work from assistant inference. "
+        "For a reported trend, state when the authors do not give a mechanism; label "
+        f"any numerical explanation as inference.{limitations_block}"
+    )
+    return _format_context(selected, prefix), selected
+
+
 def _evidence_aspects(question: str) -> list[str]:
     text = re.sub(r"\s+", " ", str(question or "")).strip(" ?.!")
     match = re.search(r"\bboth\s+(.+?)\s+and\s+(.+)$", text, re.I)
@@ -517,7 +706,10 @@ def _expand_target_document_candidates(collection, candidates, target_source):
     return added
 
 
-def _retrieve_summary_context(question, collection, embedder, reranker, available_chunks):
+def _retrieve_summary_context(
+    question, collection, embedder, reranker, available_chunks,
+    selected_source=None,
+):
     n_results = min(max(INITIAL_RESULTS, 30), available_chunks)
     candidates, raw_count = _query_candidates(
         SUMMARY_QUERIES, collection, embedder, n_results
@@ -561,7 +753,8 @@ def _retrieve_summary_context(question, collection, embedder, reranker, availabl
     explicit_names = explicit_document_matches(question, candidate_names)
     explicit_name = next(iter(explicit_names), None)
     target_source = (
-        _source_identity({"source": explicit_name}) if explicit_name
+        _source_identity({"source": str(selected_source)}) if selected_source
+        else _source_identity({"source": explicit_name}) if explicit_name
         else max(source_counts, key=source_counts.get) if source_counts else None
     )
     diagnostics["document_expansion_chunks_added"] = _expand_target_document_candidates(
@@ -1065,10 +1258,12 @@ def retrieve_context(
     collection,
     embedder,
     reranker,
+    selected_source=None,
 ) -> tuple[str, list[dict]]:
+    resolved_question = resolve_followup_retrieval_query(question, previous_question)
     if previous_question:
         retrieval_query = (
-            f"Previous question: {previous_question}\nCurrent question: {question}"
+            f"Previous question: {previous_question}\nCurrent question: {resolved_question}"
         )
     else:
         retrieval_query = question
@@ -1079,13 +1274,24 @@ def retrieve_context(
 
     if is_broad_summary_question(question):
         return _retrieve_summary_context(
-            question, collection, embedder, reranker, available_chunks
+            question, collection, embedder, reranker, available_chunks,
+            selected_source=selected_source,
         )
 
     if is_multi_figure_evidence_question(question):
         return _retrieve_multi_figure_context(
             question, collection, embedder, reranker, available_chunks
         )
+
+    if is_section_aware_question(question) or is_reported_trend_question(question) or (
+        previous_question and re.search(r"\b(?:error|trend|increase|decrease)\b", question, re.I)
+    ):
+        context, sources = _retrieve_section_context(
+            retrieval_query, collection, embedder, reranker, available_chunks,
+            selected_source=selected_source,
+        )
+        if context:
+            return context, sources
 
     # Existing focused-question retrieval path.
     query_embedding = embedder.encode(

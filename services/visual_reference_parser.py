@@ -172,3 +172,52 @@ def parse_visual_reference(question: str) -> VisualReference:
 def has_visual_reference(question: str) -> bool:
     reference = parse_visual_reference(question)
     return reference.explicit_reference or reference.followup_kind is not None
+
+
+def parse_visual_references(question: str) -> list[VisualReference]:
+    """Return all explicit targets, expanding shared lists and ranges."""
+    text = str(question or "")
+    identifier = r"(?:(?:[A-Za-z]\.)?\d+(?:\.\d+)?|[A-Za-z]\d+)"
+    block_pattern = re.compile(
+        rf"\b(?P<kind>fig(?:ure)?s?|tables?|eq(?:uation)?s?)\.?\s*"
+        rf"(?P<body>\(?\s*{identifier}\s*\)?(?:\s*(?:,|and|&|to|through|[-\u2013\u2014])"
+        rf"\s*\(?\s*{identifier}\s*\)?)+|\(?\s*{identifier}\s*\)?)",
+        re.IGNORECASE,
+    )
+    positioned: list[tuple[int, VisualReference]] = []
+    for block in block_pattern.finditer(text):
+        kind = block.group("kind").casefold()
+        target_type = "figure" if kind.startswith("fig") else "table" if kind.startswith("table") else "equation"
+        body = block.group("body")
+        raw_values = re.findall(identifier, body, re.IGNORECASE)
+        if not raw_values:
+            continue
+        if len(raw_values) == 2 and re.search(r"\b(?:to|through)\b|[-\u2013\u2014]", body, re.I):
+            first, last = raw_values
+            values = (
+                [str(value) for value in range(int(first), int(last) + 1)]
+                if first.isdigit() and last.isdigit() and int(last) >= int(first)
+                else raw_values
+            )
+        else:
+            values = raw_values
+        for offset, value in enumerate(values):
+            panel = None
+            if target_type == "figure" and (compact := re.fullmatch(r"(\d+)([A-Za-z])", value)):
+                value, panel = compact.group(1), compact.group(2).casefold()
+            positioned.append((block.start() + offset, VisualReference(
+                target_type=target_type,
+                target_number=value.strip("() "),
+                panel=panel,
+                explicit_reference=True,
+                raw_reference=block.group(0),
+                remaining_query=_remaining_query(text, *block.span()),
+            )))
+    positioned.sort(key=lambda row: row[0])
+    values, seen = [], set()
+    for _, reference in positioned:
+        key = (reference.target_type, canonical_identifier(reference.target_number), reference.panel)
+        if key not in seen:
+            seen.add(key)
+            values.append(reference)
+    return values
