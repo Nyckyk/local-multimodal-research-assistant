@@ -5,7 +5,11 @@ import json
 import fitz
 import yaml
 
-from rag.retrieval import is_reported_trend_question, resolve_followup_retrieval_query
+from rag.retrieval import (
+    extract_explicit_limitations,
+    is_reported_trend_question,
+    resolve_followup_retrieval_query,
+)
 from services.equation_service import (
     analyse_resolved_equation, build_equation_evidence,
 )
@@ -15,7 +19,7 @@ from services.scientific_metrics import (
     best_by_metric, classify_numeric_trend, grounded_table_trends,
     infer_metric_semantics,
 )
-from services.structured_vision import detect_visual_type
+from services.structured_vision import detect_visual_type, format_structured_result
 from services.text_table import extract_text_table
 from services.visual_index import load_or_build_visual_index
 from services.visual_locator import resolve_visual_target, resolve_visual_targets
@@ -57,6 +61,10 @@ def test_equations_18_to_20_resolve_in_order_in_exact_document():
     assert debug["symbolic_equation_chain"]["unknowns"] == ["φ_FE", "X_BE"]
     assert "mean of the three FE nodal potentials" in answer
     assert "opposite outward normals" in answer
+    assert r"\frac{\phi_{\mathrm{FE},1}+\phi_{\mathrm{FE},2}+\phi_{\mathrm{FE},3}}{3}" in answer
+    assert r"\left[\begin{array}{cc}" in answer
+    assert r"\widetilde{K}_{\mathrm{FE}}" in answer
+    assert "potential_expression" not in answer
 
 
 def test_equation_one_preserves_operators_source_and_boundary_condition():
@@ -96,6 +104,33 @@ def test_eeg_figure_one_runtime_does_not_require_graph_axes():
     assert "x-axis" not in answer
 
 
+def test_eeg_figure_one_caption_overrides_panel_specific_interface_mappings():
+    resolution = resolve_visual_target("Explain Figure 1 in the hybrid EEG paper.", load_or_build_visual_index())
+    response = {
+        "diagram_kind": "other",
+        "labels": ["EEG electrode", "Dipoles", "Brain", "CSF", "Skull", "Scalp", "S1", "S2", "S3", "S4"],
+        "components": [{"name": "head models", "description": "three schematic panels"}],
+        "spatial_relationships": [], "connections": [], "circuit_topology": None,
+        "explanation": "Panel C incorrectly infers S4 = CSF-skull.",
+        "uncertain_items": [],
+    }
+    debug = {}
+    with patch("services.structured_vision._call_model", return_value=json.dumps(response)):
+        answer = analyse_resolved_visual("Explain Figure 1 in the hybrid EEG paper.", resolution, debug_info=debug)
+    mappings = {
+        panel["panel"]: {item["label"]: item["interface"] for item in panel["mappings"]}
+        for panel in debug["validated_json"]["panel_mappings"]
+    }
+    assert mappings["B"] == {
+        "S1": "brain-skull", "S2": "skull-scalp", "S3": "scalp-air",
+    }
+    assert mappings["C"] == {
+        "S1": "brain-CSF", "S2": "CSF-skull", "S3": "skull-scalp", "S4": "scalp-air",
+    }
+    assert "S4 = CSF-skull" not in answer
+    assert "S4 = scalp-air" in answer
+
+
 def test_table_one_extracts_clean_header_and_grounded_explanation():
     with fitz.open(PDF) as document:
         table = extract_text_table(
@@ -133,6 +168,17 @@ def test_table_five_runtime_uses_validated_hierarchical_text_fallback():
     assert "Radial direction" in answer and "Tangential direction" in answer
 
 
+def test_table_five_hierarchical_markdown_uses_readable_subtables():
+    with fitz.open(PDF) as document:
+        table = extract_text_table(document[13], "5", "Extract every row and column from Table 5.")
+    rendered = format_structured_result("table", table)
+    first_header = rendered.splitlines()[0]
+    assert "0.1641" not in first_header
+    assert "**Radial direction (z-axis)**" in rendered
+    assert "**Tangential direction (x-axis)**" in rendered
+    assert rendered.count("Metric | Source eccentricity | 50%") == 2
+
+
 def test_metric_semantics_use_targets_not_larger_is_better():
     with fitz.open(PDF) as document:
         evidence = build_equation_evidence(PDF, 6, "21") + build_equation_evidence(PDF, 6, "22")
@@ -150,6 +196,32 @@ def test_figure_six_values_are_non_monotonic():
             _associated_graph_text(document, 12, document[12].get_text("text"))
         )
     assert trends["RDM|Hybrid BE-FE"]["classification"] == "non-monotonic"
+
+
+def test_figure_six_recovers_validated_graph_from_associated_table_five():
+    resolution = resolve_visual_target(
+        "Compare RDM and MAG in Figure 6 in the hybrid EEG paper.",
+        load_or_build_visual_index(),
+    )
+    debug = {}
+    with patch("services.structured_vision._call_model", return_value="{}"):
+        answer = analyse_resolved_visual(
+            "Compare RDM and MAG in Figure 6 in the hybrid EEG paper.",
+            resolution,
+            debug_info=debug,
+        )
+    assert debug["final_answer_path"] == "validated_graph_with_table_evidence_fallback"
+    assert "Graph is missing fields" in debug["vision_graph_validation_error"]
+    result = debug["validated_json"]
+    assert len(result["panels"]) == 2
+    assert all(
+        row["classification"] == "non-monotonic"
+        for row in result["grounded_trends"].values()
+    )
+    claims = " ".join(item["claim"] for item in result["comparisons"])
+    assert "RDM target 0 at all 6 radial" in claims
+    assert "MAG target 1 at all 6 radial" in claims
+    assert "closer to the MAG target 1" in answer
 
 
 def test_figure_seven_peak_compares_all_eccentricities():
@@ -191,6 +263,19 @@ def test_limitations_and_future_work_are_adjacent_in_conclusion():
     assert "future research" in lower
     assert "heterogeneous" in lower and "white matter" in lower
     assert "source localization" in lower or "source-localization" in lower
+
+
+def test_plural_explicit_limitations_collects_time_and_mesh_complexity():
+    with fitz.open(PDF) as document:
+        grounding = extract_explicit_limitations([document[16].get_text("text")])
+    statements = " ".join(item["statement"] for item in grounding["items"]).casefold()
+    evidence = " ".join(
+        sentence for item in grounding["items"] for sentence in item["evidence"]
+    ).casefold()
+    assert len(grounding["items"]) == 2
+    assert "more time consuming" in statements
+    assert "mesh algorithm" in statements and "more complex" in statements
+    assert "three times" in evidence
 
 
 def test_followup_pronoun_resolution_preserves_distinctive_terms():

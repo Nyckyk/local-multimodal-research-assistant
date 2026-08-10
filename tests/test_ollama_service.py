@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from unittest.mock import patch
 
 from services.ollama_service import generate_answer
@@ -153,6 +154,48 @@ def test_grounded_inferred_limitations_are_completed_and_clearly_labelled():
     assert debug["final_missing_inferred_limitations"] == []
 
 
+def test_explicit_plural_limitations_are_completed_without_losing_future_work():
+    items = [
+        {
+            "key": "explicit_runtime",
+            "statement": "The hybrid method is more time consuming than the comparison method.",
+            "evidence": ["The simulation took approximately three times as long at the same DOF."],
+        },
+        {
+            "key": "explicit_mesh",
+            "statement": "Its mesh extraction algorithm is more complex than the comparison method.",
+            "evidence": [],
+        },
+    ]
+    context = (
+        "[SECTION-AWARE AUTHOR EVIDENCE]\n[EXPLICIT AUTHOR LIMITATIONS]\n"
+        + __import__("json").dumps({"items": items, "status": "explicit_author_limitations"})
+        + "\nThe authors propose improved mesh generation as future work."
+    )
+    debug = {}
+    with patch(
+        "services.ollama_service.ollama.chat",
+        side_effect=[
+            _response(
+                "The authors state that the hybrid method is more time consuming. "
+                "Future work will improve mesh generation."
+            ),
+            _response("Its mesh extraction algorithm is more complex than the comparison method."),
+        ],
+    ) as chat:
+        answer = generate_answer(
+            "What limitations do the authors identify, and what future work do they propose?",
+            context,
+            [],
+            debug,
+        )
+    assert chat.call_count == 2
+    assert "more time consuming" in answer
+    assert "mesh extraction algorithm is more complex" in answer
+    assert "Future work" in answer
+    assert debug["final_missing_explicit_limitations"] == []
+
+
 def test_grounded_transient_comparison_is_preserved_after_summary_generation():
     context = (
         "[DOCUMENT SUMMARY MODE]\n"
@@ -207,3 +250,25 @@ def test_multi_figure_completion_keeps_trends_attached_to_their_figure():
     assert "39.52 °C at 4 GHz" in answer
     assert debug["multi_figure_contradiction_removed"] is True
     assert debug["multi_figure_depth_language_qualified"] is False
+
+
+def test_absorbed_power_alone_does_not_make_heating_depth_a_direct_measurement():
+    context = (
+        "[MULTI-FIGURE EVIDENCE MODE]\n"
+        "Source: paper.pdf, page 9\n"
+        "Fig. 5 shows absorbed power concentrated near the incident boundary."
+    )
+    debug = {}
+    with patch(
+        "services.ollama_service.ollama.chat",
+        return_value=_response(
+            "The absorbed-power distribution is a proxy for heating depth."
+        ),
+    ):
+        answer = generate_answer("Which figure shows heating depth?", context, [], debug)
+    depth_sentence = next(
+        sentence for sentence in re.split(r"(?<=[.!?])\s+", answer)
+        if "heating depth" in sentence.casefold()
+    )
+    assert "inferred heating depth from spatial absorbed-power contours" in depth_sentence
+    assert debug["multi_figure_depth_language_qualified"] is True

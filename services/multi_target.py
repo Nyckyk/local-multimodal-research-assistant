@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import asdict, dataclass
 
 from services.equation_service import build_equation_evidence
 from services.ollama_service import generate_answer
+from services.scientific_metrics import infer_metric_semantics
 from services.visual_locator import VisualResolution
 from services.visual_runtime import analyse_resolved_visual
 
@@ -40,6 +42,79 @@ def extract_experimental_context(caption: str) -> dict:
         "source_eccentricities": re.findall(r"\b\d+(?:\.\d+)?%", text),
         "grounded_caption": text,
     }
+
+
+def _explicit_metric_exceptions(text: str) -> list[str]:
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", re.sub(r"\s+", " ", str(text or "")))
+    return list(dict.fromkeys(
+        sentence.strip() for sentence in sentences
+        if re.search(r"\b(?:RDM|MAG)\b", sentence, re.I)
+        and re.search(r"\bexcept(?:ion)?\b", sentence, re.I)
+        and re.search(r"\b(?:outperform|better|worse|accurate)\w*\b", sentence, re.I)
+    ))
+
+
+def _metric_aware_synthesis_guardrail(
+    answer: str,
+    semantics: dict,
+    explicit_exceptions: list[str],
+    grounded_trends: dict,
+) -> str:
+    """Remove target-value and trend contradictions, then restore explicit author text."""
+    parts = re.split(r"(?<=[.!?])(?=\s|$)", str(answer or ""))
+    kept = []
+    mag_target = semantics.get("MAG", {}).get("target_value")
+    has_non_monotonic = any(
+        "non-monotonic" in str(row.get("classification", ""))
+        for row in grounded_trends.values() if isinstance(row, dict)
+    )
+    has_validated_monotonic = bool(grounded_trends) and all(
+        str(row.get("classification", "")).startswith("monotonic")
+        for row in grounded_trends.values() if isinstance(row, dict)
+    )
+    for part in parts:
+        if mag_target == 1.0 and re.search(r"\bMAG\b", part, re.I):
+            if re.search(
+                r"\b(?:higher|larger|greatest)\b.{0,80}\b(?:better|superior|outperform|accurate)",
+                part,
+                re.I | re.DOTALL,
+            ):
+                continue
+            if explicit_exceptions and re.search(
+                r"\b(?:all|every)\b.{0,100}\b(?:eccentricit|case|point)",
+                part,
+                re.I | re.DOTALL,
+            ):
+                continue
+        if (has_non_monotonic or not has_validated_monotonic) and re.search(
+            r"\b(?:monotonic(?:ally)?|steadily)\b",
+            part,
+            re.I,
+        ):
+            continue
+        if re.search(r"\bwidening\s+(?:gap|difference)\b", part, re.I):
+            continue
+        kept.append(part)
+    cleaned = "".join(kept).strip()
+    additions = []
+    if mag_target == 1.0 and not re.search(
+        r"\bMAG\b.{0,100}\b(?:close|closeness|distance|deviation)\b.{0,30}\b1\b|"
+        r"\b(?:close|closeness|distance|deviation)\b.{0,30}\b1\b.{0,100}\bMAG\b",
+        cleaned,
+        re.I | re.DOTALL,
+    ):
+        additions.append("MAG accuracy is judged by closeness to 1, not by taking the larger value.")
+    normalized = re.sub(r"\s+", " ", cleaned).casefold()
+    for statement in explicit_exceptions:
+        key = re.sub(r"\s+", " ", statement).casefold()
+        eccentricity = re.search(r"\b\d+(?:\.\d+)?%", statement)
+        if key not in normalized and not (
+            eccentricity and eccentricity.group(0).casefold() in normalized and "except" in normalized
+        ):
+            additions.append(f"The authors explicitly state: {statement}")
+    if additions:
+        cleaned = f"{cleaned.rstrip()}\n\n" + " ".join(additions)
+    return cleaned.strip()
 
 
 def _local_equation_text(evidence: str, number: str) -> str:
@@ -80,7 +155,8 @@ def _deterministic_interface_coupling(
 The constant BE surface potential is approximated by the mean of the three FE nodal potentials on the shared triangular interface:
 
 $$
-\phi_{{BE}}=\frac{{\phi_{{FE1}}+\phi_{{FE2}}+\phi_{{FE3}}}}{{3}}.
+\displaystyle \phi_{{\mathrm{{BE}}}}
+=\frac{{\phi_{{\mathrm{{FE}},1}}+\phi_{{\mathrm{{FE}},2}}+\phi_{{\mathrm{{FE}},3}}}}{{3}}.
 $$
 
 **Equation {roles['current']} — normal-current continuity**
@@ -88,8 +164,8 @@ $$
 The normal conductive current is continuous across the interface. Because the two regions use opposite outward normals, the paper writes
 
 $$
-\sigma_{{FE}}\frac{{\partial\phi_{{FE}}}}{{\partial n_{{FE}}}}
-=-\sigma_{{BE}}\frac{{\partial\phi_{{BE}}}}{{\partial n_{{BE}}}}.
+\sigma_{{\mathrm{{FE}}}}\frac{{\partial\phi_{{\mathrm{{FE}}}}}}{{\partial n_{{\mathrm{{FE}}}}}}
+=-\sigma_{{\mathrm{{BE}}}}\frac{{\partial\phi_{{\mathrm{{BE}}}}}}{{\partial n_{{\mathrm{{BE}}}}}}.
 $$
 
 **Equation {roles['system']} — assembled coupled system**
@@ -97,13 +173,13 @@ $$
 Applying those two interface conditions modifies the FE and BE blocks and produces the final algebraic system
 
 $$
-\begin{{bmatrix}}
-\widetilde K_{{FE}} & M_{{FE}}\\
-M_{{BE}} & \widetilde A_{{BE}}
-\end{{bmatrix}}
-\begin{{bmatrix}}\phi_{{FE}}\\X_{{BE}}\end{{bmatrix}}
+\left[\begin{{array}}{{cc}}
+\widetilde{{K}}_{{\mathrm{{FE}}}} & M_{{\mathrm{{FE}}}}\\
+M_{{\mathrm{{BE}}}} & \widetilde{{A}}_{{\mathrm{{BE}}}}
+\end{{array}}\right]
+\left[\begin{{array}}{{c}}\phi_{{\mathrm{{FE}}}}\\X_{{\mathrm{{BE}}}}\end{{array}}\right]
 =
-\begin{{bmatrix}}\widetilde B_{{FE}}\\\widetilde B_{{BE}}\end{{bmatrix}}.
+\left[\begin{{array}}{{c}}\widetilde{{B}}_{{\mathrm{{FE}}}}\\\widetilde{{B}}_{{\mathrm{{BE}}}}\end{{array}}\right].
 $$
 
 Together, the first condition transfers FE nodal potentials to the BE surface unknown, the second transfers the matching normal flux with the correct sign convention, and the third solves the modified FE potentials $\phi_{{FE}}$ and BE unknowns $X_{{BE}}$ in one coupled system."""
@@ -195,10 +271,14 @@ def analyse_visual_targets(
 ) -> str:
     """Validate each requested visual independently, then synthesize them."""
     target_results, evidence_parts = [], []
+    metric_semantics: dict[str, dict] = {}
+    grounded_trends: dict[str, dict] = {}
+    metric_evidence_parts = [text_evidence]
     for resolution in resolutions:
         context = extract_experimental_context(
             f"{resolution.caption}\n{resolution.nearby_text}"
         )
+        metric_evidence_parts.extend([resolution.caption or "", resolution.nearby_text or ""])
         if resolution.status != "resolved":
             target_results.append(TargetResult(
                 resolution.target_type, resolution.target_number, resolution.status,
@@ -222,10 +302,15 @@ def analyse_visual_targets(
                 resolution.pdf_name, resolution.page_number, answer=answer,
                 structured=structured, experimental_context=context,
             ))
+            if isinstance(structured, dict):
+                metric_semantics.update(structured.get("metric_semantics") or {})
+                grounded_trends.update(structured.get("grounded_trends") or {})
             evidence_parts.append(
                 f"[VALIDATED {resolution.target_type.upper()} {resolution.target_number}]\n"
                 f"Source: {resolution.pdf_name}, PDF page {resolution.page_number}\n"
-                f"Experimental context: {context}\nResult: {answer}"
+                f"Experimental context: {context}\n"
+                f"Validated structured evidence: {json.dumps(structured, ensure_ascii=False)}\n"
+                f"Result: {answer}"
             )
         except Exception as error:
             target_results.append(TargetResult(
@@ -235,9 +320,23 @@ def analyse_visual_targets(
             ))
     if not evidence_parts:
         return "Could not verify any requested visual target from validated structured output."
+    metric_evidence = "\n".join(metric_evidence_parts)
+    metric_semantics = {**infer_metric_semantics(metric_evidence), **metric_semantics}
+    explicit_exceptions = _explicit_metric_exceptions(metric_evidence)
+    metric_block = (
+        "\n[VALIDATED METRIC SEMANTICS]\n"
+        f"{json.dumps(metric_semantics, ensure_ascii=False)}\n"
+        "For target-value metrics, compare absolute distance from the target; never "
+        "equate a larger raw value with better performance. Do not infer monotonic or "
+        "widening gaps from endpoints. Explicit author exceptions override generic synthesis.\n"
+        f"Explicit author comparison exceptions: {json.dumps(explicit_exceptions, ensure_ascii=False)}\n"
+    ) if metric_semantics or explicit_exceptions else ""
     answer = generate_answer(
         question + "\nCompare only the individually validated targets; keep every claim attached to its figure and experimental context.",
-        "\n\n".join(evidence_parts), conversation_history or [],
+        metric_block + "\n\n".join(evidence_parts), conversation_history or [],
+    )
+    answer = _metric_aware_synthesis_guardrail(
+        answer, metric_semantics, explicit_exceptions, grounded_trends
     )
     missing = [row for row in target_results if row.status != "resolved"]
     if missing:
@@ -247,6 +346,9 @@ def analyse_visual_targets(
     if debug_info is not None:
         debug_info.update({
             "targets": [asdict(row) for row in target_results],
+            "metric_semantics": metric_semantics,
+            "explicit_metric_exceptions": explicit_exceptions,
+            "grounded_trends": grounded_trends,
             "final_answer_path": "validated_multi_visual_synthesis",
             "final_answer_code_path": "validated_multi_visual_synthesis",
         })

@@ -77,6 +77,73 @@ def extract_inferred_limitations(documents: list[str]) -> dict:
     return {"items": items, "status": "inferred_from_stated_assumptions"} if items else {}
 
 
+def extract_explicit_limitations(documents: list[str]) -> dict:
+    """Collect every distinct adverse claim from an author-labelled limitation block."""
+    text = re.sub(r"[ \t]+", " ", "\n".join(str(item or "") for item in documents))
+    start = re.search(
+        r"\b(?:there (?:are|were)|we (?:identify|acknowledge))\s+(?:some\s+)?"
+        r"limitations?\b|(?:^|\n)\s*limitations?\s*(?:\n|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if not start:
+        return {}
+    tail = text[start.start():]
+    stop = re.search(
+        r"\n\s*(?:\d+(?:\.\d+)*\s+)?(?:conclusions?|future work|"
+        r"data availability|author contributions|funding|references)\b",
+        tail,
+        re.IGNORECASE,
+    )
+    block = tail[:stop.start()] if stop else tail[:5000]
+    sentences = [
+        re.sub(r"\s+", " ", sentence).strip(" \n-;:")
+        for sentence in re.split(r"(?<=[.!?])\s+", block)
+    ]
+    adverse = re.compile(
+        r"\b(?:more\s+time[ -]?consuming|more\s+complex|slower|costlier|"
+        r"computationally expensive|difficult(?:y)?|drawback|requires?\s+additional|"
+        r"cannot|unable|limited by)\b",
+        re.IGNORECASE,
+    )
+    items = []
+    seen_signatures = []
+    for index, sentence in enumerate(sentences):
+        if not adverse.search(sentence):
+            continue
+        if items and re.match(r"^(?:hence|therefore|thus)\b", sentence, re.IGNORECASE):
+            continue
+        cleaned = re.sub(
+            r"^(?:there (?:are|were).*?addressed\.\s*)|^(?:first|second|third|also),?\s*",
+            "",
+            sentence,
+            flags=re.IGNORECASE,
+        ).strip()
+        if len(cleaned.split()) < 5:
+            continue
+        signature = {
+            token for token in re.findall(r"[a-z][a-z-]{3,}", cleaned.casefold())
+            if token not in {"than", "more", "method", "study", "hybrid"}
+        }
+        if any(
+            signature and existing
+            and len(signature.intersection(existing)) / min(len(signature), len(existing)) >= 0.7
+            for existing in seen_signatures
+        ):
+            continue
+        evidence = [cleaned]
+        if index + 1 < len(sentences) and re.search(
+            r"\b(?:for example|approximately|about|times|same DOF)\b",
+            sentences[index + 1],
+            re.IGNORECASE,
+        ):
+            evidence.append(sentences[index + 1])
+        key = "explicit_" + "_".join(sorted(signature)[:5])
+        items.append({"key": key, "statement": cleaned, "evidence": evidence})
+        seen_signatures.append(signature)
+    return {"items": items, "status": "explicit_author_limitations"} if items else {}
+
+
 def _limitation_keys(document: str) -> set[str]:
     text = re.sub(r"\s+", " ", str(document or ""))
     return {
@@ -401,12 +468,32 @@ def _retrieve_section_context(
         pages.add(page)
         if len(selected) >= FINAL_RESULTS:
             break
+    explicit_limitations = {}
+    if re.search(r"\blimitations?\b", question, re.IGNORECASE):
+        ordered_documents = [
+            document for document, metadata, _ in sorted(
+                rows,
+                key=lambda row: (
+                    int(row[1].get("page", 0)) if isinstance(row[1].get("page"), int) else 0,
+                    int(row[1].get("chunk", 0)) if isinstance(row[1].get("chunk"), int) else 0,
+                ),
+            )
+        ]
+        explicit_limitations = extract_explicit_limitations(ordered_documents)
+    limitations_block = ""
+    if explicit_limitations:
+        limitations_block = (
+            "\n[EXPLICIT AUTHOR LIMITATIONS]\n"
+            f"{json.dumps(explicit_limitations, ensure_ascii=False)}\n"
+            "For a plural limitations question, include every item exactly once. "
+            "Keep these author-stated limitations separate from any inference.\n"
+        )
     prefix = (
         "[SECTION-AWARE AUTHOR EVIDENCE]\n"
         "Continue through the supplied discussion/conclusion evidence. Separate "
         "author-stated limitations and explicit future work from assistant inference. "
         "For a reported trend, state when the authors do not give a mechanism; label "
-        "any numerical explanation as inference."
+        f"any numerical explanation as inference.{limitations_block}"
     )
     return _format_context(selected, prefix), selected
 

@@ -17,7 +17,13 @@ from services.structured_vision import (
     detect_compact_graph_panel_ids,
     detect_visual_type,
     format_structured_result,
+    validate_graph,
     validate_table,
+)
+from services.scientific_metrics import (
+    best_by_metric,
+    grounded_table_trends,
+    infer_metric_semantics,
 )
 from services.text_table import compare_tables, extract_text_table
 from services.visual_reference_parser import parse_visual_reference
@@ -90,6 +96,108 @@ def _associated_graph_text(document, page_index: int, page_text: str) -> str:
         else "unknown"
     )
     return f"[TARGET FIGURE ORIENTATION: {orientation}]\n" + "\n\n".join(parts)
+
+
+def _validated_graph_table_fallback(
+    question: str,
+    figure_number: str,
+    caption: str,
+    evidence_text: str,
+) -> dict | None:
+    """Build a complete graph object from an explicitly associated statistical table."""
+    trends = grounded_table_trends(evidence_text)
+    semantics = infer_metric_semantics(evidence_text)
+    if not trends or not semantics:
+        return None
+    orientation_match = re.search(
+        r"\[TARGET FIGURE ORIENTATION:\s*(radial|tangential)\]",
+        evidence_text,
+        re.IGNORECASE,
+    )
+    orientation = orientation_match.group(1).lower() if orientation_match else ""
+    metrics = []
+    for panel, metric in re.findall(r"\(([A-Za-z])\)\s*(RDM|MAG)\b", caption, re.I):
+        metrics.append((panel.lower(), metric.upper()))
+    if not metrics:
+        metrics = [
+            (chr(ord("a") + index), metric)
+            for index, metric in enumerate(dict.fromkeys(row["metric"] for row in trends.values()))
+        ]
+    panels, comparisons = [], []
+    for panel_id, metric in metrics:
+        rows = [
+            row for row in trends.values()
+            if row["metric"].casefold() == metric.casefold()
+            and (not orientation or row.get("orientation") == orientation)
+        ]
+        if len(rows) < 2 or metric not in semantics:
+            return None
+        positions = rows[0]["positions"]
+        if any(row["positions"] != positions for row in rows):
+            return None
+        display_rows = []
+        for row in rows:
+            display_rows.append({
+                **row,
+                "series": re.sub(r"\bPI-\s+FEM\b", "PI-FEM", str(row["series"]), flags=re.I),
+            })
+        all_values = [value for row in display_rows for value in row["values"]]
+        panel = {
+            "panel": panel_id,
+            "graph_kind": "other",
+            "group": f"{orientation.title()} direction" if orientation else "Associated experiment",
+            "x_axis": {
+                "label": "Source eccentricity", "unit": "%", "scale": "linear",
+                "tick_labels": positions, "scientific_multiplier": None,
+            },
+            "y_axis": {
+                "label": metric, "unit": "", "scale": "linear",
+                "tick_labels": [], "scientific_multiplier": None,
+            },
+            "series": [row["series"] for row in display_rows],
+            "visible_range": {
+                "min": min(all_values), "max": max(all_values), "unit": "",
+                "confidence": 0.99,
+            },
+            "shape_features": ["boxplot means recovered from the associated statistical table"],
+            "complexity_score": 0.0,
+            "visible_trends": [
+                f"{row['series']}: {row['classification']}; values "
+                + ", ".join(f"{position}={value:g}" for position, value in zip(positions, row["values"]))
+                for row in display_rows
+            ],
+        }
+        panels.append(panel)
+        winners = []
+        for column in range(len(positions)):
+            winner = best_by_metric(
+                {row["series"]: row["values"][column] for row in display_rows},
+                semantics[metric],
+            )
+            winners.append(winner)
+        if winners and len(set(winners)) == 1 and winners[0]:
+            target = semantics[metric].get("target_value")
+            target_text = f"target {target:g}" if isinstance(target, (int, float)) else "metric target"
+            comparisons.append({
+                "claim": (
+                    f"{winners[0]} is closer to the {metric} {target_text} at all "
+                    f"{len(positions)} {orientation + ' ' if orientation else ''}source eccentricities "
+                    "in the associated table."
+                ),
+                "subject": winners[0], "relation": "other", "metric": f"{metric} accuracy",
+                "evidence": ["text"], "confidence": 0.99,
+                "uncertain": False, "evidence_conflict": False,
+            })
+    if not panels:
+        return None
+    return validate_graph({
+        "figure_number": str(figure_number or ""),
+        "panels": panels,
+        "comparisons": comparisons,
+        "metric_semantics": semantics,
+        "frequency_direction_evidence": [],
+        "uncertain_values": [],
+    }, evidence_text)
 
 
 def _render_page_image(
@@ -1465,6 +1573,28 @@ def _analyse_typed_page(
             debug_info=analysis_debug,
             fit_verification_images=fit_verification_images,
         )
+        if visual_type == "graph" and not str(
+            analysis_debug.get("final_answer_path", "")
+        ).startswith("validated"):
+            graph_fallback = _validated_graph_table_fallback(
+                question,
+                _figure_number(question) or "",
+                target_caption[1] if target_caption else "",
+                combined_evidence,
+            )
+            if graph_fallback is not None:
+                analysis_debug.update({
+                    "vision_graph_validation_error": analysis_debug.get("validation_error", ""),
+                    "validated_json": graph_fallback,
+                    "repaired_json": graph_fallback,
+                    "final_structured_output": graph_fallback,
+                    "rendered_structured_object": graph_fallback,
+                    "final_validation_result": "passed",
+                    "validation_error": "",
+                    "final_answer_path": "validated_graph_with_table_evidence_fallback",
+                    "final_answer_code_path": "validated_graph_with_table_evidence_fallback",
+                })
+                return format_structured_result("graph", graph_fallback)
         if visual_type != "table":
             return answer
 

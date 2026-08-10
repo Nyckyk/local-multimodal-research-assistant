@@ -100,7 +100,7 @@ _LIMITATION_ANSWER_PATTERNS = {
     "fixed_tissue_properties": r"\bfixed\b.{0,80}\btissue properties\b|\btissue properties\b.{0,80}\bfixed\b",
     "no_phase_changes": r"\b(?:no|exclude[ds]?)\b.{0,50}\bphase changes?\b|\bphase changes?\b.{0,50}\b(?:absent|excluded)\b",
     "no_chemical_reactions": r"\b(?:no|exclude[ds]?)\b.{0,50}\bchemical reactions?\b|\bchemical reactions?\b.{0,50}\b(?:absent|excluded)\b",
-    "local_thermal_equilibrium": r"\blocal\w* thermal equilibrium\b|\bblood.tissue thermal equilibrium\b",
+    "local_thermal_equilibrium": r"\bblood.tissue thermal equilibrium\b",
     "uniform_incident_irradiance": r"\buniform\b.{0,80}\bincident irradiance\b|\bincident irradiance\b.{0,80}\buniform\b",
     "simplified_environment": r"\b(?:walls?|metallic enclosures?|simplified environmental geometry|unobstructed environment)\b",
     "benchmark_validation": r"\bnew experimental human data\b",
@@ -118,6 +118,38 @@ def _missing_inferred_limitations(answer: str, items: list[dict]) -> list[dict]:
             re.IGNORECASE | re.DOTALL,
         )
     ]
+
+
+def _validated_explicit_limitations(context: str) -> list[dict]:
+    marker = "[EXPLICIT AUTHOR LIMITATIONS]"
+    _, found, remainder = str(context or "").partition(marker)
+    if not found or (start := remainder.find("{")) < 0:
+        return []
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(remainder[start:])
+    except (json.JSONDecodeError, TypeError):
+        return []
+    items = payload.get("items", []) if isinstance(payload, dict) else []
+    return [
+        item for item in items
+        if isinstance(item, dict) and item.get("key") and item.get("statement")
+    ]
+
+
+def _missing_explicit_limitations(answer: str, items: list[dict]) -> list[dict]:
+    normalized_answer = set(re.findall(r"[a-z][a-z-]{3,}", str(answer or "").casefold()))
+    missing = []
+    for item in items:
+        statement_tokens = {
+            token for token in re.findall(
+                r"[a-z][a-z-]{3,}", str(item.get("statement", "")).casefold()
+            )
+            if token not in {"than", "more", "method", "study", "hybrid"}
+        }
+        overlap = len(statement_tokens.intersection(normalized_answer))
+        if statement_tokens and overlap / len(statement_tokens) < 0.55:
+            missing.append(item)
+    return missing
 
 
 def _remove_efficiency_contradiction(context: str, answer: str) -> tuple[str, bool]:
@@ -176,7 +208,7 @@ def _qualify_inferred_depth_language(answer: str) -> tuple[str, bool]:
     qualified = []
     for part in parts:
         if re.search(r"\bheating depth\b|\bpenetration\b", part, re.I) and not re.search(
-            r"\b(?:infer\w*|contours?|absorbed[ -]power|spatial)\b", part, re.I
+            r"\b(?:infer\w*|contours?|spatial)\b", part, re.I
         ):
             part = re.sub(
                 r"\bheating depth\b",
@@ -370,6 +402,7 @@ def generate_answer(
     requested_sections = _requested_summary_sections(question) if summary_mode else []
     grounded_items = _validated_framework_items(context)
     inferred_limitations = _validated_inferred_limitations(context)
+    explicit_limitations = _validated_explicit_limitations(context)
     section_rule = ""
     if len(requested_sections) >= 2:
         section_rule = (
@@ -409,9 +442,12 @@ EVIDENCE RULES:
     constraints in the limitations section and explicitly label them as
     limitations inferred from stated assumptions, not limitations declared by
     the authors.
-13. Distinguish a convenient one-step or coupled formulation from measured
+  13. Distinguish a convenient one-step or coupled formulation from measured
     computation time. Never call a method faster or more efficient overall
-    when the evidence reports that it is more time-consuming.
+     when the evidence reports that it is more time-consuming.
+  14. When EXPLICIT AUTHOR LIMITATIONS is present and the question asks for
+      limitations in the plural, include every validated item and keep it
+      separate from inferred constraints.
 {section_rule}
 
 Supplied evidence:
@@ -462,6 +498,9 @@ text or the labelled visual analysis.
     missing_inferred_limitations = _missing_inferred_limitations(
         answer, inferred_limitations
     )
+    missing_explicit_limitations = _missing_explicit_limitations(
+        answer, explicit_limitations
+    )
     incomplete_ending = _ends_incomplete(answer)
     length_limited = done_reason.casefold() in {
         "length", "max_tokens", "max token", "num_predict",
@@ -469,6 +508,7 @@ text or the labelled visual analysis.
     needs_continuation = (
         length_limited or incomplete_ending or bool(missing_sections)
         or bool(missing_grounded_items) or bool(missing_inferred_limitations)
+        or bool(missing_explicit_limitations)
     )
     attempts = [{
         "done": bool(_response_value(response, "done", False)),
@@ -490,6 +530,12 @@ text or the labelled visual analysis.
             missing_parts.append(
                 "grounded inferred limitations: " + "; ".join(
                     item["statement"] for item in missing_inferred_limitations
+                )
+            )
+        if missing_explicit_limitations:
+            missing_parts.append(
+                "explicit author limitations: " + "; ".join(
+                    item["statement"] for item in missing_explicit_limitations
                 )
             )
         missing_text = "; ".join(missing_parts) or "the unfinished final thought"
@@ -528,6 +574,9 @@ text or the labelled visual analysis.
     final_missing_limitations = _missing_inferred_limitations(
         answer, inferred_limitations
     )
+    final_missing_explicit_limitations = _missing_explicit_limitations(
+        answer, explicit_limitations
+    )
     grounded_items_appended = []
     if final_missing_grounded:
         grounded_items_appended = list(final_missing_grounded)
@@ -559,6 +608,18 @@ text or the labelled visual analysis.
         final_missing_limitations = _missing_inferred_limitations(
             answer, inferred_limitations
         )
+    explicit_limitations_appended = []
+    if final_missing_explicit_limitations:
+        explicit_limitations_appended = [
+            item["key"] for item in final_missing_explicit_limitations
+        ]
+        statements = "\n".join(
+            f"- {item['statement']}" for item in final_missing_explicit_limitations
+        )
+        answer = f"{answer.rstrip()}\n\n**Additional explicit author limitations**\n\n{statements}"
+        final_missing_explicit_limitations = _missing_explicit_limitations(
+            answer, explicit_limitations
+        )
     answer, transient_comparison_appended = _append_grounded_transient_comparison(
         context, answer
     )
@@ -586,6 +647,9 @@ text or the labelled visual analysis.
             "initial_missing_inferred_limitations": [
                 item["key"] for item in missing_inferred_limitations
             ],
+            "initial_missing_explicit_limitations": [
+                item["key"] for item in missing_explicit_limitations
+            ],
             "initial_incomplete_ending": incomplete_ending,
             "initial_length_limited": length_limited,
             "continuation_used": len(attempts) == 2,
@@ -594,8 +658,12 @@ text or the labelled visual analysis.
             "final_missing_inferred_limitations": [
                 item["key"] for item in final_missing_limitations
             ],
+            "final_missing_explicit_limitations": [
+                item["key"] for item in final_missing_explicit_limitations
+            ],
             "grounded_items_appended": grounded_items_appended,
             "inferred_limitations_appended": inferred_limitations_appended,
+            "explicit_limitations_appended": explicit_limitations_appended,
             "grounded_transient_comparison_appended": transient_comparison_appended,
             "multi_figure_details_appended": multi_figure_details_appended,
             "multi_figure_contradiction_removed": contradiction_removed,

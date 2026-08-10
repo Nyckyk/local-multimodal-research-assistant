@@ -790,6 +790,88 @@ def normalize_composite_diagram_endpoints(value: dict) -> dict:
     return corrected
 
 
+def extract_caption_panel_mappings(evidence_text: str) -> list[dict]:
+    """Recover panel-scoped symbol definitions from an explicit figure caption."""
+    evidence = str(evidence_text or "")
+    caption = evidence
+    marker = "TARGET FIGURE CAPTION (authoritative for this crop):"
+    if marker in evidence:
+        caption = evidence.split(marker, 1)[1].split("PAGE TEXT CROSS-CHECK:", 1)[0]
+    panel_matches = list(re.finditer(r"\(([A-Za-z])\)", caption))
+    mappings = []
+    for index, panel_match in enumerate(panel_matches):
+        body = caption[
+            panel_match.end():
+            panel_matches[index + 1].start() if index + 1 < len(panel_matches) else len(caption)
+        ]
+        definition = re.search(
+            r"((?:S\s*\d+\s*,?\s*(?:and\s*)?)+)\s+are\s+the\s+"
+            r"interfaces?\s+between\s+(.+?),\s*respectively",
+            body,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not definition:
+            continue
+        labels = re.findall(r"S\s*(\d+)", definition.group(1), re.IGNORECASE)
+        interfaces = [
+            re.sub(r"\s+", " ", item).strip(" ,.;")
+            for item in re.split(r"\s*,\s*(?:and\s+)?|\s+and\s+", definition.group(2))
+            if item.strip(" ,.;")
+        ]
+        if len(labels) != len(interfaces):
+            continue
+        mappings.append({
+            "panel": panel_match.group(1).upper(),
+            "mappings": [
+                {"label": f"S{number}", "interface": interface}
+                for number, interface in zip(labels, interfaces)
+            ],
+            "source": "caption",
+        })
+    return mappings
+
+
+def apply_caption_panel_mappings(value: dict, evidence_text: str) -> dict:
+    """Make explicit caption mappings authoritative without mixing panel scopes."""
+    mappings = extract_caption_panel_mappings(evidence_text)
+    if not mappings:
+        return value
+    corrected = deepcopy(value)
+    corrected["panel_mappings"] = mappings
+    corrected["connections"] = [
+        connection for connection in corrected.get("connections", [])
+        if not (
+            isinstance(connection, dict)
+            and any(
+                re.fullmatch(r"S\s*\d+", str(connection.get(field, "")).strip(), re.I)
+                for field in ("from", "to")
+            )
+        )
+    ]
+    sentences = re.split(r"(?<=[.!?])\s+", str(corrected.get("explanation", "")))
+    sentences = [
+        sentence for sentence in sentences
+        if not (
+            re.search(r"\bS\s*\d+\b", sentence, re.I)
+            and re.search(r"\b(?:interface|corresponds?|means?|panel)\b|=", sentence, re.I)
+        )
+    ]
+    mapping_text = " ".join(
+        f"Panel {panel['panel']}: "
+        + "; ".join(
+            f"{item['label']} = {item['interface']}" for item in panel["mappings"]
+        )
+        + "."
+        for panel in mappings
+    )
+    base = " ".join(sentence.strip() for sentence in sentences if sentence.strip())
+    corrected["explanation"] = (
+        f"{base}\n\nCaption-defined panel mappings: {mapping_text}" if base
+        else f"Caption-defined panel mappings: {mapping_text}"
+    )
+    return corrected
+
+
 def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
     if not isinstance(value, dict):
         raise StructuredOutputError("Labelled diagram response must be an object.")
@@ -974,7 +1056,7 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
             "Caption/text states a component-specific series relationship "
             "missing from the diagram result."
         )
-    return value
+    return apply_caption_panel_mappings(value, evidence_text)
 
 
 def enrich_boundary_conditions(
@@ -2605,13 +2687,66 @@ Previous response: {raw[:4000]}
 """
 
 
+def _markdown_table(columns: list, rows: list[list]) -> list[str]:
+    lines = [" | ".join(map(str, columns)), " | ".join(["---"] * len(columns))]
+    lines.extend(
+        " | ".join("unreadable" if cell is None else str(cell) for cell in row)
+        for row in rows
+    )
+    return lines
+
+
+def _format_hierarchical_table(value: dict) -> list[str] | None:
+    """Split a very wide spanning-header table into readable sibling subtables."""
+    columns = value.get("columns") or []
+    header_rows = value.get("header_rows") or []
+    spans = [span for span in value.get("header_spans") or [] if span.get("row") == 0]
+    if len(columns) <= 8 or not header_rows or len(spans) < 2:
+        return None
+    covered = {
+        index for span in spans
+        for index in range(int(span["start_column"]), int(span["end_column"]) + 1)
+    }
+    descriptors = [index for index in range(len(columns)) if index not in covered]
+    lines = []
+    for span in spans:
+        indices = [
+            *descriptors,
+            *range(int(span["start_column"]), int(span["end_column"]) + 1),
+        ]
+        leaf = header_rows[-1]
+        subcolumns = [
+            (leaf[index] or columns[index].split("/")[-1].strip())
+            if index < len(leaf) else columns[index]
+            for index in indices
+        ]
+        if descriptors:
+            subcolumns[0] = "Metric"
+        lines.extend([
+            f"**{span['label']}**",
+            "",
+            *_markdown_table(
+                subcolumns,
+                [[row[index] for index in indices] for row in value["rows"]],
+            ),
+            "",
+        ])
+    return lines[:-1]
+
+
 def format_structured_result(visual_type: str, value: dict) -> str:
     if visual_type == "table":
         title = value.get("title") or f"Table {value.get('table_number', '')}".strip()
-        lines = [f"**{title}**", "", " | ".join(map(str, value["columns"]))]
-        lines.append(" | ".join(["---"] * len(value["columns"])))
-        for row in value["rows"]:
-            lines.append(" | ".join("unreadable" if cell is None else str(cell) for cell in row))
+        if value.get("header_rows"):
+            first_group = next(
+                (str(cell).strip() for cell in value["header_rows"][0] if cell),
+                "",
+            )
+            if first_group and first_group in title:
+                title = title.split(first_group, 1)[0].rstrip(" .")
+        hierarchical = _format_hierarchical_table(value)
+        lines = [f"**{title}**", ""]
+        lines.extend(hierarchical or _markdown_table(value["columns"], value["rows"]))
         if value["comparisons"]:
             lines.extend(["", *[f"- {item}" for item in value["comparisons"]]])
         return "\n".join(lines)
@@ -2640,6 +2775,16 @@ def format_structured_result(visual_type: str, value: dict) -> str:
             lines.append("\n**Uncertain:** " + ", ".join(map(str, value["uncertain_values"])))
         return "\n".join(lines)
     lines = [value["explanation"]]
+    if value.get("panel_mappings"):
+        lines.append("\n**Caption-defined panel mappings:**")
+        for panel in value["panel_mappings"]:
+            lines.append(
+                f"- Panel {panel['panel']}: "
+                + "; ".join(
+                    f"{item['label']} = {item['interface']}"
+                    for item in panel["mappings"]
+                )
+            )
     if value["components"]:
         if value.get("circuit_topology"):
             lines.append("\n**Components:**")
