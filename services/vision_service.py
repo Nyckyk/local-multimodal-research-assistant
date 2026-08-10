@@ -11,6 +11,7 @@ import ollama
 from settings import VISION_MODEL
 
 from services.structured_vision import (
+    DIAGRAM_TYPES,
     analyse_compact_multi_panel_graph,
     analyse_typed_image,
     detect_compact_graph_panel_ids,
@@ -55,6 +56,40 @@ def _associated_boundary_text(document, page_index: int) -> str:
         if excerpt:
             parts.append(f"Associated PDF page {index + 1}:\n{excerpt}")
     return "\n\n".join(parts)
+
+
+def _associated_graph_text(document, page_index: int, page_text: str) -> str:
+    """Bring metric definitions and matching statistical tables to a graph."""
+    metrics = [name for name in ("RDM", "MAG") if re.search(rf"\b{name}\b", page_text)]
+    parts = []
+    for index in range(max(0, page_index - 8), min(len(document), page_index + 3)):
+        text = document[index].get_text("text") or ""
+        has_definition = metrics and all(re.search(rf"\b{name}\b", text) for name in metrics) and re.search(
+            r"\b(?:defined as|magnitude ratio|relative difference measure)\b", text, re.I
+        )
+        has_table = re.search(r"\bTABLE\s+\w+", text, re.I) and any(
+            token in text for token in re.findall(r"\bExample\s+[IVX]+\b", page_text, re.I)
+        )
+        if has_definition or has_table:
+            structured = ""
+            if has_table and (number := re.search(r"\bTABLE\s+([^\s.:]+(?:\.\d+)?)", text, re.I)):
+                try:
+                    table = extract_text_table(document[index], number.group(1), "Extract this statistical table.")
+                    if table:
+                        structured = "\n[STRUCTURED STATISTICAL TABLE]\n" + json.dumps(table, ensure_ascii=False)
+                except Exception:
+                    structured = ""
+            block = f"PDF page {index + 1}:\n{text[:9000]}{structured}"
+            if structured and re.search(r'"(?:RDM|MAG)"', structured):
+                parts.insert(0, block)
+            else:
+                parts.append(block)
+    orientation = (
+        "radial" if re.search(r"\bradial dipole", page_text, re.I)
+        else "tangential" if re.search(r"\btangential dipole", page_text, re.I)
+        else "unknown"
+    )
+    return f"[TARGET FIGURE ORIENTATION: {orientation}]\n" + "\n\n".join(parts)
 
 
 def _render_page_image(
@@ -1240,7 +1275,7 @@ def _analyse_typed_page(
         if target_caption
         else ""
     )
-    if visual_type == "labelled_diagram" and re.search(
+    if visual_type in DIAGRAM_TYPES and re.search(
         r"\bboundary conditions?\b", question, re.I
     ):
         combined_evidence = (
@@ -1550,12 +1585,16 @@ def analyse_pdf_page(
                 analysis_text_evidence = (
                     f"{associated}\n\n{analysis_text_evidence}"
                 ).strip()
+        if visual_type == "graph":
+            associated = _associated_graph_text(document, page_number - 1, page_text)
+            if associated:
+                analysis_text_evidence = f"{associated}\n\n{analysis_text_evidence}".strip()
 
         # Graphs and tables must be dispatched before the legacy grouping
         # keyword check because their legends/rows commonly contain "groups".
         # Non-grouping diagrams use their own relationship schema as well.
         if visual_type in {"graph", "table"} or (
-            visual_type == "labelled_diagram" and not _is_grouping_question(question)
+            visual_type in DIAGRAM_TYPES and not _is_grouping_question(question)
         ):
             return _analyse_typed_page(
                 page,

@@ -10,6 +10,8 @@ from pathlib import Path
 import fitz
 import ollama
 
+from services.scientific_metrics import grounded_table_trends, infer_metric_semantics
+
 from settings import NYQUIST_LOCAL_DEVIATION_THRESHOLD, VISION_MODEL
 
 STRUCTURED_NUM_PREDICT = 1800
@@ -17,7 +19,11 @@ COMPACT_PANEL_NUM_PREDICT = 650
 COMPACT_COMPARISON_NUM_PREDICT = 350
 AXIS_LABEL_NUM_PREDICT = 220
 NYQUIST_FIT_NUM_PREDICT = 260
-VISUAL_TYPES = {"labelled_diagram", "graph", "table"}
+DIAGRAM_TYPES = {
+    "labelled_diagram", "anatomical_schematic", "circuit", "flowchart",
+    "microscopy_photo", "contour_heatmap",
+}
+VISUAL_TYPES = {*DIAGRAM_TYPES, "graph", "table"}
 VISUAL_IDENTIFIER_PATTERN = r"(?:[A-Za-z]\.)?\d+(?:\.\d+)?|[A-Za-z]\d+"
 
 
@@ -130,11 +136,24 @@ def detect_visual_type(question: str, page_text: str = "") -> str | None:
         if caption:
             relevant_text += " " + caption.group(0).lower()
 
+    if re.search(r"\b(contour|heatmap|isothermal|spatial distribution)\b", relevant_text):
+        return "contour_heatmap"
+    if re.search(r"\b(micrograph|microscopy|histology|photograph|photo)\b", relevant_text):
+        return "microscopy_photo"
+    if re.search(r"\b(flowchart|workflow|decision tree|process flow)\b", relevant_text):
+        return "flowchart"
+    if re.search(r"\b(circuit|resistor|capacitor|impedance topology)\b", relevant_text):
+        return "labelled_diagram"
     if re.search(
-        r"\b(graph|plot|chart|bode|nyquist|axis|axes|curve|trend|panel|spectrum)\b",
+        r"\b(graph|plot|chart|boxplot|bode|nyquist|axis|axes|curve|trend|spectrum)\b",
         relevant_text,
     ):
         return "graph"
+    if re.search(
+        r"\b(anatomical|head model|tissue model|brain|skull|scalp|organ|layer model)\b",
+        relevant_text,
+    ):
+        return "anatomical_schematic"
     if re.search(
         r"\b(diagram|schematic|circuit|topology|component|connection|labelled|labeled)\b",
         relevant_text,
@@ -146,7 +165,7 @@ def detect_visual_type(question: str, page_text: str = "") -> str | None:
 
 
 def _schema_text(visual_type: str) -> str:
-    if visual_type == "labelled_diagram":
+    if visual_type in DIAGRAM_TYPES:
         return """{
   "diagram_kind": "circuit|other",
   "labels": ["..."],
@@ -198,6 +217,7 @@ def _schema_text(visual_type: str) -> str:
       "uncertain": false, "evidence_conflict": false
     }
   ],
+  "metric_semantics": {"metric": {"objective": "minimize|maximize|target_value|range|unknown", "target_value": null}},
   "frequency_direction_evidence": ["..."],
   "uncertain_values": ["..."]
 }"""
@@ -205,6 +225,8 @@ def _schema_text(visual_type: str) -> str:
         return """{
   "table_number": "...",
   "title": "...",
+  "header_rows": [["...", null]],
+  "header_spans": [{"row": 0, "start_column": 0, "end_column": 1, "label": "..."}],
   "columns": ["..."],
   "rows": [["...", null]],
   "units": {"column name": "unit or null"},
@@ -219,9 +241,10 @@ def build_structured_prompt(
     question: str,
     evidence_text: str = "",
 ) -> str:
-    evidence = evidence_text[:6000]
-    type_rules = {
-        "labelled_diagram": (
+    # Multi-panel scientific plots may need both an earlier metric definition
+    # and a later statistical table. Keep both local evidence blocks available.
+    evidence = evidence_text[:16000]
+    diagram_rule = (
             "Identify visible labels/components and explicit spatial or connective "
             "relationships. In a circuit, every connection endpoint must name a listed "
             "component, node or branch. In a biological diagram, a relationship endpoint "
@@ -234,7 +257,9 @@ def build_structured_prompt(
             "components into one edge string. Connections may reference component IDs, "
             "visible biological labels, node IDs or branch IDs. For a non-circuit, set "
             "circuit_topology to null. Ignore anything outside the cropped target figure."
-        ),
+        )
+    type_rules = {
+        **{name: diagram_rule for name in DIAGRAM_TYPES},
         "graph": (
             "Treat each visible panel independently. Preserve exact readable axis variable "
             "labels. Record visible tick labels and any scientific-notation multiplier "
@@ -787,6 +812,15 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
 
     value = normalize_composite_diagram_endpoints(value)
     value = normalize_boundary_diagram_endpoints(value, evidence_text)
+    for relationship in value["spatial_relationships"]:
+        if not isinstance(relationship, dict):
+            continue
+        relation = _normal_name(relationship.get("relationship", ""))
+        if relation in {"contains", "contain", "encloses", "enclose", "holds", "hold"}:
+            relationship["subject"], relationship["object"] = (
+                relationship.get("object"), relationship.get("subject")
+            )
+            relationship["relationship"] = "within"
     diagram_kind = str(value["diagram_kind"]).strip().lower()
     if diagram_kind not in {"circuit", "other"}:
         raise StructuredOutputError("diagram_kind must be circuit or other.")
@@ -1525,6 +1559,22 @@ def validate_graph(value: dict, evidence_text: str = "") -> dict:
             raise StructuredOutputError(
                 "Nyquist frequency direction was inferred without arrows, labels or grounded text."
             )
+    grounded_semantics = infer_metric_semantics(evidence_text)
+    if grounded_semantics:
+        value["metric_semantics"] = grounded_semantics
+    else:
+        value.setdefault("metric_semantics", {})
+    table_trends = grounded_table_trends(evidence_text)
+    value["grounded_trends"] = table_trends
+    if table_trends:
+        for panel in value["panels"]:
+            metric = str(panel.get("y_axis", {}).get("label", ""))
+            matching = [row for row in table_trends.values() if row["metric"].casefold() in metric.casefold()]
+            if matching:
+                panel["visible_trends"] = [
+                    f"{row['series']}: {row['classification']}; maximum at {row['maximum_position']}."
+                    for row in matching
+                ]
     return value
 
 
@@ -1545,11 +1595,22 @@ def validate_table(value: dict) -> dict:
             )
     if not isinstance(value["comparisons"], list) or not isinstance(value["unreadable_cells"], list):
         raise StructuredOutputError("Table comparison/unreadable fields are invalid.")
+    header_rows = value.get("header_rows", [])
+    if header_rows:
+        if not isinstance(header_rows, list) or not all(isinstance(row, list) for row in header_rows):
+            raise StructuredOutputError("Table header_rows must be a list of rows.")
+        raw_widths = {len(row) for row in header_rows}
+        if len(raw_widths) != 1:
+            raise StructuredOutputError("Hierarchical table header rows must have equal raw widths.")
+        if next(iter(raw_widths)) != len(value["columns"]):
+            raise StructuredOutputError("Expanded logical columns do not match the header width.")
+    if not isinstance(value.get("header_spans", []), list):
+        raise StructuredOutputError("Table header_spans must be a list.")
     return value
 
 
 def validate_typed_response(visual_type: str, value: dict, evidence_text: str = "") -> dict:
-    if visual_type == "labelled_diagram":
+    if visual_type in DIAGRAM_TYPES:
         return validate_labelled_diagram(value, evidence_text)
     if visual_type == "graph":
         return validate_graph(value, evidence_text)
@@ -2739,7 +2800,7 @@ def analyse_typed_image(
     fit_verification_images: list[tuple[str, Path]] | None = None,
 ) -> str:
     prompt = build_structured_prompt(visual_type, question, evidence_text)
-    circuit_context = visual_type == "labelled_diagram" and bool(re.search(
+    circuit_context = visual_type in DIAGRAM_TYPES and bool(re.search(
         r"\b(?:circuit|resistor|capacitor|impedance)\b",
         question,
         re.IGNORECASE,
@@ -2777,7 +2838,7 @@ def analyse_typed_image(
         errors.append(str(first_error))
         initial_validation_errors.append(str(first_error))
         topology_retry = (
-            visual_type == "labelled_diagram"
+            visual_type in DIAGRAM_TYPES
             and isinstance(parsed, dict)
             and str(parsed.get("diagram_kind", "")).lower() == "circuit"
             and _is_topology_error(first_error)
@@ -2865,7 +2926,7 @@ def analyse_typed_image(
                             "could_not_verify_topology"
                             if topology_retry or circuit_context
                             else "grounded_boundary_equation_fallback"
-                            if visual_type == "labelled_diagram" and re.search(
+                            if visual_type in DIAGRAM_TYPES and re.search(
                                 r"\bboundary conditions?\b", question, re.I
                             ) and grounded_boundary_synthesis(evidence_text)
                             else "grounded_caption_summary_fallback"
@@ -2893,7 +2954,7 @@ def analyse_typed_image(
                         evidence_text, visual_type, question
                     )
 
-    if visual_type == "labelled_diagram":
+    if visual_type in DIAGRAM_TYPES:
         value = enrich_boundary_conditions(value, evidence_text, question)
 
     fit_verification_raw = []
@@ -2935,7 +2996,7 @@ def analyse_typed_image(
                 if used_repair else "validated_structured_vision"
             ),
         })
-    if visual_type == "labelled_diagram" and re.search(
+    if visual_type in DIAGRAM_TYPES and re.search(
         r"\bboundary conditions?\b", question, re.I
     ):
         boundary_rendering = format_boundary_condition_result(value, evidence_text)

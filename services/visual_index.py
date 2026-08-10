@@ -14,10 +14,10 @@ from services.visual_reference_parser import canonical_identifier
 from settings import PAPERS_FOLDER, VISUAL_INDEX_PATH
 
 
-INDEX_VERSION = 3
+INDEX_VERSION = 5
 _IDENTIFIER = r"(?:[A-Za-z]\.)?\d+(?:\.\d+)?|[A-Za-z]\d+"
 _FIGURE_CAPTION_PATTERN = re.compile(
-    rf"^\s*(?P<kind>fig(?:ure)?\.?)\s*(?P<number>{_IDENTIFIER})\s*[.:]",
+    rf"^\s*(?P<kind>fig(?:ure)?\.?)\s*(?P<number>{_IDENTIFIER})(?:\s*[.:]\s*|\s+)(?P<title>.+)$",
     re.IGNORECASE,
 )
 _TABLE_ONLY_PATTERN = re.compile(
@@ -30,7 +30,7 @@ _TABLE_CAPTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _REFERENCE_VERBS = re.compile(
-    r"^(?:reports?|presents?|shows?|provides?|illustrates?|displays?|is|was)\b",
+    r"^(?:reports?|represents?|presents?|shows?|provides?|illustrates?|displays?|is|was)\b",
     re.IGNORECASE,
 )
 _REFERENCE_PATTERN = re.compile(
@@ -122,9 +122,11 @@ def _caption_blocks(page: fitz.Page) -> list[dict]:
     ]
     captions = []
     for index, block in enumerate(blocks):
+        figure_match = _FIGURE_CAPTION_PATTERN.match(block["text"])
         match = (
-            _FIGURE_CAPTION_PATTERN.match(block["text"])
-            or _TABLE_ONLY_PATTERN.match(block["text"])
+            figure_match
+            if figure_match and not _REFERENCE_VERBS.match(figure_match.group("title"))
+            else _TABLE_ONLY_PATTERN.match(block["text"])
         )
         if not match:
             table_match = _TABLE_CAPTION_PATTERN.match(block["text"])

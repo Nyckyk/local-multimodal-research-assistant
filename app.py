@@ -9,6 +9,7 @@ from rag.ingestion import index_pdf
 from rag.retrieval import retrieve_context
 from services.equation_service import analyse_resolved_equation
 from services.ollama_service import generate_answer
+from services.multi_target import analyse_equation_chain, analyse_visual_targets
 from services.query_rewriter import rewrite_question
 from services.visual_fallback import resolve_with_visual_fallback
 from services.visual_index import load_or_build_visual_index, visual_index_needs_rebuild
@@ -17,6 +18,7 @@ from services.visual_locator import (
     format_resolution_problem,
     manual_visual_resolution,
     resolve_visual_target,
+    resolve_visual_targets,
     should_activate_automatic_vision,
 )
 from services.visual_reference_parser import has_visual_reference
@@ -359,15 +361,18 @@ if question:
                 collection=collection,
                 embedder=embedder,
                 reranker=reranker,
+                selected_source=preferred_pdf.name if preferred_pdf else None,
             )
 
             visual_answer = ""
             equation_answer = ""
+            multi_answer = ""
             vision_error = ""
             equation_error = ""
             visual_context = ""
             vision_debug = {"_save_crops": vision_debug_enabled}
             equation_debug = {}
+            multi_debug = {"_save_crops": vision_debug_enabled}
             text_generation_debug = {}
             resolution_fallback_debug = {}
             previous_visual_evidence = next(
@@ -391,12 +396,13 @@ if question:
                     source.get("pdf", source.get("source", ""))
                     for source in message_sources if isinstance(source, dict)
                 )
+            multi_resolutions = []
             if manual_visual_override and manual_pdf is not None:
                 resolution = manual_visual_resolution(
                     manual_pdf, int(manual_page_number), question
                 )
             elif automatic_visual_detection:
-                resolution = resolve_visual_target(
+                multi_resolutions = resolve_visual_targets(
                     question=question,
                     index=visual_index,
                     selected_pdf=preferred_pdf,
@@ -404,6 +410,7 @@ if question:
                     current_source_names=previous_sources,
                     embedder=embedder,
                 )
+                resolution = multi_resolutions[0]
                 if resolution.target_type != "equation" and has_visual_reference(question) and (
                     resolution.status == "not_found"
                     or (
@@ -421,13 +428,31 @@ if question:
                         )
             else:
                 resolution = resolve_visual_target(question, {"files": {}})
+                multi_resolutions = []
 
             use_vision = (
                 manual_visual_override and resolution.target_type != "equation"
             ) or should_activate_automatic_vision(question, resolution)
             selected_pdf = Path(resolution.pdf_path) if resolution.pdf_path else None
             vision_page_number = resolution.page_number or 1
-            if resolution.status == "resolved" and resolution.target_type == "equation":
+            if len(multi_resolutions) > 1:
+                target_types = {item.target_type for item in multi_resolutions}
+                try:
+                    if target_types == {"equation"}:
+                        multi_answer = analyse_equation_chain(
+                            question, multi_resolutions,
+                            conversation_history=conversation_history,
+                            debug_info=multi_debug,
+                        )
+                    elif "equation" not in target_types:
+                        multi_answer = analyse_visual_targets(
+                            question, multi_resolutions, text_evidence=context,
+                            conversation_history=conversation_history,
+                            debug_info=multi_debug,
+                        )
+                except Exception as error:
+                    equation_error = str(error)
+            if not multi_answer and resolution.status == "resolved" and resolution.target_type == "equation":
                 try:
                     equation_answer = analyse_resolved_equation(
                         question,
@@ -437,7 +462,7 @@ if question:
                     )
                 except Exception as error:
                     equation_error = str(error)
-            if use_vision and selected_pdf is not None:
+            if not multi_answer and use_vision and selected_pdf is not None:
                 if not manual_visual_override:
                     st.info(
                         "Automatically detected:\n\n"
@@ -480,7 +505,18 @@ if question:
             evidence = None
             visual_reference_requested = has_visual_reference(question)
 
-            if equation_answer:
+            if multi_answer:
+                answer = multi_answer
+                resolved_multi = [item for item in multi_resolutions if item.status == "resolved"]
+                first = resolved_multi[0] if resolved_multi else resolution
+                evidence = {
+                    "summary": "Grounded ordered multi-target analysis.",
+                    "analysis_kind": "Multi-target analysis",
+                    "pdf": first.pdf_name or "Unknown source",
+                    "page": int(first.page_number or 1),
+                    "visual_targets": [item.to_dict() for item in multi_resolutions],
+                }
+            elif equation_answer:
                 answer = (
                     f"{equation_answer}\n\n"
                     f"Source: **{resolution.pdf_name}**, "
@@ -571,7 +607,13 @@ if question:
 
                 if visual_reference_requested or manual_visual_override:
                     st.markdown("### Visual target resolution")
-                    st.json(resolution.to_dict())
+                    st.json(
+                        [item.to_dict() for item in multi_resolutions]
+                        if len(multi_resolutions) > 1 else resolution.to_dict()
+                    )
+                    if len(multi_resolutions) > 1:
+                        st.markdown("### Multi-target analysis")
+                        st.json(multi_debug)
                     if resolution_fallback_debug:
                         st.markdown("### Local vision resolution fallback")
                         st.json(resolution_fallback_debug)

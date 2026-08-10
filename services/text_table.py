@@ -155,8 +155,115 @@ def _selection_comparison(question: str, columns: list[str], rows: list[list]) -
     ]
 
 
+def _clean_cell(value):
+    if value is None:
+        return None
+    return _clean(value).replace("−", "−")
+
+
+def _expanded_headers(header_rows: list[list]) -> tuple[list[str], list[dict]]:
+    width = len(header_rows[0])
+    expanded_rows, spans = [], []
+    for row_index, raw in enumerate(header_rows):
+        row = [_clean_cell(cell) for cell in raw]
+        expanded = list(row)
+        last = None
+        span_start = None
+        for index, cell in enumerate(row):
+            if cell:
+                if last is not None and span_start is not None and index - 1 > span_start:
+                    spans.append({"row": row_index, "start_column": span_start, "end_column": index - 1, "label": last})
+                last, span_start = cell, index
+            elif last is not None:
+                expanded[index] = last
+        if last is not None and span_start is not None and width - 1 > span_start:
+            spans.append({"row": row_index, "start_column": span_start, "end_column": width - 1, "label": last})
+        expanded_rows.append(expanded)
+    columns = []
+    for column in range(width):
+        parts = []
+        for row in expanded_rows:
+            value = row[column]
+            if value and (not parts or parts[-1].casefold() != value.casefold()):
+                parts.append(value)
+        columns.append(" / ".join(parts) if parts else ("Metric" if column == 0 else "Method" if column == 1 else f"Column {column + 1}"))
+    return columns, spans
+
+
+def _grounded_table_explanations(question: str, page_text: str, rows: list[list]) -> list[str]:
+    if not re.search(r"\b(?:explain|represent|mean|compare|why|what)\b", question, re.I):
+        return []
+    vocabulary = {
+        token.casefold() for row in rows for cell in row[:2] if cell
+        for token in re.findall(r"[A-Za-z][A-Za-z-]{4,}", str(cell))
+    }
+    sentences = re.split(r"(?<=[.!?])\s+", re.sub(r"\s+", " ", page_text))
+    grounded = []
+    for sentence in sentences:
+        lower = sentence.casefold()
+        table_term = bool(vocabulary.intersection(re.findall(r"[a-z][a-z-]{4,}", lower)))
+        table_term = table_term or any(
+            token[:7] in lower for token in vocabulary if len(token) >= 7
+        )
+        if table_term and re.search(
+            r"\b(?:defined as|ratio of|intervals? shown|values?.{0,30}(?:used|chosen|sampled)|represent)\b",
+            lower,
+        ):
+            grounded.append(sentence.strip())
+    return list(dict.fromkeys(grounded))[:3]
+
+
+def _extract_native_table(page, table_number: str, question: str) -> dict | None:
+    """Use PyMuPDF's local ruled-table detector, preserving spanning headers."""
+    try:
+        tables = page.find_tables().tables
+    except Exception:
+        return None
+    page_text = page.get_text("text") or ""
+    marker = re.search(
+        rf"TABLE\s*{re.escape(str(table_number))}\b\s*(.*?)(?=\n(?:[A-Z][A-Za-z ]+\n){2,}|\Z)",
+        page_text, re.I | re.S,
+    )
+    for detected in tables:
+        raw = detected.extract()
+        if not raw or len(raw) < 2:
+            continue
+        width = max(len(row) for row in raw)
+        raw = [list(row) + [None] * (width - len(row)) for row in raw]
+        hierarchical = any(cell is None for cell in raw[0]) and len(raw) > 2
+        header_count = 2 if hierarchical else 1
+        header_rows = [[_clean_cell(cell) for cell in row] for row in raw[:header_count]]
+        columns, spans = _expanded_headers(header_rows)
+        rows, inherited_first = [], None
+        for raw_row in raw[header_count:]:
+            row = [_clean_cell(cell) for cell in raw_row]
+            if row[0]:
+                inherited_first = row[0]
+            elif inherited_first and hierarchical:
+                row[0] = inherited_first
+            rows.append(row)
+        title_text = _clean(marker.group(1))[:500] if marker else ""
+        title = f"Table {table_number}" + (f". {title_text}" if title_text else "")
+        value = {
+            "table_number": str(table_number), "title": title,
+            "header_rows": header_rows, "header_spans": spans,
+            "columns": columns, "rows": rows, "units": {},
+            "comparisons": _selection_comparison(question, columns, rows)
+                + _grounded_table_explanations(question, page_text, rows),
+            "unreadable_cells": [
+                {"row": r, "column": columns[c]} for r, row in enumerate(rows)
+                for c, cell in enumerate(row) if cell is None
+            ],
+        }
+        return validate_table(value)
+    return None
+
+
 def extract_text_table(page, table_number: str, question: str = "") -> dict | None:
     """Parse a visually contiguous text table into the typed table schema."""
+    native = _extract_native_table(page, table_number, question)
+    if native is not None:
+        return native
     lines = _page_lines(page)
     marker_index = next((
         index for index, line in enumerate(lines)

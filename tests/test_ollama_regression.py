@@ -133,7 +133,8 @@ def _run_summary_case(case, artifact_writer):
     answer = ""
     try:
         context, sources = retrieve_context(
-            case["question"], "", get_collection(), load_embedder(), load_reranker()
+            case["question"], "", get_collection(), load_embedder(), load_reranker(),
+            selected_source=case["pdf_filename"],
         )
         debug.update({"context": context, "sources": sources})
         assert sources, "RAG returned no evidence"

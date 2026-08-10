@@ -9,6 +9,7 @@ from settings import NORMAL_NUM_PREDICT, OLLAMA_MODEL, SUMMARY_NUM_PREDICT
 _SUMMARY_SECTION_PATTERNS = {
     "research question": r"\b(?:research question|objective|aim|purpose)\b",
     "methods": r"\b(?:methods?|methodology|approach)\b",
+    "validation": r"\b(?:validation|verification|evaluation scenarios?|benchmarks?)\b",
     "main results": r"\b(?:main results?|results?|findings?)\b",
     "limitations": r"\blimitations?\b",
 }
@@ -38,10 +39,16 @@ def _requested_summary_sections(question: str) -> list[str]:
 
 
 def _missing_summary_sections(answer: str, requested: list[str]) -> list[str]:
-    return [
-        name for name in requested
-        if not re.search(_SUMMARY_SECTION_PATTERNS[name], answer, re.IGNORECASE)
-    ]
+    missing = []
+    for name in requested:
+        match = re.search(_SUMMARY_SECTION_PATTERNS[name], answer, re.IGNORECASE)
+        if not match:
+            missing.append(name)
+            continue
+        nearby = re.sub(r"\s+", " ", answer[match.end():match.end() + 420]).strip(" :#*-\n")
+        if len(re.findall(r"\b\w+\b", nearby)) < 6:
+            missing.append(name)
+    return missing
 
 
 def _validated_framework_items(context: str) -> list[str]:
@@ -90,13 +97,13 @@ def _validated_inferred_limitations(context: str) -> list[dict]:
 
 _LIMITATION_ANSWER_PATTERNS = {
     "numerical_2d": r"\b2D\b.{0,80}\b(?:numerical|model|simulation)\b|\b(?:numerical|model|simulation)\b.{0,80}\b2D\b",
-    "fixed_tissue_properties": r"\b(?:fixed|constant|uniform|unalterable|unvarying)\b.{0,120}\b(?:tissue|thermal|dielectric)?\s*propert|\b(?:tissue|thermal|dielectric)?\s*propert\w*\b.{0,120}\b(?:fixed|constant|unalterable|unvarying)\b",
+    "fixed_tissue_properties": r"\bfixed\b.{0,80}\btissue properties\b|\btissue properties\b.{0,80}\bfixed\b",
     "no_phase_changes": r"\b(?:no|exclude[ds]?)\b.{0,50}\bphase changes?\b|\bphase changes?\b.{0,50}\b(?:absent|excluded)\b",
     "no_chemical_reactions": r"\b(?:no|exclude[ds]?)\b.{0,50}\bchemical reactions?\b|\bchemical reactions?\b.{0,50}\b(?:absent|excluded)\b",
     "local_thermal_equilibrium": r"\blocal\w* thermal equilibrium\b|\bblood.tissue thermal equilibrium\b",
     "uniform_incident_irradiance": r"\buniform\b.{0,80}\bincident irradiance\b|\bincident irradiance\b.{0,80}\buniform\b",
     "simplified_environment": r"\b(?:walls?|metallic enclosures?|simplified environmental geometry|unobstructed environment)\b",
-    "benchmark_validation": r"\bvalidat\w*\b.{0,100}\b(?:benchmark|prior|previous|published)\b|\b(?:benchmark|prior|previous|published)\b.{0,100}\bvalidat\w*\b",
+    "benchmark_validation": r"\bnew experimental human data\b",
 }
 
 
@@ -111,6 +118,17 @@ def _missing_inferred_limitations(answer: str, items: list[dict]) -> list[dict]:
             re.IGNORECASE | re.DOTALL,
         )
     ]
+
+
+def _remove_efficiency_contradiction(context: str, answer: str) -> tuple[str, bool]:
+    if not re.search(r"\b(?:more time-consuming|three times|3 times)\b", context, re.I):
+        return answer, False
+    pattern = re.compile(
+        r"(?<=[.!?])\s+[^.!?]*\b(?:computationally more efficient|faster overall|less time-consuming)\b[^.!?]*[.!?]",
+        re.I,
+    )
+    cleaned, count = pattern.subn("", answer)
+    return cleaned.strip(), bool(count)
 
 
 def _context_source_blocks(context: str) -> list[str]:
@@ -391,6 +409,9 @@ EVIDENCE RULES:
     constraints in the limitations section and explicitly label them as
     limitations inferred from stated assumptions, not limitations declared by
     the authors.
+13. Distinguish a convenient one-step or coupled formulation from measured
+    computation time. Never call a method faster or more efficient overall
+    when the evidence reports that it is more time-consuming.
 {section_rule}
 
 Supplied evidence:
@@ -541,6 +562,9 @@ text or the labelled visual analysis.
     answer, transient_comparison_appended = _append_grounded_transient_comparison(
         context, answer
     )
+    answer, efficiency_contradiction_removed = _remove_efficiency_contradiction(
+        context, answer
+    )
     (
         answer,
         multi_figure_details_appended,
@@ -576,6 +600,7 @@ text or the labelled visual analysis.
             "multi_figure_details_appended": multi_figure_details_appended,
             "multi_figure_contradiction_removed": contradiction_removed,
             "multi_figure_depth_language_qualified": depth_language_qualified,
+            "efficiency_contradiction_removed": efficiency_contradiction_removed,
             "final_incomplete_ending": _ends_incomplete(answer),
             "response_characters": len(answer),
             "response_words": len(answer.split()),
