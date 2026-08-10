@@ -71,10 +71,58 @@ def test_multi_visual_partial_failure_retains_valid_target_and_names_missing():
     assert "Could not verify: Figure 10" in answer
 
 
+def test_resolved_visual_failure_retains_target_caption_and_author_text():
+    values = [_resolved("figure", "9", 15), _resolved("figure", "10", 16)]
+    values[0].caption = (
+        "Figure 9. realistic head model for radial dipole orientation, "
+        "(A) RDM and (B) MAG at six source eccentricities."
+    )
+    values[0].nearby_text = "The authors report radial realistic-head results."
+    values[1].caption = (
+        "Figure 10. realistic head model for tangential dipole orientation, "
+        "(A) RDM and (B) MAG at six source eccentricities."
+    )
+    captured = {}
+
+    def visual(question, resolution, text_evidence="", debug_info=None):
+        if resolution.target_number == "9":
+            raise ValueError("simulated vision failure")
+        debug_info.update({
+            "final_answer_path": "validated_typed_vision",
+            "validated_json": {"figure_number": "10", "panels": []},
+        })
+        return "validated Figure 10"
+
+    def answer(question, context, history, debug_info=None):
+        captured["context"] = context
+        return "Figure 9 is radial. Figure 10 is tangential."
+
+    debug = {}
+    with patch("services.multi_target.analyse_resolved_visual", side_effect=visual), patch(
+        "services.multi_target.generate_answer", side_effect=answer
+    ):
+        result = analyse_visual_targets("Compare Figures 9 and 10.", values, debug_info=debug)
+    assert "GROUNDED TEXT FALLBACK FOR FIGURE 9" in captured["context"]
+    assert "VALIDATED FIGURE 10" in captured["context"]
+    assert "Could not verify" not in result
+    assert [row["status"] for row in debug["targets"]] == [
+        "grounded_text_fallback", "resolved"
+    ]
+    assert debug["evidence_complete"] is True
+
+
 def test_multi_visual_synthesis_uses_target_metric_semantics_and_author_exception():
     values = [_resolved("figure", "9", 15), _resolved("figure", "10", 16)]
+    values[0].caption = (
+        "Figure 9. anisotropic four-layer realistic model for radial dipole "
+        "orientation. (A) RDM and (B) MAG at six source eccentricities."
+    )
+    values[1].caption = (
+        "Figure 10. anisotropic four-layer realistic model for tangential "
+        "dipole orientation. (A) RDM and (B) MAG at six source eccentricities."
+    )
     values[1].nearby_text = (
-        "The realistic-head method outperforms PI-FEM regarding RDM. "
+        "The realistic-head hybrid BE-FE method outperforms PI-FEM regarding RDM. "
         "With regard to MAG, hybrid BE-FE outperforms PI-FEM in both directions "
         "except at 98% source eccentricity."
     )
@@ -94,18 +142,32 @@ def test_multi_visual_synthesis_uses_target_metric_semantics_and_author_exceptio
         return f"validated figure {resolution.target_number}"
 
     wrong = (
-        "Hybrid BE-FE wins MAG at every eccentricity because higher MAG is superior. "
-        "Both metrics monotonically increase with a widening gap."
+        "Figure 10 is the radial-direction case. Hybrid BE-FE consistently "
+        "outperforms PI-FEM across all tested eccentricities because higher MAG "
+        "is superior. Higher eccentricity means the source moves deeper into the "
+        "brain. Both metrics monotonically increase with a widening gap."
     )
     debug = {}
     with patch("services.multi_target.analyse_resolved_visual", side_effect=visual), patch(
         "services.multi_target.generate_answer", return_value=wrong
     ) as generated:
         answer = analyse_visual_targets("Compare Figures 9 and 10.", values, debug_info=debug)
-    supplied = generated.call_args.args[1]
-    assert '"target_value": 1.0' in supplied
+    assert generated.call_count == 0
     assert "higher MAG is superior" not in answer
+    assert "consistently" not in answer and "all tested eccentricities" not in answer
     assert "monotonically" not in answer and "widening gap" not in answer
+    assert "deeper into the brain" not in answer
     assert "closeness to 1" in answer
     assert "except at 98% source eccentricity" in answer
+    assert "Figure 10 — tangential dipoles" in answer
+    contexts = {row["figure_number"]: row for row in debug["figure_contexts"]}
+    assert contexts["9"]["dipole_orientation"] == "radial"
+    assert contexts["10"]["dipole_orientation"] == "tangential"
+    assert contexts["9"]["panel_metrics"] == {"A": "RDM", "B": "MAG"}
+    assert contexts["10"]["panel_metrics"] == {"A": "RDM", "B": "MAG"}
+    assert not any(
+        row["figure_number"] == "10" and row["dipole_orientation"] == "radial"
+        for row in debug["figure_contexts"]
+    )
     assert debug["explicit_metric_exceptions"]
+    assert debug["deterministic_author_synthesis"] is True

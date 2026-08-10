@@ -185,6 +185,8 @@ def test_metric_semantics_use_targets_not_larger_is_better():
     semantics = infer_metric_semantics(evidence)
     assert semantics["RDM"]["target_value"] == 0
     assert semantics["MAG"]["target_value"] == 1
+    assert "normalized" in semantics["RDM"]["definition"]
+    assert "magnitude ratio" in semantics["MAG"]["definition"]
     assert best_by_metric({"a": 0.8, "b": 1.02, "c": 1.2}, semantics["MAG"]) == "b"
 
 
@@ -222,6 +224,25 @@ def test_figure_six_recovers_validated_graph_from_associated_table_five():
     assert "RDM target 0 at all 6 radial" in claims
     assert "MAG target 1 at all 6 radial" in claims
     assert "closer to the MAG target 1" in answer
+
+
+def test_figure_six_metric_definitions_are_visible_when_requested():
+    question = (
+        "Compare RDM and MAG in Figure 6 in the hybrid EEG paper and explain "
+        "what each metric measures."
+    )
+    resolution = resolve_visual_target(question, load_or_build_visual_index())
+    debug = {}
+    with patch("services.structured_vision._call_model", return_value="{}"):
+        answer = analyse_resolved_visual(question, resolution, debug_info=debug)
+    assert debug["final_answer_path"] == "validated_graph_with_table_evidence_fallback"
+    assert debug["metric_definitions_rendered"] is True
+    assert "normalized difference/error" in answer
+    assert "spatial potential distribution or topography" in answer
+    assert "target = 0" in answer
+    assert "relative magnitude ratio" in answer
+    assert "numerical and reference potentials" in answer
+    assert "target = 1" in answer
 
 
 def test_figure_seven_peak_compares_all_eccentricities():

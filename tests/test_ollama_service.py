@@ -193,6 +193,8 @@ def test_explicit_plural_limitations_are_completed_without_losing_future_work():
     assert "more time consuming" in answer
     assert "mesh extraction algorithm is more complex" in answer
     assert "Future work" in answer
+    assert "approximately three times" in answer
+    assert debug["explicit_runtime_examples_appended"]
     assert debug["final_missing_explicit_limitations"] == []
 
 

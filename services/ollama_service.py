@@ -152,6 +152,24 @@ def _missing_explicit_limitations(answer: str, items: list[dict]) -> list[dict]:
     return missing
 
 
+def _explicit_runtime_examples(items: list[dict]) -> list[str]:
+    """Return author-provided quantitative runtime examples, when present."""
+    examples = []
+    for item in items:
+        for sentence in item.get("evidence") or []:
+            text = re.sub(r"\s+", " ", str(sentence or "")).strip()
+            if re.search(
+                r"\b(?:approximately|about|roughly)?\s*(?:three|3)\s+times\b"
+                r".{0,180}\b(?:FEM|runtime|simulation|DOF)\b|"
+                r"\b(?:FEM|runtime|simulation|DOF)\b.{0,180}"
+                r"\b(?:three|3)\s+times\b",
+                text,
+                re.IGNORECASE | re.DOTALL,
+            ) and text not in examples:
+                examples.append(text)
+    return examples
+
+
 def _remove_efficiency_contradiction(context: str, answer: str) -> tuple[str, bool]:
     if not re.search(r"\b(?:more time-consuming|three times|3 times)\b", context, re.I):
         return answer, False
@@ -620,6 +638,18 @@ text or the labelled visual analysis.
         final_missing_explicit_limitations = _missing_explicit_limitations(
             answer, explicit_limitations
         )
+    runtime_examples_appended = []
+    for example in _explicit_runtime_examples(explicit_limitations):
+        if re.search(
+            r"\b(?:three|3)\s+times\b.{0,180}\b(?:FEM|runtime|simulation|DOF)\b|"
+            r"\b(?:FEM|runtime|simulation|DOF)\b.{0,180}\b(?:three|3)\s+times\b",
+            answer,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            break
+        answer = f"{answer.rstrip()}\n\n**Reported runtime example:** {example}"
+        runtime_examples_appended.append(example)
+        break
     answer, transient_comparison_appended = _append_grounded_transient_comparison(
         context, answer
     )
@@ -664,6 +694,7 @@ text or the labelled visual analysis.
             "grounded_items_appended": grounded_items_appended,
             "inferred_limitations_appended": inferred_limitations_appended,
             "explicit_limitations_appended": explicit_limitations_appended,
+            "explicit_runtime_examples_appended": runtime_examples_appended,
             "grounded_transient_comparison_appended": transient_comparison_appended,
             "multi_figure_details_appended": multi_figure_details_appended,
             "multi_figure_contradiction_removed": contradiction_removed,

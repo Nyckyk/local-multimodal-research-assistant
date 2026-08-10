@@ -2753,6 +2753,17 @@ def format_structured_result(visual_type: str, value: dict) -> str:
     if visual_type == "graph":
         figure_label = _display_figure_label(value.get("figure_number"))
         lines = [f"**{figure_label} graph analysis**"]
+        if value.get("show_metric_definitions") and value.get("metric_semantics"):
+            lines.extend(["", "**Metric definitions:**"])
+            for metric, semantics in value["metric_semantics"].items():
+                definition = str(semantics.get("definition", "")).strip()
+                target = semantics.get("target_value")
+                if not definition or not isinstance(target, (int, float)):
+                    continue
+                lines.append(
+                    f"- **{metric}:** {definition}; target = {target:g} "
+                    f"(closer to {target:g} is better)."
+                )
         for panel in value["panels"]:
             lines.append(
                 f"\n- **{_display_panel_label(panel.get('panel'), panel.get('group'))}**"

@@ -68,7 +68,7 @@ def _associated_graph_text(document, page_index: int, page_text: str) -> str:
     """Bring metric definitions and matching statistical tables to a graph."""
     metrics = [name for name in ("RDM", "MAG") if re.search(rf"\b{name}\b", page_text)]
     parts = []
-    for index in range(max(0, page_index - 8), min(len(document), page_index + 3)):
+    for index in range(max(0, page_index - 10), min(len(document), page_index + 3)):
         text = document[index].get_text("text") or ""
         has_definition = metrics and all(re.search(rf"\b{name}\b", text) for name in metrics) and re.search(
             r"\b(?:defined as|magnitude ratio|relative difference measure)\b", text, re.I
@@ -198,6 +198,43 @@ def _validated_graph_table_fallback(
         "frequency_direction_evidence": [],
         "uncertain_values": [],
     }, evidence_text)
+
+
+def _asks_for_metric_definitions(question: str) -> bool:
+    """Return true only when visible metric meaning is part of the question."""
+    return bool(re.search(
+        r"\b(?:what|which)\b.{0,80}\b(?:measure|mean|represent|define)\w*\b|"
+        r"\b(?:explain|define|describe)\b.{0,80}\b(?:RDM|MAG|metric)\b|"
+        r"\b(?:RDM|MAG)\b.{0,80}\b(?:measure|mean|represent|definition)\w*\b",
+        str(question or ""),
+        re.IGNORECASE | re.DOTALL,
+    ))
+
+
+def _add_visible_metric_definitions(
+    question: str,
+    structured: dict | None,
+    debug_info: dict,
+) -> str | None:
+    """Render grounded metric definitions without another model call."""
+    if not _asks_for_metric_definitions(question) or not isinstance(structured, dict):
+        return None
+    semantics = structured.get("metric_semantics") or {}
+    if not any(
+        isinstance(value, dict) and value.get("definition")
+        for value in semantics.values()
+    ):
+        return None
+    visible = dict(structured)
+    visible["show_metric_definitions"] = True
+    debug_info.update({
+        "validated_json": visible,
+        "repaired_json": visible,
+        "final_structured_output": visible,
+        "rendered_structured_object": visible,
+        "metric_definitions_rendered": True,
+    })
+    return format_structured_result("graph", visible)
 
 
 def _render_page_image(
@@ -1573,6 +1610,16 @@ def _analyse_typed_page(
             debug_info=analysis_debug,
             fit_verification_images=fit_verification_images,
         )
+        if visual_type == "graph" and str(
+            analysis_debug.get("final_answer_path", "")
+        ).startswith("validated"):
+            visible_answer = _add_visible_metric_definitions(
+                question,
+                analysis_debug.get("validated_json"),
+                analysis_debug,
+            )
+            if visible_answer is not None:
+                answer = visible_answer
         if visual_type == "graph" and not str(
             analysis_debug.get("final_answer_path", "")
         ).startswith("validated"):
@@ -1594,7 +1641,10 @@ def _analyse_typed_page(
                     "final_answer_path": "validated_graph_with_table_evidence_fallback",
                     "final_answer_code_path": "validated_graph_with_table_evidence_fallback",
                 })
-                return format_structured_result("graph", graph_fallback)
+                visible_answer = _add_visible_metric_definitions(
+                    question, graph_fallback, analysis_debug
+                )
+                return visible_answer or format_structured_result("graph", graph_fallback)
         if visual_type != "table":
             return answer
 

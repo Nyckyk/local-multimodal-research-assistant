@@ -17,6 +17,10 @@ def infer_metric_semantics(text: str) -> dict[str, dict]:
         semantics["RDM"] = {
             "objective": "target_value", "target_value": 0.0,
             "comparison": "smaller absolute deviation from 0 is better",
+            "definition": (
+                "normalized difference/error in the spatial potential "
+                "distribution or topography"
+            ),
             "grounding": "explicit metric definition",
         }
     if re.search(r"\bMAG\b", evidence) and re.search(
@@ -26,6 +30,10 @@ def infer_metric_semantics(text: str) -> dict[str, dict]:
         semantics["MAG"] = {
             "objective": "target_value", "target_value": 1.0,
             "comparison": "smaller absolute deviation from 1 is better",
+            "definition": (
+                "relative magnitude ratio between numerical and reference "
+                "potentials"
+            ),
             "grounding": "explicit numerical/reference ratio definition",
         }
     return semantics
