@@ -34,12 +34,48 @@ def _preserves_original_terms(question: str, rewritten: str) -> bool:
     return protected.issubset(rewritten_words)
 
 
+def _recent_referent(question: str, conversation_history: list[dict]) -> str | None:
+    """Resolve a repeated experimental noun phrase only when it appears verbatim."""
+    target = re.search(
+        r"\b(?:these|those)\s+(samples|cells)|\bthis\s+(experiment|model|treatment)|\bits\s+threshold\b",
+        question,
+        re.I,
+    )
+    if not target:
+        return None
+    kind = next((value for value in target.groups() if value), "threshold").casefold()
+    history = "\n".join(
+        str(message.get("content", "")) for message in conversation_history[-6:]
+        if isinstance(message, dict)
+    )
+    noun = "samples" if kind == "threshold" else kind
+    candidates = re.findall(
+        rf"\b((?:human|patient|clinical|mouse|murine|primary|treated|control|[A-Z][A-Za-z0-9-]*)"
+        rf"(?:\s+[A-Za-z0-9-]+){{0,6}}\s+{re.escape(noun)})\b",
+        history,
+        re.I,
+    )
+    if not candidates:
+        return None
+    return max(candidates, key=lambda value: (len(value.split()), len(value))).strip()
+
+
 def rewrite_question(
     question: str,
     conversation_history: list[dict],
 ) -> str:
     if not conversation_history or not _needs_context_resolution(question):
         return question
+
+    referent = _recent_referent(question, conversation_history)
+    if referent:
+        if re.search(r"\bits\s+threshold\b", question, re.I):
+            return re.sub(r"\bits\s+threshold\b", f"the {referent} threshold", question, count=1, flags=re.I)
+        return re.sub(
+            r"\b(?:these|those)\s+(?:samples|cells)\b|"
+            r"\bthis\s+(?:experiment|model|treatment)\b",
+            referent, question, count=1, flags=re.I,
+        )
 
     history_text = "\n".join(
         f"{message['role']}: {message['content']}"

@@ -1744,6 +1744,7 @@ def analyse_pdf_page(
     question: str,
     debug_info: dict | None = None,
     text_evidence: str = "",
+    visual_type_override: str | None = None,
 ) -> str:
     """Analyse one PDF page locally, with structured grouping when useful."""
     if not pdf_path.exists():
@@ -1757,7 +1758,7 @@ def analyse_pdf_page(
             )
         page = document.load_page(page_number - 1)
         page_text = page.get_text("text")
-        visual_type = detect_visual_type(question, page_text)
+        visual_type = visual_type_override or detect_visual_type(question, page_text)
         analysis_text_evidence = text_evidence
         if re.search(r"\bboundary conditions?\b", question, re.I):
             associated = _associated_boundary_text(document, page_number - 1)
@@ -1773,7 +1774,7 @@ def analyse_pdf_page(
         # Graphs and tables must be dispatched before the legacy grouping
         # keyword check because their legends/rows commonly contain "groups".
         # Non-grouping diagrams use their own relationship schema as well.
-        if visual_type in {"graph", "table"} or (
+        if visual_type in {"graph", "table", "mixed_figure"} or (
             visual_type in DIAGRAM_TYPES and not _is_grouping_question(question)
         ):
             return _analyse_typed_page(

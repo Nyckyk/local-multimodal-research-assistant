@@ -421,6 +421,11 @@ def generate_answer(
     grounded_items = _validated_framework_items(context)
     inferred_limitations = _validated_inferred_limitations(context)
     explicit_limitations = _validated_explicit_limitations(context)
+    coverage_match = re.search(r"Requested answer slots:\s*(\[[^\n]*\])", context)
+    try:
+        coverage_slots = json.loads(coverage_match.group(1)) if coverage_match else []
+    except json.JSONDecodeError:
+        coverage_slots = []
     section_rule = ""
     if len(requested_sections) >= 2:
         section_rule = (
@@ -466,6 +471,12 @@ EVIDENCE RULES:
   14. When EXPLICIT AUTHOR LIMITATIONS is present and the question asks for
       limitations in the plural, include every validated item and keep it
       separate from inferred constraints.
+  15. For METHODS-AWARE RETRIEVAL, answer every requested answer slot. Never
+      fill a missing method from "standard practice", what is "typically
+      implied", or what is "presumably" done. Say it is not specified instead.
+  16. Keep experimental provenance attached to its domain, species, tissue or
+      cell line, treatment, control, measurement, and figure/panel. Human-derived
+      cell lines are not human patient samples.
 {section_rule}
 
 Supplied evidence:
@@ -519,6 +530,10 @@ text or the labelled visual analysis.
     missing_explicit_limitations = _missing_explicit_limitations(
         answer, explicit_limitations
     )
+    missing_coverage_slots = [
+        slot for slot in coverage_slots
+        if not re.search(re.escape(slot), answer, re.I)
+    ]
     incomplete_ending = _ends_incomplete(answer)
     length_limited = done_reason.casefold() in {
         "length", "max_tokens", "max token", "num_predict",
@@ -527,6 +542,7 @@ text or the labelled visual analysis.
         length_limited or incomplete_ending or bool(missing_sections)
         or bool(missing_grounded_items) or bool(missing_inferred_limitations)
         or bool(missing_explicit_limitations)
+        or bool(missing_coverage_slots)
     )
     attempts = [{
         "done": bool(_response_value(response, "done", False)),
@@ -556,6 +572,8 @@ text or the labelled visual analysis.
                     item["statement"] for item in missing_explicit_limitations
                 )
             )
+        if missing_coverage_slots:
+            missing_parts.append("requested methods fields: " + ", ".join(missing_coverage_slots))
         missing_text = "; ".join(missing_parts) or "the unfinished final thought"
         continuation_messages = [
             *messages,
@@ -603,6 +621,21 @@ text or the labelled visual analysis.
             f"validated evidence: {', '.join(final_missing_grounded)}."
         )
         final_missing_grounded = _missing_grounded_items(answer, grounded_items)
+    framework_count_appended = False
+    count_word = {
+        1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
+        7: "seven", 8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve",
+    }.get(len(grounded_items), str(len(grounded_items)))
+    if grounded_items and not re.search(
+        rf"\b(?:{len(grounded_items)}|{re.escape(count_word)})\s+hallmarks?\b",
+        answer,
+        re.I,
+    ):
+        answer = (
+            f"{answer.rstrip()}\n\nThe validated framework contains "
+            f"{count_word} hallmarks."
+        )
+        framework_count_appended = True
     limitations_label_missing = bool(inferred_limitations) and not re.search(
         r"\blimitations?\b.{0,80}\binferred\b.{0,80}\bassumptions?\b|"
         r"\binferred\b.{0,80}\blimitations?\b.{0,80}\bassumptions?\b",
@@ -656,6 +689,23 @@ text or the labelled visual analysis.
     answer, efficiency_contradiction_removed = _remove_efficiency_contradiction(
         context, answer
     )
+    unsupported_completion_removed = False
+    sentences = re.split(r"(?<=[.!?])\s+", answer)
+    cleaned_sentences = [
+        sentence for sentence in sentences
+        if not re.search(r"\b(?:typically implied|standard practice would be|presumably)\b", sentence, re.I)
+    ]
+    if len(cleaned_sentences) != len(sentences):
+        unsupported_completion_removed = True
+        answer = " ".join(cleaned_sentences).strip()
+    final_missing_coverage = [
+        slot for slot in coverage_slots if not re.search(re.escape(slot), answer, re.I)
+    ]
+    if final_missing_coverage:
+        answer += "\n\n**Requested fields not explicitly covered**\n\n" + "\n".join(
+            f"- {slot}: Not specified in the retrieved evidence."
+            for slot in final_missing_coverage
+        )
     (
         answer,
         multi_figure_details_appended,
@@ -692,6 +742,7 @@ text or the labelled visual analysis.
                 item["key"] for item in final_missing_explicit_limitations
             ],
             "grounded_items_appended": grounded_items_appended,
+            "framework_count_appended": framework_count_appended,
             "inferred_limitations_appended": inferred_limitations_appended,
             "explicit_limitations_appended": explicit_limitations_appended,
             "explicit_runtime_examples_appended": runtime_examples_appended,
@@ -700,6 +751,9 @@ text or the labelled visual analysis.
             "multi_figure_contradiction_removed": contradiction_removed,
             "multi_figure_depth_language_qualified": depth_language_qualified,
             "efficiency_contradiction_removed": efficiency_contradiction_removed,
+            "requested_answer_slots": coverage_slots,
+            "final_missing_coverage_slots": final_missing_coverage,
+            "unsupported_standard_practice_completion_removed": unsupported_completion_removed,
             "final_incomplete_ending": _ends_incomplete(answer),
             "response_characters": len(answer),
             "response_words": len(answer.split()),

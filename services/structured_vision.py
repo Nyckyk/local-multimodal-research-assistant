@@ -11,6 +11,7 @@ import fitz
 import ollama
 
 from services.scientific_metrics import grounded_table_trends, infer_metric_semantics
+from services.scientific_evidence import structured_semantically_sufficient
 
 from settings import NYQUIST_LOCAL_DEVIATION_THRESHOLD, VISION_MODEL
 
@@ -23,7 +24,7 @@ DIAGRAM_TYPES = {
     "labelled_diagram", "anatomical_schematic", "circuit", "flowchart",
     "microscopy_photo", "contour_heatmap",
 }
-VISUAL_TYPES = {*DIAGRAM_TYPES, "graph", "table"}
+VISUAL_TYPES = {*DIAGRAM_TYPES, "graph", "table", "mixed_figure"}
 VISUAL_IDENTIFIER_PATTERN = r"(?:[A-Za-z]\.)?\d+(?:\.\d+)?|[A-Za-z]\d+"
 
 
@@ -165,6 +166,27 @@ def detect_visual_type(question: str, page_text: str = "") -> str | None:
 
 
 def _schema_text(visual_type: str) -> str:
+    if visual_type == "mixed_figure":
+        return """{
+  "figure_number": "...",
+  "panels": [
+    {
+      "panel": "a",
+      "visual_type": "workflow|microscopy|graph|heatmap|table|other",
+      "structured_analysis": {
+        "summary": "...",
+        "labels": ["..."],
+        "components": ["..."],
+        "measurements": ["..."],
+        "observations": ["..."]
+      },
+      "confidence": 0.0,
+      "uncertain_items": ["..."]
+    }
+  ],
+  "explanation": "...",
+  "uncertain_items": ["..."]
+}"""
     if visual_type in DIAGRAM_TYPES:
         return """{
   "diagram_kind": "circuit|other",
@@ -286,6 +308,13 @@ def build_structured_prompt(
             "Transcribe columns and rows in display order. Repeat visually merged group "
             "cells on each applicable row. Every row must contain exactly one value per "
             "column. Use null for unreadable cells and record their positions."
+        ),
+        "mixed_figure": (
+            "Detect panel labels first and analyse every panel independently. "
+            "A panel may be a workflow, microscopy image, graph, heatmap, table, "
+            "or another scientific visual. Do not force all panels into one schema. "
+            "Keep each panel summary concise and report only visible or caption-grounded "
+            "content. Panel letters alone are not an analysis."
         ),
     }[visual_type]
     return f"""
@@ -1004,26 +1033,36 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
                 valid_references.add(_normal_name(node["label"]))
         for branch in value["circuit_topology"]["branches"]:
             valid_references.add(_normal_name(branch["id"]))
+    validated_relationships = []
     for relationship in value["spatial_relationships"]:
         if not isinstance(relationship, dict):
-            raise StructuredOutputError("Each spatial relationship must be an object.")
-        _require_keys(
-            relationship,
-            {"subject", "relationship", "object"},
-            "Spatial relationship",
-        )
-        if not all(
+            if diagram_kind == "circuit":
+                raise StructuredOutputError("Each spatial relationship must be an object.")
+            value["uncertain_items"].append("An invalid optional spatial relationship was removed.")
+            continue
+        if not {"subject", "relationship", "object"}.issubset(relationship) or not all(
             isinstance(relationship[field], str) and relationship[field].strip()
             for field in ("subject", "relationship", "object")
         ):
-            raise StructuredOutputError(
-                "Spatial relationship fields must be non-empty strings."
-            )
+            if diagram_kind == "circuit":
+                raise StructuredOutputError("Spatial relationship fields must be non-empty strings.")
+            value["uncertain_items"].append("An incomplete optional spatial relationship was removed.")
+            continue
+        validated_relationships.append(relationship)
+    value["spatial_relationships"] = validated_relationships
     grounded_evidence = _normal_name(evidence_text)
+    validated_connections = []
     for connection in value["connections"]:
         if not isinstance(connection, dict):
-            raise StructuredOutputError("Each diagram connection must be an object.")
-        _require_keys(connection, {"from", "to", "relationship"}, "Diagram connection")
+            if diagram_kind == "circuit":
+                raise StructuredOutputError("Each diagram connection must be an object.")
+            value["uncertain_items"].append("An invalid optional connection was removed.")
+            continue
+        if not {"from", "to", "relationship"}.issubset(connection):
+            if diagram_kind == "circuit":
+                raise StructuredOutputError("Diagram connection is incomplete.")
+            value["uncertain_items"].append("An incomplete optional connection was removed.")
+            continue
         endpoints = {_normal_name(connection["from"]), _normal_name(connection["to"])}
         unknown = endpoints.difference(valid_references)
         if diagram_kind != "circuit":
@@ -1032,9 +1071,16 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
                 if not endpoint or endpoint not in grounded_evidence
             }
         if valid_references and unknown:
-            raise StructuredOutputError(
-                "A diagram connection references an unknown component, label, node or branch."
+            if diagram_kind == "circuit":
+                raise StructuredOutputError(
+                    "A diagram connection references an unknown component, label, node or branch."
+                )
+            value["uncertain_items"].append(
+                "An optional connection with an unverified endpoint was removed."
             )
+            continue
+        validated_connections.append(connection)
+    value["connections"] = validated_connections
 
     series_sentences = [
         sentence.lower()
@@ -1692,6 +1738,31 @@ def validate_table(value: dict) -> dict:
 
 
 def validate_typed_response(visual_type: str, value: dict, evidence_text: str = "") -> dict:
+    if visual_type == "mixed_figure":
+        _require_keys(value, {"figure_number", "panels", "explanation", "uncertain_items"}, "Mixed figure")
+        if not isinstance(value["panels"], list) or not isinstance(value["uncertain_items"], list):
+            raise StructuredOutputError("Mixed figure panels and uncertain_items must be lists.")
+        valid_panels, warnings, seen = [], [], set()
+        for panel in value["panels"]:
+            if not isinstance(panel, dict):
+                warnings.append("discarded non-object panel")
+                continue
+            required = {"panel", "visual_type", "structured_analysis", "confidence", "uncertain_items"}
+            if not required.issubset(panel) or not isinstance(panel.get("structured_analysis"), dict):
+                warnings.append(f"discarded invalid panel {panel.get('panel', '?')}")
+                continue
+            key = str(panel["panel"]).strip().casefold()
+            if not key or key in seen:
+                warnings.append(f"discarded duplicate/empty panel {panel.get('panel', '?')}")
+                continue
+            seen.add(key)
+            valid_panels.append(panel)
+        if not valid_panels:
+            raise StructuredOutputError("Mixed figure contains no valid panel analyses.")
+        value["panels"] = valid_panels
+        if warnings:
+            value["validation_warnings"] = warnings
+        return value
     if visual_type in DIAGRAM_TYPES:
         return validate_labelled_diagram(value, evidence_text)
     if visual_type == "graph":
@@ -2247,6 +2318,9 @@ def validate_compact_panel_response(value: dict, expected_panels: list[str]) -> 
         )
         panel_id = re.sub(r"[^a-z0-9]+", "", str(panel["panel"]).lower())
         panel["panel"] = panel_id
+        group_match = re.search(r"\bgroup\s*([A-Za-z0-9]+)\b", str(panel["group"]), re.I)
+        if group_match:
+            panel["group"] = f"Group {group_match.group(1)}"
         observed.append(panel_id)
         _validate_compact_axis(panel["x_axis"], panel_id, "x")
         _validate_compact_axis(panel["y_axis"], panel_id, "y")
@@ -2735,6 +2809,20 @@ def _format_hierarchical_table(value: dict) -> list[str] | None:
 
 
 def format_structured_result(visual_type: str, value: dict) -> str:
+    if visual_type == "mixed_figure":
+        label = _display_figure_label(value.get("figure_number"))
+        lines = [f"**{label} panel analysis**"]
+        for panel in value.get("panels", []):
+            analysis = panel.get("structured_analysis", {})
+            summary = str(analysis.get("summary", "")).strip()
+            observations = analysis.get("observations") or analysis.get("measurements") or []
+            detail = summary or "; ".join(map(str, observations)) or "No verified panel detail."
+            lines.append(f"\n- **Panel {panel.get('panel')} ({panel.get('visual_type')}):** {detail}")
+        if value.get("explanation"):
+            lines.extend(["", str(value["explanation"])])
+        if value.get("uncertain_items"):
+            lines.append("\n**Uncertain:** " + ", ".join(map(str, value["uncertain_items"])))
+        return "\n".join(lines)
     if visual_type == "table":
         title = value.get("title") or f"Table {value.get('table_number', '')}".strip()
         if value.get("header_rows"):
@@ -2990,6 +3078,14 @@ def analyse_typed_image(
     try:
         parsed = parse_json_response(raw)
         value = validate_typed_response(visual_type, parsed, evidence_text)
+        sufficient, semantic_debug = structured_semantically_sufficient(
+            visual_type, value, question
+        )
+        if not sufficient:
+            raise StructuredOutputError(
+                "structured_vision_schema_valid_but_semantically_insufficient: "
+                + json.dumps(semantic_debug, ensure_ascii=False)
+            )
     except StructuredOutputError as first_error:
         errors.append(str(first_error))
         initial_validation_errors.append(str(first_error))
@@ -3007,6 +3103,14 @@ def analyse_typed_image(
                 value = validate_typed_response(
                     visual_type, repaired_json, evidence_text
                 )
+                sufficient, semantic_debug = structured_semantically_sufficient(
+                    visual_type, value, question
+                )
+                if not sufficient:
+                    raise StructuredOutputError(
+                        "structured_vision_schema_valid_but_semantically_insufficient: "
+                        + json.dumps(semantic_debug, ensure_ascii=False)
+                    )
                 repaired_validation_result = "passed"
                 retry_kind = "grounded_topology_repair"
                 used_repair = True
@@ -3100,6 +3204,11 @@ def analyse_typed_image(
                             "validation_error": " | ".join(errors),
                             "final_answer_path": fallback_path,
                             "final_answer_code_path": fallback_path,
+                            "semantic_validation_status": (
+                                "structured_vision_schema_valid_but_semantically_insufficient"
+                                if any("semantically_insufficient" in item for item in errors)
+                                else "not_reached_or_failed_schema_validation"
+                            ),
                         })
                     if topology_retry or circuit_context:
                         return (
@@ -3151,6 +3260,7 @@ def analyse_typed_image(
                 "validated_repaired_structured_vision"
                 if used_repair else "validated_structured_vision"
             ),
+            "semantic_validation_status": "passed",
         })
     if visual_type in DIAGRAM_TYPES and re.search(
         r"\bboundary conditions?\b", question, re.I
