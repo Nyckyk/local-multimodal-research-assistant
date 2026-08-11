@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+from services.ollama_service import generate_answer
 from services.scientific_evidence import (
     caption_results_fallback,
+    contradiction_check_condition_prose,
     figure_local_evidence,
     merge_mixed_figure_with_caption,
     remove_unsupported_acronym_expansions,
@@ -35,6 +38,7 @@ def analyse_resolved_visual(
         resolution.caption_page_number,
         resolution.target_number,
         resolution.full_caption or resolution.caption,
+        question,
     )
     composed_evidence = (
         f"{local_evidence['evidence_text']}\n\nRETRIEVED RAG EVIDENCE:\n{text_evidence}"
@@ -96,6 +100,58 @@ def analyse_resolved_visual(
         })
     else:
         answer = remove_unsupported_acronym_expansions(answer, local_evidence["glossary"])
+
+    slots = local_evidence["requested_answer_slots"]
+    if slots:
+        authoritative_path = str(
+            (debug_info or {}).get("final_answer_code_path")
+            or (debug_info or {}).get("final_answer_path")
+            or "validated_visual"
+        )
+        synthesis_context = (
+            "[FIGURE QUESTION COVERAGE]\n"
+            f"Requested answer slots: {json.dumps(slots)}\n"
+            "Resolve every slot from the supplied visual, caption, Results, or Methods evidence. "
+            "For each slot, give grounded evidence, say explicitly that it was not found, or label "
+            "a necessary interpretation as inference. Explicit condition-level Results statements "
+            "override generalized visual summaries. Preserve quantitative qualifiers such as "
+            "'less than'; do not replace them with zero. Avoid only, never, or excludes unless an "
+            "author statement explicitly supports that scope. Panel summaries are intermediate "
+            "evidence and must not replace the higher-level answer requested.\n"
+            f"Provisional validated visual path: {authoritative_path}\n"
+            f"[VALIDATED VISUAL EVIDENCE]\n{answer}\n\n"
+            "[EXPLICIT CONDITION OUTCOMES]\n"
+            f"{json.dumps(local_evidence['explicit_condition_outcomes'], ensure_ascii=False)}\n\n"
+            "[EXPLICIT CLASSIFIER TAXONOMY]\n"
+            f"{json.dumps(local_evidence['explicit_classifier_taxonomy'], ensure_ascii=False)}\n\n"
+            f"{composed_evidence}"
+        )
+        coverage_debug = {}
+        answer = generate_answer(question, synthesis_context, [], coverage_debug)
+        removed_claims = []
+        if "condition-specific outcomes" in slots:
+            answer, removed_claims = contradiction_check_condition_prose(
+                answer, local_evidence["explicit_condition_outcomes"],
+            )
+            if removed_claims:
+                answer = (
+                    f"{answer.rstrip()}\n\n**Explicit author-reported condition outcomes**\n\n"
+                    + "\n".join(
+                        f"- {statement}" for statement in local_evidence["explicit_condition_outcomes"]
+                    )
+                )
+        answer = remove_unsupported_acronym_expansions(answer, local_evidence["glossary"])
+        if debug_info is not None:
+            debug_info.update({
+                "requested_answer_slots": slots,
+                "coverage_synthesis_applied": True,
+                "coverage_synthesis_debug": coverage_debug,
+                "condition_claims_removed": removed_claims,
+                "final_answer_code_path": authoritative_path,
+            })
+    elif debug_info is not None:
+        debug_info["requested_answer_slots"] = []
+        debug_info["coverage_synthesis_applied"] = False
     return answer
 
 

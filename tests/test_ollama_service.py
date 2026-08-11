@@ -224,6 +224,29 @@ def test_grounded_transient_comparison_is_preserved_after_summary_generation():
     assert debug["grounded_transient_comparison_appended"] is True
 
 
+def test_summary_methods_complete_explicit_source_method_terminology():
+    context = (
+        "[DOCUMENT SUMMARY MODE]\n"
+        "Source: paper.pdf, page 1, section abstract\n"
+        "The equations use the finite element method (FEM) for solving."
+    )
+    debug = {}
+    with patch(
+        "services.ollama_service.ollama.chat",
+        side_effect=[
+            _response("Research question: Q. Methods: Numerical solution. Main results: R."),
+            _response("The source method should also be named explicitly."),
+        ],
+    ) as chat:
+        answer = generate_answer(
+            "Summarise the research question, methods and main results.",
+            context, [], debug,
+        )
+    assert chat.call_count == 2
+    assert "finite element method" in answer.casefold()
+    assert debug["explicit_method_terms_appended"] == ["FEM"]
+
+
 def test_multi_figure_completion_keeps_trends_attached_to_their_figure():
     context = (
         "[MULTI-FIGURE EVIDENCE MODE]\n"

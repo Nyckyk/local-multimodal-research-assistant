@@ -3,7 +3,8 @@ import re
 
 from services.document_matching import explicit_document_matches
 from services.scientific_evidence import (
-    classify_experimental_domain,
+    classify_experimental_evidence,
+    extract_explicit_classifier_taxonomy,
     experimental_provenance,
     requested_answer_slots,
 )
@@ -152,20 +153,21 @@ def extract_explicit_limitations(documents: list[str]) -> dict:
 def extract_discussion_limitations(documents: list[str]) -> dict:
     """Capture limitations explicitly stated in Discussion even without a heading."""
     text = re.sub(r"[ \t]+", " ", "\n".join(str(item or "") for item in documents))
+    protected_text = re.sub(r"\be\.g\.", "e§g§", text, flags=re.I)
     sentences = [
-        re.sub(r"\s+", " ", sentence).strip()
-        for sentence in re.split(r"(?<=[.!?])\s+", text)
+        re.sub(r"\s+", " ", sentence.replace("e§g§", "e.g.")).strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", protected_text)
     ]
     limitation_language = re.compile(
         r"\b(?:limitation|caveat|however|while ideally|depends? on|"
         r"affect(?:s|ed)? (?:the )?(?:comparisons?|performance|interpretation)|"
-        r"may (?:need|require) (?:to be )?adapt\w*|adaptation may be required|"
-        r"cannot|not possible|might not)\b",
+        r"(?:may|might) (?:need|require) (?:to be )?adapt\w*|adaptation may be required|"
+        r"performed worse|unlikely (?:that .*? would )?work|cannot|not possible|might not)\b",
         re.I,
     )
     topic_language = re.compile(
-        r"\b(?:marker|comparison|other tissues?|generali[sz]|heterogeneous|"
-        r"false positives?|predictor|classifier|score)\b",
+        r"\b(?:marker|comparison|other tissues?|generali[sz]|heterogene\w*|"
+        r"false positives?|predictor|classifier|score|TSS|morphology|cell type|stressor|condition)\b",
         re.I,
     )
     items, seen = [], set()
@@ -677,6 +679,17 @@ def _format_context(selected_results: list[dict], prefix: str = "") -> str:
     return "\n\n".join(([prefix] if prefix else []) + parts)
 
 
+def _question_coverage_prefix(question: str) -> str:
+    slots = requested_answer_slots(question)
+    if not slots:
+        return ""
+    return (
+        "[QUESTION COVERAGE]\n"
+        f"Requested answer slots: {json.dumps(slots)}\n"
+        "Answer every slot from evidence, explicitly mark it not found, or clearly label inference."
+    )
+
+
 def _query_candidates(queries, collection, embedder, n_results):
     candidates = {}
     raw_count = 0
@@ -1013,11 +1026,35 @@ def _retrieve_summary_context(
             "Only named_items may be presented as canonical framework items. "
             "Mechanisms discussed within their sections are not additional named items.\n"
         )
+    explicit_limitations_grounding = {}
     limitations_grounding = {}
     limitations_block = ""
     if re.search(r"\blimitations?\b", question, re.IGNORECASE):
-        limitations_grounding = extract_inferred_limitations(framework_documents)
-    if limitations_grounding:
+        explicit_limitations_grounding = extract_explicit_limitations(framework_documents)
+        discussion_limitations = extract_discussion_limitations(framework_documents)
+        if discussion_limitations:
+            if explicit_limitations_grounding:
+                existing = {
+                    item["statement"].casefold()
+                    for item in explicit_limitations_grounding["items"]
+                }
+                explicit_limitations_grounding["items"].extend(
+                    item for item in discussion_limitations["items"]
+                    if item["statement"].casefold() not in existing
+                )
+            else:
+                explicit_limitations_grounding = discussion_limitations
+        if not explicit_limitations_grounding:
+            limitations_grounding = extract_inferred_limitations(framework_documents)
+    if explicit_limitations_grounding:
+        diagnostics["explicit_author_limitations"] = explicit_limitations_grounding
+        limitations_block = (
+            "\n[EXPLICIT AUTHOR LIMITATIONS]\n"
+            f"{json.dumps(explicit_limitations_grounding, ensure_ascii=False)}\n"
+            "These are author-stated limitations from the Discussion. Present them "
+            "as explicit, not implied, and keep any assistant inference separate.\n"
+        )
+    elif limitations_grounding:
         diagnostics["inferred_limitations_grounding"] = limitations_grounding
         limitations_block = (
             "\n[INFERRED LIMITATIONS GROUNDING]\n"
@@ -1042,13 +1079,23 @@ def _retrieve_summary_context(
             uncovered.difference_update(covered)
             if not uncovered:
                 break
+    taxonomy = extract_explicit_classifier_taxonomy("\n".join(framework_documents))
+    taxonomy_block = ""
+    if taxonomy:
+        diagnostics["explicit_classifier_taxonomy"] = taxonomy
+        taxonomy_block = (
+            "\n[EXPLICIT CLASSIFIER TAXONOMY]\n"
+            f"{json.dumps(taxonomy, ensure_ascii=False)}\n"
+            "Preserve these exact identifiers and source descriptions. Do not infer "
+            "acronym expansions or an umbrella classifier family absent from this block.\n"
+        )
     prefix = (
         "[DOCUMENT SUMMARY MODE]\n"
         f"Document type: {document_type}\n"
         "Summarize the whole document using representative evidence. For a review, "
         "cover purpose and scope, central framework, major themes, conclusions, "
         "implications and limitations; do not call review arguments experimental findings."
-        f"{framework_block}{limitations_block}"
+        f"{framework_block}{limitations_block}{taxonomy_block}"
     )
     diagnostics["final_selected_chunks"] = len(selected)
     diagnostics["final_selected_pages"] = [item["page"] for item in selected]
@@ -1448,9 +1495,9 @@ def _retrieve_cross_domain_context(
     question, collection, embedder, reranker, available_chunks, selected_source=None,
 ):
     domain_queries = {
-        "in_vitro_cell_line": f"{question} cell culture in vitro cell line evidence figure",
-        "animal_model": f"{question} mouse animal in vivo tissue evidence figure",
-        "human_clinical_patient_tissue": f"{question} human patient clinical tissue evidence figure",
+        "in_vitro_human_cell_line": f"{question} cell culture in vitro human cell line evidence figure",
+        "mouse_animal_tissue": f"{question} mouse animal in vivo tissue evidence figure",
+        "human_patient_tissue": f"{question} human patient clinical tissue evidence figure",
     }
     candidates, _ = _query_candidates(
         domain_queries.values(), collection, embedder,
@@ -1469,21 +1516,64 @@ def _retrieve_cross_domain_context(
         if (target is None or _source_identity(metadata) == target)
         and not _is_reference_or_metadata(document)
     ]
+    evidence_objects = []
+    try:
+        from services.visual_index import flatten_visual_targets, load_or_build_visual_index
+
+        for visual in flatten_visual_targets(load_or_build_visual_index()):
+            if visual.get("target_type") != "figure" or visual.get("match_kind") != "caption":
+                continue
+            metadata = {
+                "pdf": visual.get("pdf_name", ""),
+                "page": visual.get("page_number", "Unknown page"),
+                "chunk": f"visual-index-{visual.get('target_number', '')}",
+            }
+            if target is not None and _source_identity(metadata) != target:
+                continue
+            caption = visual.get("full_caption") or visual.get("caption", "")
+            nearby = visual.get("nearby_text", "")
+            classification = classify_experimental_evidence(caption, nearby, "")
+            evidence_objects.append({
+                "document": f"{caption}\n{nearby}".strip(),
+                "metadata": metadata,
+                "caption": caption,
+                "results": nearby,
+                "classification": classification,
+                "figure_or_panel": f"Figure {visual.get('target_number', '')}",
+            })
+    except (OSError, ValueError, TypeError):
+        evidence_objects = []
+    if not evidence_objects:
+        evidence_objects = [{
+            "document": document,
+            "metadata": metadata,
+            "caption": "",
+            "results": document,
+            "classification": classify_experimental_evidence("", document, ""),
+            "figure_or_panel": None,
+        } for document, metadata in rows]
     selected, provenance_rows = [], []
     for domain, query in domain_queries.items():
-        domain_rows = [row for row in rows if classify_experimental_domain(row[0]) == domain]
+        domain_rows = [
+            row for row in evidence_objects
+            if row["classification"]["experimental_domain"] == domain
+        ]
         if not domain_rows:
             provenance_rows.append({"experimental_domain": domain, "status": "no grounded evidence found"})
             continue
-        scores = reranker.predict([[query, document] for document, _ in domain_rows])
+        scores = reranker.predict([[query, row["caption"] or row["document"]] for row in domain_rows])
         ranked = sorted(zip(scores, domain_rows), key=lambda row: float(row[0]), reverse=True)
         used_pages = set()
-        for score, (document, metadata) in ranked:
+        for score, row in ranked:
+            document, metadata = row["document"], row["metadata"]
             page = metadata.get("page")
             if page in used_pages:
                 continue
             item = _source_item(score, document, metadata, f"domain:{domain}")
-            item["experimental_provenance"] = experimental_provenance(document)
+            item["experimental_provenance"] = {
+                **experimental_provenance(row["caption"] or document, row["figure_or_panel"]),
+                **row["classification"],
+            }
             selected.append(item)
             provenance_rows.append(item["experimental_provenance"])
             used_pages.add(page)
@@ -1522,21 +1612,27 @@ def retrieve_context(
         return "", []
 
     if is_broad_summary_question(question):
-        return _retrieve_summary_context(
+        context, sources = _retrieve_summary_context(
             question, collection, embedder, reranker, available_chunks,
             selected_source=selected_source,
         )
+        prefix = _question_coverage_prefix(question)
+        return (f"{prefix}\n{context}" if prefix else context), sources
 
     if is_cross_domain_evidence_question(question):
-        return _retrieve_cross_domain_context(
+        context, sources = _retrieve_cross_domain_context(
             question, collection, embedder, reranker, available_chunks,
             selected_source=selected_source,
         )
+        prefix = _question_coverage_prefix(question)
+        return (f"{prefix}\n{context}" if prefix else context), sources
 
     if is_multi_figure_evidence_question(question):
-        return _retrieve_multi_figure_context(
+        context, sources = _retrieve_multi_figure_context(
             question, collection, embedder, reranker, available_chunks
         )
+        prefix = _question_coverage_prefix(question)
+        return (f"{prefix}\n{context}" if prefix else context), sources
 
     if is_methods_question(resolved_question):
         context, sources = _retrieve_methods_context(
@@ -1544,7 +1640,8 @@ def retrieve_context(
             selected_source=selected_source,
         )
         if context:
-            return context, sources
+            prefix = _question_coverage_prefix(question)
+            return (f"{prefix}\n{context}" if prefix else context), sources
 
     if is_section_aware_question(question) or is_reported_trend_question(question) or (
         previous_question and re.search(r"\b(?:error|trend|increase|decrease)\b", question, re.I)
@@ -1554,7 +1651,8 @@ def retrieve_context(
             selected_source=selected_source,
         )
         if context:
-            return context, sources
+            prefix = _question_coverage_prefix(question)
+            return (f"{prefix}\n{context}" if prefix else context), sources
 
     # Existing focused-question retrieval path.
     query_embedding = embedder.encode(
@@ -1606,4 +1704,4 @@ def retrieve_context(
         chunks_per_page[page_key] = chunks_per_page.get(page_key, 0) + 1
         if len(selected_results) >= FINAL_RESULTS:
             break
-    return _format_context(selected_results), selected_results
+    return _format_context(selected_results, _question_coverage_prefix(question)), selected_results

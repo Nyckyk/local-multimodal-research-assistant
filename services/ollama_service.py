@@ -3,6 +3,11 @@ import re
 
 import ollama
 
+from services.scientific_evidence import (
+    document_glossary,
+    extract_explicit_classifier_taxonomy,
+    remove_unsupported_acronym_expansions,
+)
 from settings import NORMAL_NUM_PREDICT, OLLAMA_MODEL, SUMMARY_NUM_PREDICT
 
 
@@ -421,6 +426,13 @@ def generate_answer(
     grounded_items = _validated_framework_items(context)
     inferred_limitations = _validated_inferred_limitations(context)
     explicit_limitations = _validated_explicit_limitations(context)
+    explicit_method_terms = []
+    if summary_mode and "methods" in requested_sections:
+        explicit_method_terms = [
+            {"acronym": acronym, "term": expansion}
+            for acronym, expansion in document_glossary(context).items()
+            if re.search(r"\b(?:method|model|algorithm|classifier|framework|approach)\b", expansion, re.I)
+        ][:6]
     coverage_match = re.search(r"Requested answer slots:\s*(\[[^\n]*\])", context)
     try:
         coverage_slots = json.loads(coverage_match.group(1)) if coverage_match else []
@@ -477,6 +489,16 @@ EVIDENCE RULES:
   16. Keep experimental provenance attached to its domain, species, tissue or
       cell line, treatment, control, measurement, and figure/panel. Human-derived
       cell lines are not human patient samples.
+  17. For FIGURE QUESTION COVERAGE, explicit nearby Results statements override
+      a generalized visual interpretation at the condition level. Preserve each
+      named condition and quantitative qualifier. Do not change "less than 30%"
+      into zero, and do not say only, never, or excludes unless the evidence uses
+      wording with that scope.
+  18. When EXPLICIT CLASSIFIER TAXONOMY is present, preserve identifiers and
+      descriptions exactly. Do not infer acronym expansions, algorithm families,
+      or umbrella families from a model name.
+  19. A caption/panel inventory is intermediate evidence. Directly answer higher-
+      level explanatory clauses using supplied Results or Methods evidence.
 {section_rule}
 
 Supplied evidence:
@@ -530,6 +552,10 @@ text or the labelled visual analysis.
     missing_explicit_limitations = _missing_explicit_limitations(
         answer, explicit_limitations
     )
+    missing_method_terms = [
+        row for row in explicit_method_terms
+        if not re.search(re.escape(row["term"]), answer, re.I)
+    ]
     missing_coverage_slots = [
         slot for slot in coverage_slots
         if not re.search(re.escape(slot), answer, re.I)
@@ -542,6 +568,7 @@ text or the labelled visual analysis.
         length_limited or incomplete_ending or bool(missing_sections)
         or bool(missing_grounded_items) or bool(missing_inferred_limitations)
         or bool(missing_explicit_limitations)
+        or bool(missing_method_terms)
         or bool(missing_coverage_slots)
     )
     attempts = [{
@@ -570,6 +597,12 @@ text or the labelled visual analysis.
             missing_parts.append(
                 "explicit author limitations: " + "; ".join(
                     item["statement"] for item in missing_explicit_limitations
+                )
+            )
+        if missing_method_terms:
+            missing_parts.append(
+                "explicit source method terminology: " + ", ".join(
+                    f"{row['term']} ({row['acronym']})" for row in missing_method_terms
                 )
             )
         if missing_coverage_slots:
@@ -613,6 +646,10 @@ text or the labelled visual analysis.
     final_missing_explicit_limitations = _missing_explicit_limitations(
         answer, explicit_limitations
     )
+    final_missing_method_terms = [
+        row for row in explicit_method_terms
+        if not re.search(re.escape(row["term"]), answer, re.I)
+    ]
     grounded_items_appended = []
     if final_missing_grounded:
         grounded_items_appended = list(final_missing_grounded)
@@ -671,6 +708,16 @@ text or the labelled visual analysis.
         final_missing_explicit_limitations = _missing_explicit_limitations(
             answer, explicit_limitations
         )
+    explicit_method_terms_appended = []
+    if final_missing_method_terms:
+        explicit_method_terms_appended = [row["acronym"] for row in final_missing_method_terms]
+        answer = (
+            f"{answer.rstrip()}\n\n**Explicit method terminology from the source:** "
+            + "; ".join(
+                f"{row['term']} ({row['acronym']})" for row in final_missing_method_terms
+            )
+            + "."
+        )
     runtime_examples_appended = []
     for example in _explicit_runtime_examples(explicit_limitations):
         if re.search(
@@ -706,6 +753,12 @@ text or the labelled visual analysis.
             f"- {slot}: Not specified in the retrieved evidence."
             for slot in final_missing_coverage
         )
+    supported_terms = document_glossary(context)
+    supported_terms.update({
+        row["name"]: row["source_description"]
+        for row in extract_explicit_classifier_taxonomy(context)
+    })
+    answer = remove_unsupported_acronym_expansions(answer, supported_terms)
     (
         answer,
         multi_figure_details_appended,
@@ -730,6 +783,9 @@ text or the labelled visual analysis.
             "initial_missing_explicit_limitations": [
                 item["key"] for item in missing_explicit_limitations
             ],
+            "initial_missing_explicit_method_terms": [
+                item["acronym"] for item in missing_method_terms
+            ],
             "initial_incomplete_ending": incomplete_ending,
             "initial_length_limited": length_limited,
             "continuation_used": len(attempts) == 2,
@@ -745,6 +801,7 @@ text or the labelled visual analysis.
             "framework_count_appended": framework_count_appended,
             "inferred_limitations_appended": inferred_limitations_appended,
             "explicit_limitations_appended": explicit_limitations_appended,
+            "explicit_method_terms_appended": explicit_method_terms_appended,
             "explicit_runtime_examples_appended": runtime_examples_appended,
             "grounded_transient_comparison_appended": transient_comparison_appended,
             "multi_figure_details_appended": multi_figure_details_appended,

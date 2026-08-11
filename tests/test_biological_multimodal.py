@@ -13,9 +13,13 @@ from services.document_matching import explicit_document_matches
 from services.query_rewriter import rewrite_question
 from services.scientific_evidence import (
     caption_results_fallback,
+    classify_experimental_evidence,
     classify_experimental_domain,
+    contradiction_check_condition_prose,
     document_glossary,
+    extract_explicit_classifier_taxonomy,
     extract_caption_panels,
+    figure_local_evidence,
     merge_mixed_figure_with_caption,
     remove_unsupported_acronym_expansions,
     requested_answer_slots,
@@ -212,13 +216,13 @@ def test_discussion_limitations_are_author_stated():
 
 
 def test_experimental_domains_remain_distinct():
-    assert classify_experimental_domain("A549 human cells were treated in culture") == "in_vitro_cell_line"
-    assert classify_experimental_domain("mouse liver tissue in vivo") == "animal_model"
-    assert classify_experimental_domain("human patient liver samples") == "human_clinical_patient_tissue"
+    assert classify_experimental_domain("A549 human cells were treated in culture") == "in_vitro_human_cell_line"
+    assert classify_experimental_domain("mouse liver tissue in vivo") == "mouse_animal_tissue"
+    assert classify_experimental_domain("human patient liver samples") == "human_patient_tissue"
 
 
 def test_human_cell_line_is_not_patient_evidence():
-    assert classify_experimental_domain("human A549 cell line in vitro") != "human_clinical_patient_tissue"
+    assert classify_experimental_domain("human A549 cell line in vitro") != "human_patient_tissue"
 
 
 def test_unsupported_acronym_expansion_is_removed():
@@ -275,3 +279,255 @@ def test_compact_graph_group_sample_suffixes_normalize_before_comparison():
         "confidence": 0.9, "uncertain": [],
     }, validated["panels"])
     assert comparison["magnitude_order_high_to_low"] == ["Group 3", "Group 1", "Group 2"]
+
+
+def test_figure_five_question_slots_and_grounded_counts(targets):
+    question = (
+        "For Figure 5, how many compounds were screened, how many hits were "
+        "specific to each cell line or active in both, and explain the first "
+        "experiment and later screening experiment."
+    )
+    slots = requested_answer_slots(question)
+    assert {
+        "compounds screened", "condition-specific hit counts", "shared hit count",
+        "first experiment", "later screening experiment",
+    }.issubset(slots)
+    row = target(targets, 5)
+    evidence = figure_local_evidence(
+        Path(row["pdf_path"]), row["page_number"], row["caption_page_number"],
+        row["target_number"], row["full_caption"], question,
+    )
+    grounded = evidence["evidence_text"]
+    for expected in ("676", "27", "11", "18"):
+        assert expected in grounded
+    assert "GFP" in grounded and "mCherry" in grounded
+    assert "ABT-263" in grounded and "ABT-737" in grounded
+    assert "GM classi" in grounded and "A549" in grounded and "IMR90" in grounded
+
+
+def test_figure_five_fallback_gets_shared_coverage_synthesis(targets):
+    resolution = resolve_visual_target(
+        f"For Figure 5 in {TITLE}, how many drugs were screened and explain the first experiment?",
+        load_or_build_visual_index(),
+    )
+    debug = {}
+    captured = {}
+
+    def fake_generation(question, context, history, debug_info):
+        captured["context"] = context
+        return "compounds screened: grounded; first experiment: grounded"
+
+    with patch(
+        "services.visual_runtime.analyse_pdf_page",
+        side_effect=lambda **kwargs: kwargs["debug_info"].update(
+            {"final_answer_path": "grounded_caption_summary_fallback"}
+        ) or "unsafe raw",
+    ), patch("services.visual_runtime.generate_answer", side_effect=fake_generation):
+        answer = analyse_resolved_visual(
+            "How many drugs were screened and explain the first experiment?",
+            resolution, debug_info=debug,
+        )
+    assert debug["final_answer_code_path"] == "grounded_caption_results_fallback"
+    assert debug["coverage_synthesis_applied"]
+    assert "676" in captured["context"]
+    assert answer.startswith("compounds screened") and "unsafe raw" not in answer
+
+
+@pytest.mark.parametrize("partial, expected_path", [
+    (False, "validated_multimodal_figure"),
+    (True, "validated_partial_vision_with_text_fallback"),
+])
+def test_figure_question_coverage_runs_after_validated_mixed_paths(
+    targets, partial, expected_path,
+):
+    resolution = resolve_visual_target(
+        f"For Figure 5 in {TITLE}, how many compounds were screened?",
+        load_or_build_visual_index(),
+    )
+    panel_rows = extract_caption_panels(target(targets, 5)["full_caption"])
+    if partial:
+        panel_rows = panel_rows[:1]
+    structured = {
+        "figure_number": "5",
+        "panels": [{
+            "panel": row["panel"], "visual_type": row["visual_type"],
+            "structured_analysis": {
+                "summary": row["caption_description"], "observations": ["visible"],
+            },
+            "confidence": 0.9, "uncertain_items": [],
+        } for row in panel_rows],
+        "explanation": "", "uncertain_items": [],
+    }
+    debug = {}
+
+    def fake_analysis(**kwargs):
+        kwargs["debug_info"].update({
+            "final_answer_path": "validated_typed_vision",
+            "validated_json": structured,
+        })
+        return "provisional"
+
+    with patch("services.visual_runtime.analyse_pdf_page", side_effect=fake_analysis), patch(
+        "services.visual_runtime.generate_answer", return_value="compounds screened: grounded",
+    ) as synthesize:
+        analyse_resolved_visual(
+            "How many compounds were screened?", resolution, debug_info=debug,
+        )
+    assert debug["final_answer_code_path"] == expected_path
+    assert debug["coverage_synthesis_applied"]
+    assert synthesize.call_count == 1
+
+
+def test_figure_two_condition_evidence_preserves_author_distinctions(targets):
+    row = target(targets, 2)
+    evidence = figure_local_evidence(
+        Path(row["pdf_path"]), row["page_number"], row["caption_page_number"],
+        row["target_number"], row["full_caption"],
+        "Compare all conditions and explain the Figure 2 result.",
+    )
+    grounded = " ".join(evidence["explicit_condition_outcomes"])
+    for term in ("growing", "irradiated", "MLN8054", "etoposide", "53BP1"):
+        assert term.casefold() in grounded.casefold()
+    assert "less than 30%" in grounded
+    cleaned, removed = contradiction_check_condition_prose(
+        "53BP1 foci are present in irradiated cells but not in senescent cells. "
+        "AEM excludes DNA-damaged cells.",
+        evidence["explicit_condition_outcomes"],
+    )
+    assert removed and "not in senescent cells" not in cleaned
+    assert "excludes DNA-damaged cells" not in cleaned
+
+
+def test_figure_one_results_features_exception_and_panel_i_role(targets):
+    row = target(targets, 1)
+    evidence = figure_local_evidence(
+        Path(row["pdf_path"]), row["page_number"], row["caption_page_number"],
+        row["target_number"], row["full_caption"],
+        "Which nuclear features change with senescence and what is the exception?",
+    )
+    grounded = evidence["evidence_text"].casefold()
+    for feature in (
+        "nuclear area", "gyration radius", "compactness", "chord ratio",
+        "displacement", "elongation", "form factor",
+    ):
+        assert feature in grounded
+    assert "except form factor" in grounded
+    panel_i = next(row for row in evidence["panel_map"] if row["panel"] == "i")
+    assert panel_i["role"] == "test_validation_result"
+
+
+def test_simple_figure_question_does_not_pull_unrelated_whole_document_passages(targets):
+    row = target(targets, 1)
+    evidence = figure_local_evidence(
+        Path(row["pdf_path"]), row["page_number"], row["caption_page_number"],
+        row["target_number"], row["full_caption"],
+        "List the visibly labelled structures in this figure.",
+    )
+    assert evidence["requested_answer_slots"] == []
+    assert evidence["supporting_passages"] == []
+
+
+def test_figure_evidence_domains_follow_caption_not_page_spillover(targets):
+    expected = {
+        "1": "in_vitro_human_cell_line",
+        "7": "mouse_animal_tissue",
+        "8": "mouse_animal_tissue",
+        "9": "human_patient_tissue",
+    }
+    for number, domain in expected.items():
+        row = target(targets, number)
+        classified = classify_experimental_evidence(
+            row["full_caption"], row.get("nearby_text", ""),
+            "Human ethics text can occur elsewhere on the page.",
+        )
+        assert classified["experimental_domain"] == domain
+    assert classify_experimental_evidence(
+        target(targets, 8)["full_caption"], "", "human patient consent",
+    )["experimental_domain"] != "human_patient_tissue"
+
+
+def test_figure_eight_partial_vision_path_and_mouse_comparisons_remain_intact(targets):
+    resolution = resolve_visual_target(
+        f"Explain Figure 8 in {TITLE}", load_or_build_visual_index(),
+    )
+    debug = {}
+    partial = {
+        "figure_number": "8",
+        "panels": [{
+            "panel": "a", "visual_type": "workflow",
+            "structured_analysis": {
+                "summary": "Visible mouse senolysis experiment design.",
+                "observations": ["vehicle and senolytic cohorts"],
+            },
+            "confidence": 0.9, "uncertain_items": [],
+        }],
+        "explanation": "", "uncertain_items": [],
+    }
+
+    def fake_analysis(**kwargs):
+        kwargs["debug_info"].update({
+            "final_answer_path": "validated_typed_vision",
+            "validated_json": partial,
+        })
+        return "provisional"
+
+    with patch("services.visual_runtime.analyse_pdf_page", side_effect=fake_analysis):
+        answer = analyse_resolved_visual("Explain Figure 8", resolution, debug_info=debug)
+    assert debug["final_answer_code_path"] == "validated_partial_vision_with_text_fallback"
+    assert debug["coverage_synthesis_applied"] is False
+    assert "senolytic" in answer.casefold() and "ccl" in answer.casefold()
+    assert "young" in answer.casefold() and "old" in answer.casefold()
+
+
+def test_whole_document_evidence_populates_three_distinct_domains():
+    context, sources = retrieve_context(
+        f"Which figures provide evidence from cell culture, mouse animal and human patient experiments in {TITLE}?",
+        "", EvidenceCollection(), Embedder(), Reranker(),
+    )
+    assert sources
+    for domain in (
+        "in_vitro_human_cell_line", "mouse_animal_tissue", "human_patient_tissue",
+    ):
+        assert domain in context
+    mouse_items = [
+        item for item in sources
+        if item.get("experimental_provenance", {}).get("experimental_domain") == "mouse_animal_tissue"
+    ]
+    assert any(item["experimental_provenance"].get("figure_or_panel") == "Figure 8" for item in mouse_items)
+    assert all(
+        item.get("experimental_provenance", {}).get("figure_or_panel") != "Figure 8"
+        for item in sources
+        if item.get("experimental_provenance", {}).get("experimental_domain") == "human_patient_tissue"
+    )
+
+
+def test_discussion_limitations_cover_author_stated_biological_limits():
+    text_path = Path("data/extracted_text") / PDF_NAME.replace(".pdf", ".txt")
+    text = text_path.read_text(encoding="utf-8")
+    discussion = text[text.find("Discussion"):text.find("Methods")]
+    result = extract_discussion_limitations([discussion])
+    statements = " ".join(item["statement"] for item in result["items"]).casefold()
+    assert result["status"] == "explicit_author_limitations"
+    assert "heterogeneity" in statements
+    assert "imr90" in statements and "barasertib" in statements
+    assert "morphology" in statements and "largely unchanged" in statements
+    assert "markers" in statements and "affect the comparisons" in statements
+    assert "adaptation" in statements and "other tissues" in statements
+
+
+def test_classifier_taxonomy_uses_only_explicit_source_descriptions():
+    text_path = Path("data/extracted_text") / PDF_NAME.replace(".pdf", ".txt")
+    taxonomy = extract_explicit_classifier_taxonomy(text_path.read_text(encoding="utf-8"))
+    by_name = {row["name"]: row["source_description"] for row in taxonomy}
+    assert "AEMCP" in by_name and "classification tree-based" in by_name["AEMCP"]
+    assert "AERFMCP" in by_name and "random forest-based" in by_name["AERFMCP"]
+    assert all("umbrella" not in value.casefold() for value in by_name.values())
+
+
+def test_normal_focused_retrieval_exposes_non_methods_answer_slots():
+    context, _ = retrieve_context(
+        "Which nuclear features change with senescence?", "",
+        EvidenceCollection(), Embedder(), Reranker(),
+    )
+    assert "[QUESTION COVERAGE]" in context
+    assert "changing nuclear features" in context
