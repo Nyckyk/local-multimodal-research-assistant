@@ -5,7 +5,7 @@ from services.document_matching import explicit_document_matches
 from services.scientific_evidence import (
     classify_experimental_evidence,
     extract_explicit_classifier_taxonomy,
-    experimental_provenance,
+    experimental_evidence_object,
     requested_answer_slots,
 )
 from settings import FINAL_RESULTS, INITIAL_RESULTS
@@ -1539,7 +1539,8 @@ def _retrieve_cross_domain_context(
                 "caption": caption,
                 "results": nearby,
                 "classification": classification,
-                "figure_or_panel": f"Figure {visual.get('target_number', '')}",
+                "figure_number": visual.get("target_number"),
+                "panel": visual.get("panel"),
             })
     except (OSError, ValueError, TypeError):
         evidence_objects = []
@@ -1550,7 +1551,8 @@ def _retrieve_cross_domain_context(
             "caption": "",
             "results": document,
             "classification": classify_experimental_evidence("", document, ""),
-            "figure_or_panel": None,
+            "figure_number": None,
+            "panel": None,
         } for document, metadata in rows]
     selected, provenance_rows = [], []
     for domain, query in domain_queries.items():
@@ -1563,6 +1565,20 @@ def _retrieve_cross_domain_context(
             continue
         scores = reranker.predict([[query, row["caption"] or row["document"]] for row in domain_rows])
         ranked = sorted(zip(scores, domain_rows), key=lambda row: float(row[0]), reverse=True)
+        main_rows = [
+            pair for pair in ranked
+            if re.fullmatch(r"\d+(?:\.\d+)?", str(pair[1].get("figure_number", "")))
+        ]
+        if main_rows:
+            earliest = min(
+                main_rows,
+                key=lambda pair: (
+                    int(pair[1]["metadata"].get("page", 10**9))
+                    if isinstance(pair[1]["metadata"].get("page"), int) else 10**9,
+                    -float(pair[0]),
+                ),
+            )
+            ranked = [earliest, *[pair for pair in ranked if pair[1] is not earliest[1]]]
         used_pages = set()
         for score, row in ranked:
             document, metadata = row["document"], row["metadata"]
@@ -1570,10 +1586,16 @@ def _retrieve_cross_domain_context(
             if page in used_pages:
                 continue
             item = _source_item(score, document, metadata, f"domain:{domain}")
-            item["experimental_provenance"] = {
-                **experimental_provenance(row["caption"] or document, row["figure_or_panel"]),
-                **row["classification"],
-            }
+            item["experimental_provenance"] = experimental_evidence_object(
+                document=str(metadata.get("pdf", metadata.get("source", ""))),
+                figure_number=row["figure_number"],
+                page=page,
+                caption=row["caption"],
+                results=row["results"],
+                panel=row["panel"],
+            )
+            item["figure_number"] = row["figure_number"]
+            item["panel"] = row["panel"]
             selected.append(item)
             provenance_rows.append(item["experimental_provenance"])
             used_pages.add(page)
@@ -1586,7 +1608,10 @@ def _retrieve_cross_domain_context(
         "Keep in-vitro cell lines, primary cells, animal models, ex-vivo tissue, "
         "and human clinical/patient tissue distinct. A human-derived immortalized "
         "cell line is not human patient evidence. Preserve figure/panel and experiment "
-        "provenance; do not transfer a threshold or control between experiments."
+        "provenance; do not transfer a threshold or control between experiments. Figure "
+        "identifiers in the provenance JSON are authoritative. Never generate a main or "
+        "supplementary figure identifier from semantic text. If figure_number is null, say "
+        "'figure number not resolved'."
     )
     return _format_context(selected, prefix), selected
 

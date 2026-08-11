@@ -7,8 +7,11 @@ from pathlib import Path
 
 from services.ollama_service import generate_answer
 from services.scientific_evidence import (
+    apply_grounded_slot_fallback,
+    authoritative_panel_role_map,
     caption_results_fallback,
     contradiction_check_condition_prose,
+    enforce_authoritative_panel_prose,
     figure_local_evidence,
     merge_mixed_figure_with_caption,
     remove_unsupported_acronym_expansions,
@@ -119,26 +122,42 @@ def analyse_resolved_visual(
             "author statement explicitly supports that scope. Panel summaries are intermediate "
             "evidence and must not replace the higher-level answer requested.\n"
             f"Provisional validated visual path: {authoritative_path}\n"
+            "[AUTHORITATIVE PANEL ROLE MAP]\n"
+            f"{json.dumps(authoritative_panel_role_map(local_evidence['panel_map']), ensure_ascii=False)}\n\n"
+            "[RESOLVED ANSWER SLOT EVIDENCE]\n"
+            f"{json.dumps(local_evidence['slot_evidence'], ensure_ascii=False)}\n\n"
             f"[VALIDATED VISUAL EVIDENCE]\n{answer}\n\n"
             "[EXPLICIT CONDITION OUTCOMES]\n"
             f"{json.dumps(local_evidence['explicit_condition_outcomes'], ensure_ascii=False)}\n\n"
+            "[AUTHORITATIVE CONDITION TUPLES]\n"
+            f"{json.dumps(local_evidence['condition_tuples'], ensure_ascii=False)}\n\n"
             "[EXPLICIT CLASSIFIER TAXONOMY]\n"
             f"{json.dumps(local_evidence['explicit_classifier_taxonomy'], ensure_ascii=False)}\n\n"
             f"{composed_evidence}"
         )
         coverage_debug = {}
         answer = generate_answer(question, synthesis_context, [], coverage_debug)
+        answer, grounded_slots_appended = apply_grounded_slot_fallback(
+            answer, local_evidence["slot_evidence"],
+        )
+        answer, panel_claims_removed = enforce_authoritative_panel_prose(
+            answer, local_evidence["panel_map"],
+        )
         removed_claims = []
         if "condition-specific outcomes" in slots:
             answer, removed_claims = contradiction_check_condition_prose(
                 answer, local_evidence["explicit_condition_outcomes"],
+                local_evidence["condition_tuples"],
             )
             if removed_claims:
+                statements = list(dict.fromkeys(
+                    statement
+                    for row in local_evidence["condition_tuples"]
+                    for statement in row.get("author_statements", [])
+                ))
                 answer = (
                     f"{answer.rstrip()}\n\n**Explicit author-reported condition outcomes**\n\n"
-                    + "\n".join(
-                        f"- {statement}" for statement in local_evidence["explicit_condition_outcomes"]
-                    )
+                    + "\n".join(f"- {statement}" for statement in statements)
                 )
         answer = remove_unsupported_acronym_expansions(answer, local_evidence["glossary"])
         if debug_info is not None:
@@ -146,6 +165,8 @@ def analyse_resolved_visual(
                 "requested_answer_slots": slots,
                 "coverage_synthesis_applied": True,
                 "coverage_synthesis_debug": coverage_debug,
+                "grounded_slots_appended": grounded_slots_appended,
+                "panel_claims_removed": panel_claims_removed,
                 "condition_claims_removed": removed_claims,
                 "final_answer_code_path": authoritative_path,
             })

@@ -12,11 +12,15 @@ from rag.retrieval import (
 from services.document_matching import explicit_document_matches
 from services.query_rewriter import rewrite_question
 from services.scientific_evidence import (
+    apply_grounded_slot_fallback,
+    authoritative_panel_role_map,
     caption_results_fallback,
     classify_experimental_evidence,
     classify_experimental_domain,
     contradiction_check_condition_prose,
     document_glossary,
+    enforce_authoritative_panel_prose,
+    experimental_evidence_object,
     extract_explicit_classifier_taxonomy,
     extract_caption_panels,
     figure_local_evidence,
@@ -25,6 +29,7 @@ from services.scientific_evidence import (
     requested_answer_slots,
     structured_semantically_sufficient,
     unsupported_source_completion,
+    validate_classifier_taxonomy_prose,
 )
 from services.structured_vision import validate_compact_comparison, validate_compact_panel_response, validate_labelled_diagram
 from services.visual_index import flatten_visual_targets, load_or_build_visual_index
@@ -126,7 +131,53 @@ def test_long_summary_uses_correct_document():
 def test_figure_one_has_complete_a_to_i_panel_map(targets):
     row = target(targets, 1)
     assert row["page_number"] == 3 and row["caption_page_number"] == 4
-    assert [item["panel"] for item in extract_caption_panels(row["full_caption"])] == list("abcdefghi")
+    panel_map = extract_caption_panels(row["full_caption"])
+    assert [item["panel"] for item in panel_map] == list("abcdefghi")
+    roles = {item["panel"]: item["role"] for item in panel_map}
+    assert roles == {
+        "a": "experimental_design",
+        "b": "marker_quantification",
+        "c": "marker_quantification",
+        "d": "marker_quantification",
+        "e": "microscopy",
+        "f": "nuclear_feature_distribution",
+        "g": "training_workflow",
+        "h": "training_result",
+        "i": "test_validation_result",
+    }
+
+
+def test_full_caption_overrides_wrong_vision_panel_identity(targets):
+    panel_map = extract_caption_panels(target(targets, 1)["full_caption"])
+    wrong = {
+        "figure_number": "1",
+        "panels": [{
+            "panel": panel,
+            "visual_type": "plot",
+            "structured_analysis": {"summary": "nuclear morphology plot"},
+        } for panel in "cde"],
+    }
+    merged, _ = merge_mixed_figure_with_caption(wrong, panel_map)
+    rows = {row["panel"]: row for row in merged["panels"]}
+    assert rows["c"]["structured_analysis"]["role"] == "marker_quantification"
+    assert rows["d"]["structured_analysis"]["role"] == "marker_quantification"
+    assert rows["e"]["structured_analysis"]["role"] == "microscopy"
+    assert all(
+        row["structured_analysis"]["summary"] != "nuclear morphology plot"
+        for row in (rows["c"], rows["d"], rows["e"])
+    )
+
+
+def test_caption_authority_removes_reconstructed_likely_panel_claim(targets):
+    panel_map = extract_caption_panels(target(targets, 1)["full_caption"])
+    answer, removed = enforce_authoritative_panel_prose(
+        "Panels C–E likely display nuclear morphology. The classifiers are then evaluated.",
+        panel_map,
+    )
+    assert removed
+    assert "likely" not in answer.casefold()
+    assert "Panel c" in answer and "Panel i" in answer
+    assert authoritative_panel_role_map(panel_map)["i"]["role"] == "test_validation_result"
 
 
 def test_schema_valid_but_empty_diagram_is_rejected():
@@ -303,6 +354,15 @@ def test_figure_five_question_slots_and_grounded_counts(targets):
     assert "GFP" in grounded and "mCherry" in grounded
     assert "ABT-263" in grounded and "ABT-737" in grounded
     assert "GM classi" in grounded and "A549" in grounded and "IMR90" in grounded
+    first_stage = " ".join(
+        item["text"] for item in evidence["slot_evidence"]["first experiment"]["evidence"]
+    ).casefold()
+    later_stage = " ".join(
+        item["text"] for item in evidence["slot_evidence"]["later screening experiment"]["evidence"]
+    ).casefold()
+    assert "selectively reduced" in first_stage and "aem" in first_stage
+    for expected in ("676", "27", "11", "18", "gm classi"):
+        assert expected in later_stage
 
 
 def test_figure_five_fallback_gets_shared_coverage_synthesis(targets):
@@ -330,7 +390,8 @@ def test_figure_five_fallback_gets_shared_coverage_synthesis(targets):
     assert debug["final_answer_code_path"] == "grounded_caption_results_fallback"
     assert debug["coverage_synthesis_applied"]
     assert "676" in captured["context"]
-    assert answer.startswith("compounds screened") and "unsafe raw" not in answer
+    assert "compounds screened" in answer and "unsafe raw" not in answer
+    assert answer.startswith("**Caption-defined panel roles**")
 
 
 @pytest.mark.parametrize("partial, expected_path", [
@@ -389,6 +450,14 @@ def test_figure_two_condition_evidence_preserves_author_distinctions(targets):
     for term in ("growing", "irradiated", "MLN8054", "etoposide", "53BP1"):
         assert term.casefold() in grounded.casefold()
     assert "less than 30%" in grounded
+    tuple_text = " ".join(
+        f"{row['condition']} {' '.join(row['author_statements'])}"
+        for row in evidence["condition_tuples"]
+    ).casefold()
+    for condition in ("growing", "irradiated", "mln8054", "etoposide"):
+        assert condition in tuple_text
+    assert "mln8054" in tuple_text and "did not observe significant amounts of dna damage" in tuple_text
+    assert "etoposide" in tuple_text and "53bp1" in tuple_text
     cleaned, removed = contradiction_check_condition_prose(
         "53BP1 foci are present in irradiated cells but not in senescent cells. "
         "AEM excludes DNA-damaged cells.",
@@ -412,8 +481,27 @@ def test_figure_one_results_features_exception_and_panel_i_role(targets):
     ):
         assert feature in grounded
     assert "except form factor" in grounded
+    assert evidence["slot_evidence"]["changing nuclear features"]["status"] == "grounded"
+    assert evidence["slot_evidence"]["feature exceptions"]["status"] == "grounded"
     panel_i = next(row for row in evidence["panel_map"] if row["panel"] == "i")
     assert panel_i["role"] == "test_validation_result"
+
+
+def test_grounded_feature_slot_replaces_premature_not_found_warning(targets):
+    row = target(targets, 1)
+    evidence = figure_local_evidence(
+        Path(row["pdf_path"]), row["page_number"], row["caption_page_number"],
+        row["target_number"], row["full_caption"],
+        "Which nuclear features change with senescence and what is the exception?",
+    )
+    answer, appended = apply_grounded_slot_fallback(
+        "- changing nuclear features: Not specified in retrieved evidence.\n"
+        "- feature exceptions: Not found.",
+        evidence["slot_evidence"],
+    )
+    assert {"changing nuclear features", "feature exceptions"}.issubset(appended)
+    assert "not specified" not in answer.casefold() and "not found" not in answer.casefold()
+    assert "form factor" in answer.casefold()
 
 
 def test_simple_figure_question_does_not_pull_unrelated_whole_document_passages(targets):
@@ -494,6 +582,21 @@ def test_whole_document_evidence_populates_three_distinct_domains():
         if item.get("experimental_provenance", {}).get("experimental_domain") == "mouse_animal_tissue"
     ]
     assert any(item["experimental_provenance"].get("figure_or_panel") == "Figure 8" for item in mouse_items)
+    main_items = [
+        item for item in sources
+        if item.get("experimental_provenance", {}).get("experimental_domain") == "in_vitro_human_cell_line"
+    ]
+    human_items = [
+        item for item in sources
+        if item.get("experimental_provenance", {}).get("experimental_domain") == "human_patient_tissue"
+    ]
+    assert any(item["experimental_provenance"].get("figure_number") == "1" for item in main_items)
+    assert any(item["experimental_provenance"].get("figure_number") == "8" for item in mouse_items)
+    assert any(item["experimental_provenance"].get("figure_number") == "9" for item in human_items)
+    assert all(
+        not str(item["experimental_provenance"].get("figure_label", "")).casefold().startswith("supplementary")
+        for item in sources
+    )
     assert all(
         item.get("experimental_provenance", {}).get("figure_or_panel") != "Figure 8"
         for item in sources
@@ -522,6 +625,49 @@ def test_classifier_taxonomy_uses_only_explicit_source_descriptions():
     assert "AEMCP" in by_name and "classification tree-based" in by_name["AEMCP"]
     assert "AERFMCP" in by_name and "random forest-based" in by_name["AERFMCP"]
     assert all("umbrella" not in value.casefold() for value in by_name.values())
+    vca = next(row for row in taxonomy if row["name"] == "VCA")
+    assert "consensus" in vca["source_description"].casefold()
+    assert vca["ambiguous_source_wording"]
+
+
+def test_unsupported_classifier_family_and_unqualified_vca_relabel_are_removed():
+    taxonomy = [
+        {
+            "name": "AEMCP", "source_description": "classification tree-based",
+            "source_descriptions": ["classification tree-based"],
+            "ambiguous_source_wording": False, "relationships": [],
+        },
+        {
+            "name": "VCA", "source_description": "voting-based consensus algorithm",
+            "source_descriptions": [
+                "voting-based consensus algorithm", "Voting-Based Clustering Algorithm",
+            ],
+            "ambiguous_source_wording": True, "relationships": [],
+        },
+    ]
+    cleaned, removed = validate_classifier_taxonomy_prose(
+        "AEMCP is an umbrella family. VCA is a clustering algorithm.", taxonomy,
+    )
+    assert len(removed) == 2
+    assert "umbrella family" not in cleaned and "VCA is a clustering" not in cleaned
+    assert "source wording for VCA is inconsistent" in cleaned
+
+
+def test_experimental_evidence_object_requires_explicit_figure_identifier():
+    resolved = experimental_evidence_object(
+        PDF_NAME, "8", 11,
+        caption="Fig. 8 shows mouse liver tissue from young and old mice.",
+    )
+    assert {
+        "document", "figure_number", "panel", "page", "experimental_domain",
+        "species", "sample_type", "source_text", "source_provenance",
+    }.issubset(resolved)
+    assert resolved["figure_number"] == "8" and resolved["figure_label"] == "Figure 8"
+    unresolved = experimental_evidence_object(
+        PDF_NAME, None, 11, results="Mouse tissue results mention Supplementary Fig. 10.",
+    )
+    assert unresolved["figure_number"] is None
+    assert unresolved["figure_label"] == "figure number not resolved"
 
 
 def test_normal_focused_retrieval_exposes_non_methods_answer_slots():

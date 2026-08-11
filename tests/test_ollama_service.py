@@ -3,7 +3,11 @@ from __future__ import annotations
 import re
 from unittest.mock import patch
 
-from services.ollama_service import generate_answer
+from services.ollama_service import (
+    _clean_generation_artifacts,
+    _enforce_experimental_figure_provenance,
+    generate_answer,
+)
 from settings import NORMAL_NUM_PREDICT, SUMMARY_NUM_PREDICT
 
 
@@ -61,6 +65,31 @@ def test_complete_short_answer_does_not_trigger_continuation_or_summary_budget()
     assert chat.call_count == 1
     assert chat.call_args.kwargs["options"]["num_predict"] == NORMAL_NUM_PREDICT
     assert not debug["continuation_used"]
+
+
+def test_compound_screen_continuation_grammar_is_cleaned():
+    cleaned, changed = _clean_generation_artifacts(
+        "Finally, **1 were identified as selective and 18 were shared."
+    )
+    assert changed
+    assert "1 was identified" in cleaned
+    assert cleaned.count("**") % 2 == 0
+
+
+def test_whole_document_provenance_rejects_invented_supplementary_figure():
+    context = (
+        '[WHOLE-DOCUMENT EXPERIMENTAL-DOMAIN EVIDENCE]\n'
+        '[{"document":"paper.pdf","figure_number":"8","figure_label":"Figure 8",'
+        '"panel":null,"page":11,"experimental_domain":"mouse_animal_tissue",'
+        '"species":"mouse","sample_type":"liver","source_text":"caption",'
+        '"source_provenance":["full_caption"]}]\nEvidence'
+    )
+    answer, invalid, appended = _enforce_experimental_figure_provenance(
+        context, "Mouse ageing is shown in implied Figure S10.",
+    )
+    assert invalid == ["Figure S10"]
+    assert "Figure S10" not in answer
+    assert "Figure 8" in answer and appended
 
 
 def test_missing_requested_summary_section_triggers_only_one_retry():

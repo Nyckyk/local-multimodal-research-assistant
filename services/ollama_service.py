@@ -7,6 +7,7 @@ from services.scientific_evidence import (
     document_glossary,
     extract_explicit_classifier_taxonomy,
     remove_unsupported_acronym_expansions,
+    validate_classifier_taxonomy_prose,
 )
 from settings import NORMAL_NUM_PREDICT, OLLAMA_MODEL, SUMMARY_NUM_PREDICT
 
@@ -33,6 +34,71 @@ def _response_text(response) -> str:
     else:
         content = getattr(message, "content", None) or getattr(message, "thinking", None)
     return str(content or "").strip()
+
+
+def _validated_experimental_provenance(context: str) -> list[dict]:
+    marker = "[WHOLE-DOCUMENT EXPERIMENTAL-DOMAIN EVIDENCE]"
+    _, found, remainder = str(context or "").partition(marker)
+    if not found or (start := remainder.find("[")) < 0:
+        return []
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(remainder[start:])
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
+
+
+def _enforce_experimental_figure_provenance(
+    context: str, answer: str,
+) -> tuple[str, list[str], bool]:
+    rows = _validated_experimental_provenance(context)
+    if not rows:
+        return answer, [], False
+    allowed = {
+        str(row["figure_number"]).casefold()
+        for row in rows if row.get("figure_number") not in (None, "")
+    }
+    invalid = []
+
+    def replace(match):
+        number = re.sub(r"\s+", "", match.group("number")).casefold()
+        if number in allowed and not match.group("supplementary"):
+            return match.group(0)
+        invalid.append(match.group(0))
+        return "figure number not resolved"
+
+    value = re.sub(
+        r"\b(?P<supplementary>Supplementary\s+)?Fig(?:ure)?\.?\s*"
+        r"(?P<number>[A-Za-z]?\s*\d+(?:\.\d+)?)\b",
+        replace, str(answer or ""), flags=re.I,
+    )
+    provenance_lines = []
+    seen = set()
+    for row in rows:
+        domain = row.get("experimental_domain")
+        label = row.get("figure_label") or "figure number not resolved"
+        signature = (domain, label, row.get("page"))
+        if not domain or signature in seen:
+            continue
+        seen.add(signature)
+        sample = row.get("sample_type") or "sample type not resolved"
+        provenance_lines.append(
+            f"- {domain}: {label}, page {row.get('page')}; {sample}."
+        )
+    appended = False
+    if provenance_lines and "**Evidence provenance**" not in value:
+        value = f"{value.rstrip()}\n\n**Evidence provenance**\n\n" + "\n".join(provenance_lines)
+        appended = True
+    return value.strip(), invalid, appended
+
+
+def _clean_generation_artifacts(answer: str) -> tuple[str, bool]:
+    value = str(answer or "")
+    cleaned = re.sub(r"\b1\s+were\b", "1 was", value, flags=re.I)
+    if cleaned.count("**") % 2:
+        index = cleaned.rfind("**")
+        cleaned = cleaned[:index] + cleaned[index + 2:]
+    return cleaned.strip(), cleaned != value
 
 
 def _requested_summary_sections(question: str) -> list[str]:
@@ -499,6 +565,16 @@ EVIDENCE RULES:
       or umbrella families from a model name.
   19. A caption/panel inventory is intermediate evidence. Directly answer higher-
       level explanatory clauses using supplied Results or Methods evidence.
+  20. AUTHORITATIVE PANEL ROLE MAP comes from the full author caption. Use its
+      panel assignments exactly and never reconstruct them with words such as
+      likely or probably.
+  21. Before saying a requested figure slot was not found, exhaust RESOLVED
+      ANSWER SLOT EVIDENCE. Keep separately numbered experiment stages separate.
+  22. AUTHORITATIVE CONDITION TUPLES preserve treatment-specific Results claims.
+      Do not collapse distinct treatments into one generic condition.
+  23. WHOLE-DOCUMENT EXPERIMENTAL-DOMAIN provenance supplies the only permitted
+      figure identifiers for those evidence objects. Never infer a supplementary
+      figure number from nearby semantic text.
 {section_rule}
 
 Supplied evidence:
@@ -754,11 +830,19 @@ text or the labelled visual analysis.
             for slot in final_missing_coverage
         )
     supported_terms = document_glossary(context)
+    classifier_taxonomy = extract_explicit_classifier_taxonomy(context)
     supported_terms.update({
         row["name"]: row["source_description"]
-        for row in extract_explicit_classifier_taxonomy(context)
+        for row in classifier_taxonomy
     })
     answer = remove_unsupported_acronym_expansions(answer, supported_terms)
+    answer, classifier_claims_removed = validate_classifier_taxonomy_prose(
+        answer, classifier_taxonomy,
+    )
+    answer, invalid_figure_references, provenance_appended = (
+        _enforce_experimental_figure_provenance(context, answer)
+    )
+    answer, generation_artifacts_cleaned = _clean_generation_artifacts(answer)
     (
         answer,
         multi_figure_details_appended,
@@ -811,6 +895,10 @@ text or the labelled visual analysis.
             "requested_answer_slots": coverage_slots,
             "final_missing_coverage_slots": final_missing_coverage,
             "unsupported_standard_practice_completion_removed": unsupported_completion_removed,
+            "classifier_taxonomy_claims_removed": classifier_claims_removed,
+            "invalid_figure_references_removed": invalid_figure_references,
+            "experimental_provenance_appended": provenance_appended,
+            "generation_artifacts_cleaned": generation_artifacts_cleaned,
             "final_incomplete_ending": _ends_incomplete(answer),
             "response_characters": len(answer),
             "response_words": len(answer.split()),
