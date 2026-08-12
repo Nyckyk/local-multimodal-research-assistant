@@ -196,10 +196,12 @@ def test_mixed_figure_uses_caption_results_fallback_on_vision_failure(targets, n
         f"Explain Figure {number} in {TITLE}", index
     )
     debug = {}
-    with patch("services.visual_runtime.analyse_pdf_page", side_effect=lambda **kwargs: kwargs["debug_info"].update({"final_answer_path": "grounded_caption_summary_fallback"}) or "unsafe raw"):
+    with patch("services.visual_runtime.analyse_pdf_page", side_effect=lambda **kwargs: kwargs["debug_info"].update({"final_answer_path": "grounded_caption_summary_fallback"}) or "unsafe raw"), patch(
+        "services.visual_runtime.generate_answer", return_value="unvalidated provisional prose",
+    ):
         answer = analyse_resolved_visual("Explain every panel", resolution, debug_info=debug)
     assert debug["final_answer_code_path"] == "grounded_caption_results_fallback"
-    assert "caption- and Results-grounded" in answer
+    assert f"Figure {number} — grounded explanation" in answer
     assert "unsafe raw" not in answer
 
 
@@ -390,8 +392,8 @@ def test_figure_five_fallback_gets_shared_coverage_synthesis(targets):
     assert debug["final_answer_code_path"] == "grounded_caption_results_fallback"
     assert debug["coverage_synthesis_applied"]
     assert "676" in captured["context"]
-    assert "compounds screened" in answer and "unsafe raw" not in answer
-    assert answer.startswith("**Caption-defined panel roles**")
+    assert "676 drugs were screened" in answer and "unsafe raw" not in answer
+    assert answer.startswith("**Figure 5 — grounded explanation**")
 
 
 @pytest.mark.parametrize("partial, expected_path", [
@@ -559,10 +561,12 @@ def test_figure_eight_partial_vision_path_and_mouse_comparisons_remain_intact(ta
         })
         return "provisional"
 
-    with patch("services.visual_runtime.analyse_pdf_page", side_effect=fake_analysis):
+    with patch("services.visual_runtime.analyse_pdf_page", side_effect=fake_analysis), patch(
+        "services.visual_runtime.generate_answer", return_value="unvalidated provisional prose",
+    ):
         answer = analyse_resolved_visual("Explain Figure 8", resolution, debug_info=debug)
     assert debug["final_answer_code_path"] == "validated_partial_vision_with_text_fallback"
-    assert debug["coverage_synthesis_applied"] is False
+    assert debug["coverage_synthesis_applied"] is True
     assert "senolytic" in answer.casefold() and "ccl" in answer.casefold()
     assert "young" in answer.casefold() and "old" in answer.casefold()
 

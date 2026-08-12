@@ -3,6 +3,12 @@ import re
 
 import ollama
 
+from services.final_answer_composer import (
+    build_provenance_final_answer_evidence,
+    parse_final_evidence_context,
+    render_final_answer_evidence,
+    validate_answer_consistency,
+)
 from services.scientific_evidence import (
     document_glossary,
     extract_explicit_classifier_taxonomy,
@@ -99,6 +105,112 @@ def _clean_generation_artifacts(answer: str) -> tuple[str, bool]:
         index = cleaned.rfind("**")
         cleaned = cleaned[:index] + cleaned[index + 2:]
     return cleaned.strip(), cleaned != value
+
+
+def _generate_from_final_answer_evidence(
+    question: str, evidence: dict, debug_info: dict | None = None,
+) -> str:
+    """Verbalize one authoritative object, repair once, then render safely."""
+    serialized = json.dumps(evidence, ensure_ascii=False)
+    prompt = f"""
+Write the final user-facing answer using only FINAL_ANSWER_EVIDENCE below.
+
+Authority is already resolved in the object. Do not reinterpret figure or panel
+identity, experimental domains, condition membership, measurements, or numeric
+values. Explicit author Results/Methods outrank full captions; full captions
+outrank validated visual evidence; model inference is last. Integrate facts into
+concise prose rather than copying source chunks. Keep distinct conditions and
+experiment stages separate. For a panelled figure, identify every caption-mapped
+panel. For experimental-domain synthesis, organize by domain and use only each
+record's figure_number. Never invent supplementary figures. Do not say a field is
+missing when the object contains it. Use balanced Markdown.
+
+Question: {question}
+
+FINAL_ANSWER_EVIDENCE:
+{serialized}
+"""
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a constrained evidence verbalizer. The supplied object "
+                "has already resolved factual conflicts; do not re-reason from it."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    response = ollama.chat(
+        model=OLLAMA_MODEL,
+        messages=messages,
+        think=False,
+        options={"temperature": 0, "num_predict": NORMAL_NUM_PREDICT},
+    )
+    initial = _response_text(response)
+    initial_errors = validate_answer_consistency(initial, evidence)
+    attempts = [{
+        "kind": "initial",
+        "done_reason": str(_response_value(response, "done_reason", "") or ""),
+        "errors": initial_errors,
+        "response_characters": len(initial),
+    }]
+    answer = initial
+    repair_errors = []
+    if initial_errors:
+        repair_prompt = f"""
+Rewrite the answer once so it exactly verbalizes FINAL_ANSWER_EVIDENCE.
+Remove or replace every conflicting sentence; do not append corrections to the
+bad answer. Do not copy raw chunks. The validator reported:
+- {chr(10).join(initial_errors)}
+
+Bad answer:
+{initial}
+
+FINAL_ANSWER_EVIDENCE:
+{serialized}
+"""
+        repaired_response = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=[
+                messages[0],
+                {"role": "user", "content": repair_prompt},
+            ],
+            think=False,
+            options={"temperature": 0, "num_predict": NORMAL_NUM_PREDICT},
+        )
+        repaired = _response_text(repaired_response)
+        repair_errors = validate_answer_consistency(repaired, evidence)
+        attempts.append({
+            "kind": "consistency_repair",
+            "done_reason": str(_response_value(repaired_response, "done_reason", "") or ""),
+            "errors": repair_errors,
+            "response_characters": len(repaired),
+        })
+        answer = repaired
+    deterministic_fallback = bool(repair_errors or not answer)
+    if deterministic_fallback:
+        answer = render_final_answer_evidence(evidence)
+    final_errors = validate_answer_consistency(answer, evidence)
+    if final_errors:
+        # The deterministic renderer should be self-consistent. Keep this as a
+        # clear failure rather than displaying prose known to contradict the
+        # evidence object.
+        answer = "Could not verify a final answer against the resolved evidence object."
+    if debug_info is not None:
+        debug_info.update({
+            "final_answer_evidence": evidence,
+            "generation_attempts": attempts,
+            "initial_evidence_consistency_errors": initial_errors,
+            "repair_evidence_consistency_errors": repair_errors,
+            "final_evidence_consistency_errors": final_errors,
+            "evidence_repair_used": bool(initial_errors),
+            "deterministic_evidence_fallback_used": deterministic_fallback,
+            "final_answer_code_path": (
+                "deterministic_evidence_renderer" if deterministic_fallback
+                else "validated_grounded_evidence_composition"
+            ),
+        })
+    return answer
 
 
 def _requested_summary_sections(question: str) -> list[str]:
@@ -487,6 +599,18 @@ def generate_answer(
     conversation_history: list[dict],
     debug_info: dict | None = None,
 ) -> str:
+    final_answer_evidence = parse_final_evidence_context(context)
+    if final_answer_evidence is None:
+        provenance = _validated_experimental_provenance(context)
+        if provenance:
+            final_answer_evidence = build_provenance_final_answer_evidence(
+                question, provenance,
+            )
+    if final_answer_evidence is not None:
+        return _generate_from_final_answer_evidence(
+            question, final_answer_evidence, debug_info,
+        )
+
     summary_mode = "[DOCUMENT SUMMARY MODE]" in context
     requested_sections = _requested_summary_sections(question) if summary_mode else []
     grounded_items = _validated_framework_items(context)
