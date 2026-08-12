@@ -234,6 +234,9 @@ def test_figure_five_renderer_recovers_caption_defined_stage_boundaries(figure_e
     evidence["experiment_stages"][0]["required_terms"].extend([
         "ABT-263", "ABT-737", "GFP", "mCherry", "AEM",
     ])
+    evidence["experiment_stages"][0]["facts"].append(
+        "The Stage 2 screen compared A549 and IMR90 and included ABT-263."
+    )
 
     answer = render_final_answer_evidence(evidence)
     stage_one = next(line for line in answer.splitlines() if "**Stage 1" in line)

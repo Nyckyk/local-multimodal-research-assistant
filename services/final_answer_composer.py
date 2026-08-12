@@ -1511,7 +1511,10 @@ def _fact_allowed_in_stage(
     normal_fact = _normal(fact)
     own_hits = {token for token in own_entities if token and token in normal_fact}
     other_hits = {token for token in other_entities if token and token in normal_fact}
-    if other_hits and not own_hits:
+    # A fact containing an entity owned exclusively by another stage must not
+    # cross the boundary merely because it also contains a shared/current-stage
+    # entity. Explicit panel references above are the grounded exception.
+    if other_hits:
         return False
     if own_hits and not other_hits:
         return True
