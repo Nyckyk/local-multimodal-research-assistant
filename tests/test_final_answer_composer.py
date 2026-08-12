@@ -14,7 +14,7 @@ from services.final_answer_composer import (
     validate_answer_consistency,
 )
 from services.ollama_service import generate_answer
-from services.scientific_evidence import figure_local_evidence
+from services.scientific_evidence import experimental_evidence_object, figure_local_evidence
 from services.visual_index import flatten_visual_targets, load_or_build_visual_index
 
 
@@ -113,6 +113,22 @@ def test_figure_one_display_preserves_form_factor_exception(figure_evidence):
     assert "etoposide-treated" in answer and "DMSO-treated" in answer
 
 
+def test_figure_one_display_explains_training_assumption_and_model_types(figure_evidence):
+    answer = render_final_answer_evidence(figure_evidence["1"])
+    assert "etoposide-treated cells were treated as senescent" in answer
+    assert "DMSO-treated cells as normal/non-senescent" in answer
+    assert "AEM is the classification-tree-based model" in answer
+    assert "AERFM is the random-forest-based model" in answer
+
+
+def test_figure_one_display_explains_training_and_independent_validation(figure_evidence):
+    answer = render_final_answer_evidence(figure_evidence["1"])
+    assert "Training result:" in answer
+    assert "similar extent as SA-β-Gal staining" in answer
+    assert "Independent validation:" in answer and "new test samples" in answer
+    assert "no single feature alone was sufficient" in answer
+
+
 def test_figure_one_rejects_speculative_panel_assignment(figure_evidence):
     errors = validate_answer_consistency(
         "Panels C-E likely display nuclear morphology.", figure_evidence["1"],
@@ -148,6 +164,29 @@ def test_figure_two_display_preserves_irradiated_less_than_30_percent(figure_evi
     assert "Less than 30%" in row and "AEM" in row
 
 
+def test_figure_two_measurement_semantics_do_not_migrate_between_markers(figure_evidence):
+    answer = render_final_answer_evidence(figure_evidence["2"])
+    assert "53BP1 foci showed cell-cycle arrest" not in answer
+    assert "53BP1 foci showed that the cells were arrested" not in answer
+    assert "53BP1 foci showed a significant increase (role: DNA-damage marker)" in answer
+    assert "BrdU incorporation showed that the cells were dividing" in answer
+
+
+def test_figure_two_has_no_duplicate_classifier_conclusions(figure_evidence):
+    answer = render_final_answer_evidence(figure_evidence["2"])
+    assert "AEM prediction established the condition as senescent" not in answer
+    irradiated = next(line for line in answer.splitlines() if "**irradiated (DD):**" in line)
+    assert irradiated.count("Less than 30%") == 1
+
+
+def test_figure_two_preserves_relevant_condition_distinctions(figure_evidence):
+    answer = render_final_answer_evidence(figure_evidence["2"])
+    for condition in (
+        "etoposide senescence", "irradiated (DD)", "growing", "MLN8054 senescence",
+    ):
+        assert f"**{condition}:**" in answer
+
+
 def test_figure_five_display_contains_explicit_stage_one(figure_evidence):
     answer = render_final_answer_evidence(figure_evidence["5"])
     stage = next(line for line in answer.splitlines() if "**Stage 1" in line)
@@ -167,6 +206,18 @@ def test_figure_five_display_preserves_all_grounded_counts(figure_evidence):
     answer = render_final_answer_evidence(figure_evidence["5"])
     for value in ("676", "56", "27", "11", "18"):
         assert value in answer
+
+
+def test_figure_five_stage_identity_prevents_cross_stage_entity_leakage(figure_evidence):
+    answer = render_final_answer_evidence(figure_evidence["5"])
+    stage_one = next(line for line in answer.splitlines() if "**Stage 1" in line)
+    stage_two = next(line for line in answer.splitlines() if "**Stage 2" in line)
+    assert "Stage 1 — Senolytic evaluation" in stage_one
+    assert "Stage 2 — Senescence-inducing compound screen" in stage_two
+    for term in ("GFP", "mCherry", "AEM", "ABT-263", "ABT-737"):
+        assert term in stage_one and term not in stage_two
+    for term in ("GM", "676", "56", "27", "11", "18"):
+        assert term in stage_two
 
 
 def test_malformed_or_contradictory_numeric_output_is_rejected(figure_evidence):
@@ -213,6 +264,29 @@ def provenance_evidence():
     )
 
 
+@pytest.fixture(scope="module")
+def detailed_provenance_evidence():
+    targets = [
+        row for row in flatten_visual_targets(load_or_build_visual_index())
+        if row.get("pdf_name") == PDF_NAME
+        and row.get("target_type") == "figure"
+        and row.get("match_kind") == "caption"
+        and row.get("target_number") in {"1", "3", "7", "8", "9"}
+    ]
+    rows = [
+        experimental_evidence_object(
+            PDF_NAME, row["target_number"], row["page_number"],
+            caption=row["full_caption"],
+        )
+        for row in sorted(targets, key=lambda item: int(item["target_number"]))
+    ]
+    return build_provenance_final_answer_evidence(
+        "Which figures provide the strongest evidence from cell culture, mouse animal "
+        "and human patient experiments, and what distinct evidence does each contribute?",
+        rows,
+    )
+
+
 def test_whole_document_evidence_retains_exact_provenance(provenance_evidence):
     mapping = {}
     for row in provenance_evidence["provenance"]:
@@ -230,6 +304,31 @@ def test_whole_document_display_uses_provenance_figure_numbers(provenance_eviden
     assert "Figure 7 and Figure 8" in answer
     assert "Figure 9" in answer
     assert validate_answer_consistency(answer, provenance_evidence) == []
+
+
+def test_whole_document_renderer_explains_each_selected_figure(detailed_provenance_evidence):
+    answer = render_final_answer_evidence(detailed_provenance_evidence)
+    assert "Figure 1" in answer and "training sets for the AEM and AERFM" in answer
+    assert "Figure 3" in answer and "single-cell level" in answer
+    assert "Figure 7" in answer and "liver cancer initiation" in answer
+    assert "Figure 8" in answer and "senolytic drugs" in answer
+    assert "liver fibrosis and aging" in answer
+    assert "Figure 9" in answer and "34 patients" in answer
+    assert "p16INK4a" in answer
+
+
+def test_whole_document_renderer_preserves_three_domains_and_selected_figures(
+    detailed_provenance_evidence,
+):
+    answer = render_final_answer_evidence(detailed_provenance_evidence)
+    for heading in (
+        "In vitro human cell-line evidence", "Mouse animal/tissue evidence",
+        "Human patient-tissue evidence",
+    ):
+        assert heading in answer
+    assert validate_answer_consistency(answer, detailed_provenance_evidence) == []
+    referenced = set(__import__("re").findall(r"\bFigure\s+(\d+)\b", answer))
+    assert referenced == {"1", "3", "7", "8", "9"}
 
 
 def test_resolved_provenance_never_displays_unresolved_figure(provenance_evidence):

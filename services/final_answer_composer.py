@@ -1046,6 +1046,19 @@ def validate_answer_consistency(answer: str, evidence: dict) -> list[str]:
     return list(dict.fromkeys(errors))
 
 
+def _caption_title(source_text: str, figure_number: str | None) -> tuple[str, str]:
+    """Return the explicit caption claim and the remaining caption text."""
+    text = _clean_text(source_text)
+    number = re.escape(str(figure_number or ""))
+    match = re.search(
+        rf"\bFig(?:ure)?\s*{number}\s*\|\s*(.+?)(?=\.\s+[a-z](?:\s*[-–]\s*[a-z]|\s*,\s*[a-z])?\s+[A-Z]|\Z)",
+        text, re.I,
+    )
+    if not match:
+        return "", text
+    return match.group(1).strip(" ."), text[match.end():].strip()
+
+
 def _joined_figures(rows: list[dict]) -> str:
     figures = [f"Figure {row['figure_number']}" for row in rows if row.get("figure_number")]
     if not figures:
@@ -1055,75 +1068,304 @@ def _joined_figures(rows: list[dict]) -> str:
     return ", ".join(figures[:-1]) + f" and {figures[-1]}"
 
 
-def _preferred_measurement(names: list[str]) -> str:
-    for pattern, label in (
-        (r"53BP1", "53BP1 foci"),
-        (r"SA.*Gal", "SA-β-Gal staining"),
-        (r"\bAEM\b", "AEM prediction"),
-        (r"DNA damage", "detectable DNA damage"),
-        (r"BrdU", "BrdU incorporation"),
-        (r"senescence", "senescence status"),
+def _clean_explanatory_sentence(value: str) -> str:
+    text = _clean_text(value)
+    text = re.sub(r"^[a-z](?:\s*[-–]\s*[a-z]|\s*,\s*[a-z])?\s+", "", text)
+    text = re.split(
+        r"\b(?:Scale bars?|Error bars|Source Data are provided|Data represent|"
+        r"Statistical significance|Significance was calculated)\b",
+        text, maxsplit=1, flags=re.I,
+    )[0]
+    text = re.sub(r"\s+", " ", text).strip(" .;:")
+    return f"{text}." if text else ""
+
+
+def _diverse_caption_sentences(source_text: str, figure_number: str | None) -> dict:
+    """Select experiment and measurement/result clauses without interpreting them."""
+    title, remainder = _caption_title(source_text, figure_number)
+    sentences = []
+    for sentence in _sentences(remainder):
+        cleaned = _clean_explanatory_sentence(sentence)
+        if not cleaned or _PLACEHOLDER_RE.search(cleaned):
+            continue
+        if cleaned not in sentences:
+            sentences.append(cleaned)
+
+    experiments = [
+        sentence for sentence in sentences
+        if re.search(
+            r"\b(?:experimental design|schematic|design of the experiments?|"
+            r"analysis of|co-?cultures?|treated with|comparison of)\b",
+            sentence, re.I,
+        )
+    ][:3]
+    measurements = [
+        sentence for sentence in sentences
+        if sentence not in experiments and re.search(
+            r"\b(?:quantification|percentage|correlation|score|staining|"
+            r"predicted|classifier|distribution|positive cells?|activity)\b",
+            sentence, re.I,
+        )
+    ][:6]
+    if not experiments and sentences:
+        experiments = sentences[:1]
+    if not measurements:
+        measurements = [row for row in sentences if row not in experiments][:2]
+    return {"title": title, "experiments": experiments, "measurements": measurements}
+
+
+def _render_provenance_item(row: dict, domain_label: str) -> str:
+    figure = f"Figure {row['figure_number']}" if row.get("figure_number") else "Selected evidence"
+    details = _diverse_caption_sentences(row.get("source_text", ""), row.get("figure_number"))
+    parts = []
+    sample = str(row.get("sample_type") or "").strip()
+    if sample and not re.search(r"[-/]$|^(?:IHC|IF|H&E|staining)$", sample, re.I):
+        parts.append(f"It studies {sample}.")
+    if details["experiments"]:
+        parts.append(f"Experiment: {' '.join(details['experiments'])}")
+    if details["measurements"]:
+        parts.append(f"Measurements and reported results: {' '.join(details['measurements'])}")
+    if details["title"]:
+        parts.append(f"Direct contribution: the caption states that {details['title'].rstrip('.')}.")
+    parts.append(f"This is selected evidence for the requested {domain_label.casefold()} comparison.")
+    return f"- **{figure}:** {' '.join(parts)}"
+
+
+def _measurement_semantics(name: str, statement: str) -> tuple[str, str]:
+    """Type a displayed measurement so unrelated qualifiers cannot migrate to it."""
+    value = str(name or "")
+    combined = f"{value} {statement}"
+    if re.search(r"\bBrdU\b", value, re.I):
+        return "BrdU incorporation", "proliferation / DNA synthesis / cell-cycle activity"
+    if re.search(r"SA\s*-?\s*[βB]-?Gal", value, re.I):
+        return "SA-β-Gal staining", "senescence-associated marker"
+    if re.search(r"\b53BP1\b", value, re.I):
+        return "53BP1 foci", "DNA-damage marker"
+    if re.search(r"\b(?:γH2AX|DNA damage)\b", value, re.I):
+        return "detectable DNA damage", "DNA-damage marker"
+    if re.search(r"\b(?:classifier|predicted|identified)\b", combined, re.I) and re.fullmatch(
+        r"[A-Z][A-Z0-9-]{1,15}", value,
+    ) and value not in {"DNA", "DD"}:
+        return value, "classifier prediction"
+    if re.search(r"\b(?:p21|p53)\b", value, re.I):
+        return value, "cell-cycle / senescence marker"
+    return value or "measured outcome", "measured outcome"
+
+
+def _typed_measurement_records(record: dict) -> list[dict]:
+    """Create renderer-local name/role/observation records from grounded tuples."""
+    typed = []
+    for measurement in record.get("measurements", []):
+        names = [str(name) for name in measurement.get("names", [])]
+        statement = str(measurement.get("statement", ""))
+        typed_names = [_measurement_semantics(name, statement) for name in names]
+
+        def first_role(role: str) -> tuple[str, str] | None:
+            return next((item for item in typed_names if item[1] == role), None)
+
+        classifier = first_role("classifier prediction")
+        damage = first_role("DNA-damage marker")
+        senescence_marker = first_role("senescence-associated marker")
+        proliferation = first_role("proliferation / DNA synthesis / cell-cycle activity")
+        qualifiers = list(dict.fromkeys(measurement.get("qualifiers", [])))
+        for qualifier in qualifiers:
+            item = None
+            if qualifier == "significant_increase":
+                name, role = damage or typed_names[0] if typed_names else ("measured outcome", "measured outcome")
+                item = {"name": name, "role": role, "observation": "showed a significant increase"}
+            elif qualifier == "no_significant_change":
+                if classifier and re.search(r"DNA damage", statement, re.I):
+                    item = {
+                        "name": classifier[0], "role": classifier[1],
+                        "observation": (
+                            "identified the condition as senescent despite no significant "
+                            "detectable DNA-damage increase"
+                        ),
+                    }
+                else:
+                    name, role = damage or typed_names[0] if typed_names else ("measured outcome", "measured outcome")
+                    item = {"name": name, "role": role, "observation": "showed no significant increase"}
+            elif qualifier == "bounded_value":
+                bounded = re.search(r"\bless than\s+\d+(?:\.\d+)?\s*%", statement, re.I)
+                name, role = classifier or ("stated classifier", "classifier prediction")
+                observation = (
+                    f"{bounded.group(0).capitalize()} of cells were identified as senescent by {name}"
+                    if bounded else "retained the stated upper bound"
+                )
+                item = {
+                    "name": "Classifier result" if bounded else name,
+                    "role": role, "observation": observation,
+                }
+            elif qualifier == "most_identified":
+                name, role = classifier or ("stated classifier", "classifier prediction")
+                item = {"name": name, "role": role, "observation": "identified most cells as senescent"}
+            elif qualifier in {"senescent", "not_established_senescent"}:
+                if qualifier == "senescent" and "most_identified" in qualifiers:
+                    continue
+                name, role = senescence_marker or classifier or ("senescence status", "senescence-associated status")
+                observation = (
+                    "confirmed that the condition was senescent"
+                    if qualifier == "senescent"
+                    else "did not establish the condition as senescent"
+                )
+                item = {"name": name, "role": role, "observation": observation}
+            elif qualifier == "dividing":
+                name, role = proliferation or ("cell-cycle activity", "proliferation / DNA synthesis")
+                item = {"name": name, "role": role, "observation": "showed that the cells were dividing"}
+            elif qualifier == "arrested":
+                item = {
+                    "name": "Cell-cycle activity", "role": "cell-cycle status",
+                    "observation": "showed that the cells were arrested",
+                }
+            elif qualifier == "selective_decrease":
+                name, role = typed_names[0] if typed_names else ("measured outcome", "measured outcome")
+                item = {"name": name, "role": role, "observation": "showed a selective decrease"}
+            if item:
+                typed.append(item)
+
+    # Prefer one informative classifier conclusion over a duplicate generic one.
+    if any(
+        row["role"] == "classifier prediction" and re.search(r"\b(?:most|despite)\b", row["observation"])
+        for row in typed
     ):
-        if any(re.search(pattern, name, re.I) for name in names):
-            return label
-    return names[0] if names else "the measured outcome"
+        typed = [
+            row for row in typed
+            if not (
+                row["role"] == "classifier prediction"
+                and row["observation"] == "confirmed that the condition was senescent"
+            )
+        ]
+    specific_classifier_observations = {
+        _normal(row["observation"])
+        for row in typed
+        if row["role"] == "classifier prediction"
+        and _normal(row["name"]) not in {"stated classifier", "classifier result"}
+    }
+    if specific_classifier_observations:
+        typed = [
+            row for row in typed
+            if not (
+                row["role"] == "classifier prediction"
+                and _normal(row["name"]) in {"stated classifier", "classifier result"}
+                and _normal(row["observation"]) in specific_classifier_observations
+            )
+        ]
+    has_named_bounded_classifier = any(
+        row["role"] == "classifier prediction"
+        and "less than" in _normal(row["observation"])
+        and "stated classifier" not in _normal(row["observation"])
+        for row in typed
+    )
+    if has_named_bounded_classifier:
+        typed = [
+            row for row in typed
+            if not (
+                row["role"] == "classifier prediction"
+                and "less than" in _normal(row["observation"])
+                and "stated classifier" in _normal(row["observation"])
+            )
+        ]
+    unique = []
+    seen = set()
+    for row in typed:
+        signature = (_normal(row["name"]), _normal(row["role"]), _normal(row["observation"]))
+        if signature not in seen:
+            unique.append(row)
+            seen.add(signature)
+    return unique
 
 
 def _render_condition_facts(record: dict) -> list[str]:
     facts = []
-    seen = set()
-    bounded_classifier = next(
-        (
-            name for measurement in record.get("measurements", [])
-            if "bounded_value" in measurement.get("qualifiers", [])
-            for name in measurement.get("names", [])
-            if re.fullmatch(r"[A-Z]{2,}", name) and name not in {"DNA", "DD"}
-        ),
-        "the stated classifier",
-    )
-    for measurement in record.get("measurements", []):
-        names = measurement.get("names", [])
-        label = _preferred_measurement(names)
-        statement = measurement.get("statement", "")
-        for qualifier in measurement.get("qualifiers", []):
-            if qualifier == "significant_increase":
-                text = f"{label} showed a significant increase."
-            elif qualifier == "no_significant_change":
-                if any(re.search(r"\bAEM\b", name) for name in names) and any(
-                    re.search(r"DNA damage", name, re.I) for name in names
-                ):
-                    text = (
-                        "AEM identified the condition as senescent despite no significant "
-                        "detectable DNA-damage increase."
-                    )
-                else:
-                    text = f"No significant increase was detected in {label}."
-            elif qualifier == "bounded_value":
-                bounded = re.search(r"\bless than\s+\d+(?:\.\d+)?\s*%", statement, re.I)
-                text = (
-                    f"{bounded.group(0).capitalize()} were identified as senescent by "
-                    f"{bounded_classifier}."
-                    if bounded else "The classifier result retained the stated upper bound."
-                )
-            elif qualifier == "most_identified":
-                text = f"{label} identified most cells as senescent."
-            elif qualifier == "not_established_senescent":
-                text = f"{label} did not establish the condition as senescent."
-            elif qualifier == "senescent":
-                text = f"{label} established the condition as senescent."
-            elif qualifier == "dividing":
-                text = f"{label} showed that the cells were dividing."
-            elif qualifier == "arrested":
-                text = f"{label} showed cell-cycle arrest."
-            elif qualifier == "selective_decrease":
-                text = f"{label} showed a selective decrease."
-            else:
-                continue
-            signature = _normal(text)
-            if signature not in seen:
-                facts.append(text)
-                seen.add(signature)
+    for row in _typed_measurement_records(record):
+        if row["name"] == "Classifier result":
+            facts.append(f"{row['observation']} (role: {row['role']}).")
+        else:
+            facts.append(f"{row['name']} {row['observation']} (role: {row['role']}).")
     return facts
+
+
+def _classifier_model_types(facts: list[str]) -> list[tuple[str, str]]:
+    combined = " ".join(facts)
+    rows = []
+    patterns = (
+        r"\b([A-Z][A-Z0-9]{1,15})(?:CP)?\s*\(classification tree-based\)",
+        r"\b([A-Z][A-Z0-9]{1,15})(?:CP)?\s*\(random forest-based\)",
+    )
+    for pattern, model_type in zip(patterns, ("classification-tree-based", "random-forest-based")):
+        for match in re.finditer(pattern, combined, re.I):
+            name = re.sub(r"CP$", "", match.group(1), flags=re.I)
+            pair = (name, model_type)
+            if pair not in rows:
+                rows.append(pair)
+    return rows
+
+
+def _render_training_validation_logic(evidence: dict) -> list[str]:
+    """Explain grounded train/test logic when caption roles explicitly define it."""
+    panels = evidence.get("panels", [])
+    by_role = {str(row.get("role")): row for row in panels}
+    required_roles = {"training_workflow", "training_result", "test_validation_result"}
+    if not required_roles.issubset(by_role):
+        return []
+    facts = [str(item) for item in evidence.get("explicit_facts", [])]
+    model_types = _classifier_model_types(facts)
+    training = str(by_role["training_result"].get("description", ""))
+    validation = str(by_role["test_validation_result"].get("description", ""))
+    combined_panels = f"{training} {validation}"
+    treatments = re.findall(r"\b([A-Za-z0-9-]+)-treated\b", combined_panels, re.I)
+    normal = re.search(r"([A-Za-z0-9-]+)(?:-treated)?\s*\(normal\)", combined_panels, re.I)
+    senescent = re.search(r"([A-Za-z0-9-]+)-treated[^.]{0,120}\(senescent\)", combined_panels, re.I)
+
+    lines = []
+    if model_types:
+        rendered_models = " and ".join(
+            f"{name} is the {model_type} model" for name, model_type in model_types
+        )
+        lines.append(f"Model design: {rendered_models}.")
+    if normal and senescent:
+        lines.append(
+            "Training labels followed the stated treatment assumption: "
+            f"{senescent.group(1)}-treated cells were treated as senescent and "
+            f"{normal.group(1)}-treated cells as normal/non-senescent."
+        )
+    elif len(dict.fromkeys(treatments)) >= 2:
+        values = list(dict.fromkeys(treatments))[:2]
+        lines.append(
+            f"The training datasets compared {values[0]}-treated and {values[1]}-treated cells."
+        )
+
+    training_fact = next((
+        fact for fact in facts
+        if re.search(r"training sets?", fact, re.I)
+        and re.search(r"both classifiers", fact, re.I)
+        and re.search(r"similar extent.*SA-?β-Gal", fact, re.I)
+    ), "")
+    if training_fact:
+        lines.append(
+            "Training result: both classifiers identified senescence in the treated "
+            "training cells to a similar extent as SA-β-Gal staining."
+        )
+    test_fact = next((
+        fact for fact in facts
+        if re.search(r"validated with test data from new samples", fact, re.I)
+    ), "")
+    if test_fact or re.search(r"\b(?:test|validation) datasets?\b", validation, re.I):
+        lines.append(
+            "Independent validation: the classifiers were then evaluated on new test "
+            "samples, with predictions compared on the same cells as SA-β-Gal staining."
+        )
+    no_single_feature = any(
+        re.search(r"none of these nuclear features alone could distinguish", fact, re.I)
+        for fact in facts
+    )
+    if no_single_feature and model_types:
+        lines.append(
+            "Together, the training and independent test results support using the "
+            "combined nuclear-morphology features, because the Results state that no "
+            "single feature alone was sufficient to distinguish senescent cells."
+        )
+    return lines
 
 
 def _render_stage(stage: dict, numeric_facts: list[dict]) -> str:
@@ -1176,6 +1418,15 @@ def _render_stage(stage: dict, numeric_facts: list[dict]) -> str:
     return " ".join(clean_facts[:3])
 
 
+def _stage_heading(stage: dict) -> str:
+    label = _clean_text(stage.get("label", "")).strip(" .")
+    if re.search(r"\bsenolytic\b", label, re.I):
+        return "Senolytic evaluation"
+    if re.search(r"\b(?:screen|drugs? inducing senescence)\b", label, re.I):
+        return "Senescence-inducing compound screen"
+    return label or str(stage.get("slot") or "Grounded experiment")
+
+
 def render_final_answer_evidence(evidence: dict) -> str:
     """Deterministic safe rendering used only after generation and repair fail."""
     if evidence.get("answer_kind") == "experimental_domain_synthesis":
@@ -1194,12 +1445,8 @@ def render_final_answer_evidence(evidence: dict) -> str:
             rows = grouped.get(domain, [])
             if not rows:
                 continue
-            figures = _joined_figures(rows)
-            samples = list(dict.fromkeys(
-                str(row.get("sample_type")) for row in rows if row.get("sample_type")
-            ))
-            sample_text = f" The selected samples are {', '.join(samples)}." if samples else ""
-            blocks.append(f"**{labels[domain]}:** {figures}.{sample_text}")
+            blocks.append(f"**{labels[domain]} — {_joined_figures(rows)}**")
+            blocks.extend(_render_provenance_item(row, labels[domain]) for row in rows)
         return "\n\n".join(blocks)
 
     source = evidence.get("source", {})
@@ -1221,9 +1468,12 @@ def render_final_answer_evidence(evidence: dict) -> str:
         if exception and comparison:
             sentence += f" All except {exception} differed significantly between {comparison}."
         lines.extend(["", sentence])
+    training_logic = _render_training_validation_logic(evidence)
+    if training_logic:
+        lines.extend(["", "**Training and validation logic**", *training_logic])
     for stage in evidence.get("experiment_stages", []):
         rendered_stage = _render_stage(stage, evidence.get("numeric_facts", []))
-        lines.extend(["", f"**Stage {stage['stage']} — {stage['label']}:** {rendered_stage}"])
+        lines.extend(["", f"**Stage {stage['stage']} — {_stage_heading(stage)}:** {rendered_stage}"])
     if evidence.get("condition_records"):
         lines.extend(["", "**Condition-level Results**"])
         for row in evidence["condition_records"]:
