@@ -220,6 +220,33 @@ def test_figure_five_stage_identity_prevents_cross_stage_entity_leakage(figure_e
         assert term in stage_two
 
 
+def test_figure_five_renderer_recovers_caption_defined_stage_boundaries(figure_evidence):
+    evidence = json.loads(json.dumps(figure_evidence["5"]))
+    evidence["question"] = "How many compounds were screened in Figure 5?"
+    evidence["experiment_stages"] = [
+        stage for stage in evidence["experiment_stages"] if stage["stage"] == 2
+    ]
+    evidence["numeric_facts"] = [
+        fact for fact in evidence["numeric_facts"] if fact["key"] == "screened"
+    ]
+    # Reproduce the manual failure: Stage 1 entities reached the only retained
+    # stage record. Caption panel boundaries must remain authoritative.
+    evidence["experiment_stages"][0]["required_terms"].extend([
+        "ABT-263", "ABT-737", "GFP", "mCherry", "AEM",
+    ])
+
+    answer = render_final_answer_evidence(evidence)
+    stage_one = next(line for line in answer.splitlines() if "**Stage 1" in line)
+    stage_two = next(line for line in answer.splitlines() if "**Stage 2" in line)
+    assert "Stage 1 — Senolytic evaluation" in stage_one
+    assert "Stage 2 — Senescence-inducing compound screen" in stage_two
+    for term in ("GFP", "mCherry", "AEM", "ABT-263", "ABT-737"):
+        assert term in stage_one and term not in stage_two
+    for term in ("A549", "IMR90", "676"):
+        assert term in stage_two
+    assert validate_answer_consistency(answer, evidence) == []
+
+
 def test_malformed_or_contradictory_numeric_output_is_rejected(figure_evidence):
     bad = (
         "Finally, **1 was identified in both groups. "

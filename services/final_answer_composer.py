@@ -825,7 +825,7 @@ def validate_answer_consistency(answer: str, evidence: dict) -> list[str]:
         ):
             errors.append(f"missing grounded feature exception: {exception}")
 
-        stages = evidence.get("experiment_stages", [])
+        stages = _renderer_stage_plan(evidence)
         for stage in stages:
             number = stage.get("stage")
             stage_match = re.search(
@@ -1371,13 +1371,28 @@ def _render_training_validation_logic(evidence: dict) -> list[str]:
 def _render_stage(stage: dict, numeric_facts: list[dict]) -> str:
     facts = stage.get("facts", [])
     selected = []
-    for pattern in (
-        r"\bco-?culture assay\b",
-        r"\btreated the co-?cultures\b",
-        r"\bnon-senescent\b.{0,180}\bselectively reduced\b",
+    for preferred_pattern, fallback_pattern in (
+        (r"\bco-?culture assay\b", r"\bco-?cultures? of senescent\b"),
+        (r"\bwe treated the co-?cultures\b", r"\bafter treatment with\b"),
+        (r"\bnon-senescent\b.{0,180}\bselectively reduced\b", None),
     ):
-        matches = [fact for fact in facts if re.search(pattern, fact, re.I)]
-        sentence = max(matches, key=len) if matches else None
+        matches = [fact for fact in facts if re.search(preferred_pattern, fact, re.I)]
+        complete_matches = [
+            fact for fact in matches
+            if not re.match(r"^[a-z](?:\s|$)", fact)
+            and not re.search(r"\bpredicted to be senescent by\s+To\b", fact, re.I)
+        ]
+        if not complete_matches and fallback_pattern:
+            fallback_matches = [
+                fact for fact in facts if re.search(fallback_pattern, fact, re.I)
+            ]
+            complete_matches = [
+                fact for fact in fallback_matches
+                if not re.match(r"^[a-z](?:\s|$)", fact)
+                and not re.search(r"\bpredicted to be senescent by\s+To\b", fact, re.I)
+            ]
+            matches = fallback_matches
+        sentence = max(complete_matches or matches, key=len) if matches else None
         if sentence and sentence not in selected:
             selected.append(sentence)
     if stage.get("stage") == 1 and selected:
@@ -1416,6 +1431,145 @@ def _render_stage(stage: dict, numeric_facts: list[dict]) -> str:
         if not re.search(r"\b(?:Scale bar|Data represent|Source Data)\b", fact, re.I)
     ]
     return " ".join(clean_facts[:3])
+
+
+def _multi_stage_panel_groups(evidence: dict) -> list[dict]:
+    """Derive renderer-local stage boundaries from caption panel ordering."""
+    panels = evidence.get("panels", [])
+    starts = [
+        index for index, panel in enumerate(panels)
+        if panel.get("role") == "experimental_design"
+    ]
+    if len(starts) < 2 or not evidence.get("experiment_stages"):
+        return []
+    groups = []
+    for offset, start in enumerate(starts):
+        end = starts[offset + 1] if offset + 1 < len(starts) else len(panels)
+        stage_panels = panels[start:end]
+        groups.append({
+            "stage": offset + 1,
+            "label": stage_panels[0].get("description", "") if stage_panels else "",
+            "panels": {
+                str(panel.get("panel", "")).casefold()
+                for panel in stage_panels if panel.get("panel")
+            },
+            "descriptions": [
+                str(panel.get("description", "")) for panel in stage_panels
+                if panel.get("description")
+            ],
+        })
+    return groups
+
+
+def _stage_entity_tokens(values: list[str]) -> set[str]:
+    combined = " ".join(values)
+    return {
+        _normal(match.group(0))
+        for match in re.finditer(
+            r"\b(?:[A-Z][A-Za-z]*\d+[A-Za-z0-9-]*|[A-Z]{2,}[A-Za-z0-9-]*|"
+            r"m[A-Z][A-Za-z0-9-]+)\b",
+            combined,
+        )
+        if _normal(match.group(0)) not in {"fig", "figure", "data"}
+    }
+
+
+def _referenced_stage_panels(text: str, figure_number: str) -> set[str]:
+    panels = set()
+    pattern = (
+        rf"\bFig(?:ure)?\.?\s*{re.escape(figure_number)}\s*"
+        r"([a-z])(?:\s*[-–—]\s*([a-z]))?(?:\s*,\s*([a-z]))?"
+    )
+    for match in re.finditer(pattern, text, re.I):
+        first, last, extra = (value.casefold() if value else "" for value in match.groups())
+        panels.add(first)
+        if last:
+            panels.update(chr(value) for value in range(ord(first), ord(last) + 1))
+        if extra:
+            panels.add(extra)
+    return panels
+
+
+def _fact_allowed_in_stage(
+    fact: str, *, figure_number: str, group: dict,
+    own_entities: set[str], other_entities: set[str], default: bool,
+) -> bool:
+    main_refs = re.findall(
+        r"(?<!Supplementary\s)\bFig(?:ure)?\.?\s*(\d+(?:\.\d+)?)",
+        fact, re.I,
+    )
+    if main_refs and any(number != figure_number for number in main_refs):
+        return False
+    if re.match(r"^[a-z](?:\s|$)", fact) and not re.search(
+        rf"\bFig(?:ure)?\.?\s*{re.escape(figure_number)}\b",
+        fact, re.I,
+    ):
+        return False
+    panel_refs = _referenced_stage_panels(fact, figure_number)
+    if panel_refs:
+        return bool(panel_refs.intersection(group["panels"]))
+    normal_fact = _normal(fact)
+    own_hits = {token for token in own_entities if token and token in normal_fact}
+    other_hits = {token for token in other_entities if token and token in normal_fact}
+    if other_hits and not own_hits:
+        return False
+    if own_hits and not other_hits:
+        return True
+    return default
+
+
+def _renderer_stage_plan(evidence: dict) -> list[dict]:
+    """Recover missing caption-defined stages without mutating authoritative evidence."""
+    existing = {
+        int(stage.get("stage")): stage
+        for stage in evidence.get("experiment_stages", [])
+        if str(stage.get("stage", "")).isdigit()
+    }
+    groups = _multi_stage_panel_groups(evidence)
+    if not groups:
+        return list(evidence.get("experiment_stages", []))
+
+    figure_number = str(evidence.get("source", {}).get("figure_number") or "")
+    entity_sets = [_stage_entity_tokens(group["descriptions"]) for group in groups]
+    explicit = [str(fact) for fact in evidence.get("explicit_facts", [])]
+    rendered = []
+    for index, group in enumerate(groups):
+        stage_number = int(group["stage"])
+        original = existing.get(stage_number, {})
+        own_entities = entity_sets[index]
+        other_entities = set().union(*(
+            entities for offset, entities in enumerate(entity_sets) if offset != index
+        )).difference(own_entities)
+        facts = list(group["descriptions"])
+        for fact in original.get("facts", []):
+            if _fact_allowed_in_stage(
+                str(fact), figure_number=figure_number, group=group,
+                own_entities=own_entities, other_entities=other_entities, default=True,
+            ) and fact not in facts:
+                facts.append(str(fact))
+        for fact in explicit:
+            if _fact_allowed_in_stage(
+                fact, figure_number=figure_number, group=group,
+                own_entities=own_entities, other_entities=other_entities, default=False,
+            ) and fact not in facts:
+                facts.append(fact)
+
+        allowed_text = _normal(" ".join(facts))
+        required_terms = [
+            str(term) for term in original.get("required_terms", [])
+            if _normal(term) and _normal(term) in allowed_text
+        ]
+        if not required_terms:
+            required_terms = _stage_required_terms(facts)
+        rendered.append({
+            "stage": stage_number,
+            "slot": original.get("slot") or f"caption stage {stage_number}",
+            "label": group["label"] or original.get("label", ""),
+            "facts": facts,
+            "required_terms": required_terms,
+            "authority": original.get("authority") or "explicit_full_caption",
+        })
+    return rendered
 
 
 def _stage_heading(stage: dict) -> str:
@@ -1471,7 +1625,7 @@ def render_final_answer_evidence(evidence: dict) -> str:
     training_logic = _render_training_validation_logic(evidence)
     if training_logic:
         lines.extend(["", "**Training and validation logic**", *training_logic])
-    for stage in evidence.get("experiment_stages", []):
+    for stage in _renderer_stage_plan(evidence):
         rendered_stage = _render_stage(stage, evidence.get("numeric_facts", []))
         lines.extend(["", f"**Stage {stage['stage']} — {_stage_heading(stage)}:** {rendered_stage}"])
     if evidence.get("condition_records"):
