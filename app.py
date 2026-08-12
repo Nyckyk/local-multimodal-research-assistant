@@ -1,30 +1,17 @@
 from pathlib import Path
-import re
 
 import streamlit as st
 
 from rag.database import get_collection
 from rag.embeddings import load_embedder, load_reranker
 from rag.ingestion import index_pdf
-from rag.retrieval import retrieve_context
-from services.equation_service import analyse_resolved_equation
-from services.ollama_service import generate_answer
-from services.multi_target import analyse_equation_chain, analyse_visual_targets
-from services.query_rewriter import rewrite_question
-from services.visual_fallback import resolve_with_visual_fallback
+from services.research_assistant import ResearchAssistant
 from services.visual_index import load_or_build_visual_index, visual_index_needs_rebuild
 from services.visual_locator import (
     clear_visual_conversation_state,
-    format_resolution_problem,
-    manual_visual_resolution,
-    resolve_visual_target,
-    resolve_visual_targets,
-    should_activate_automatic_vision,
 )
 from services.visual_reference_parser import has_visual_reference
-from services.visual_runtime import analyse_resolved_visual, build_visual_evidence
-from services.vision_service import COULD_NOT_VERIFY_MESSAGE
-from settings import MAX_HISTORY_MESSAGES, PAPERS_FOLDER
+from settings import PAPERS_FOLDER
 
 
 st.set_page_config(
@@ -330,255 +317,49 @@ if question:
             "Understanding question, searching papers "
             "and generating answer..."
         ):
-            recent_messages = st.session_state.messages[
-                -MAX_HISTORY_MESSAGES:
-            ]
-
-            conversation_history = []
-
-            for message in recent_messages[:-1]:
-                if not isinstance(message, dict):
-                    continue
-                role = message.get("role")
-                content = message.get("content")
-                if not isinstance(role, str) or not isinstance(content, str):
-                    continue
-                conversation_history.append(
-                    {
-                        "role": role,
-                        "content": content,
-                    }
-                )
-
-            retrieval_question = rewrite_question(
-                question=question,
-                conversation_history=conversation_history,
-            )
-
-            context, sources = retrieve_context(
-                question=retrieval_question,
-                previous_question="",
+            assistant = ResearchAssistant(
                 collection=collection,
                 embedder=embedder,
                 reranker=reranker,
-                selected_source=preferred_pdf.name if preferred_pdf else None,
+                visual_index=visual_index,
             )
-
-            visual_answer = ""
-            equation_answer = ""
-            multi_answer = ""
-            vision_error = ""
-            equation_error = ""
-            visual_context = ""
-            vision_debug = {"_save_crops": vision_debug_enabled}
-            equation_debug = {}
-            multi_debug = {"_save_crops": vision_debug_enabled}
-            text_generation_debug = {}
-            resolution_fallback_debug = {}
-            previous_visual_evidence = next(
-                (
-                    message.get("evidence")
-                    for message in reversed(st.session_state.messages[:-1])
-                    if isinstance(message, dict)
-                    and isinstance(message.get("evidence"), dict)
-                    and message["evidence"].get("vision_result")
-                ),
-                None,
+            response = assistant.ask(
+                question,
+                conversation_messages=st.session_state.messages[:-1],
+                preferred_pdf=preferred_pdf,
+                automatic_visual_detection=automatic_visual_detection,
+                manual_pdf=manual_pdf if manual_visual_override else None,
+                manual_page_number=int(manual_page_number),
+                save_vision_crops=vision_debug_enabled,
             )
-            previous_sources = []
-            for message in st.session_state.messages[:-1]:
-                if not isinstance(message, dict):
-                    continue
-                message_sources = message.get("sources")
-                if not isinstance(message_sources, list):
-                    continue
-                previous_sources.extend(
-                    source.get("pdf", source.get("source", ""))
-                    for source in message_sources if isinstance(source, dict)
-                )
-            multi_resolutions = []
-            if manual_visual_override and manual_pdf is not None:
-                resolution = manual_visual_resolution(
-                    manual_pdf, int(manual_page_number), question
-                )
-            elif automatic_visual_detection:
-                multi_resolutions = resolve_visual_targets(
-                    question=question,
-                    index=visual_index,
-                    selected_pdf=preferred_pdf,
-                    conversation_messages=st.session_state.messages[:-1],
-                    current_source_names=previous_sources,
-                    embedder=embedder,
-                )
-                resolution = multi_resolutions[0]
-                if resolution.target_type != "equation" and has_visual_reference(question) and (
-                    resolution.status == "not_found"
-                    or (
-                        resolution.status == "ambiguous"
-                        and "confidence" in resolution.reason.casefold()
-                    )
-                ):
-                    with st.spinner("Checking unresolved pages with the local vision model..."):
-                        resolution = resolve_with_visual_fallback(
-                            question=question,
-                            base_resolution=resolution,
-                            index=visual_index,
-                            selected_pdf=preferred_pdf,
-                            debug_info=resolution_fallback_debug,
-                        )
-            else:
-                resolution = resolve_visual_target(question, {"files": {}})
-                multi_resolutions = []
-
-            use_vision = (
-                manual_visual_override and resolution.target_type != "equation"
-            ) or should_activate_automatic_vision(question, resolution)
+            answer = response.answer
+            sources = response.sources
+            retrieval_question = response.retrieval_question
+            visual_answer = response.visual_answer
+            vision_error = response.vision_error
+            equation_error = response.equation_error
+            evidence = response.evidence
+            resolution = response.resolution
+            multi_resolutions = response.multi_resolutions
+            use_vision = response.used_vision
             selected_pdf = Path(resolution.pdf_path) if resolution.pdf_path else None
             vision_page_number = resolution.page_number or 1
-            if len(multi_resolutions) > 1:
-                target_types = {item.target_type for item in multi_resolutions}
-                try:
-                    if target_types == {"equation"}:
-                        multi_answer = analyse_equation_chain(
-                            question, multi_resolutions,
-                            conversation_history=conversation_history,
-                            debug_info=multi_debug,
-                        )
-                    elif "equation" not in target_types:
-                        multi_answer = analyse_visual_targets(
-                            question, multi_resolutions, text_evidence=context,
-                            conversation_history=conversation_history,
-                            debug_info=multi_debug,
-                        )
-                except Exception as error:
-                    equation_error = str(error)
-            if not multi_answer and resolution.status == "resolved" and resolution.target_type == "equation":
-                try:
-                    equation_answer = analyse_resolved_equation(
-                        question,
-                        resolution,
-                        conversation_history=conversation_history,
-                        debug_info=equation_debug,
-                    )
-                except Exception as error:
-                    equation_error = str(error)
-            if not multi_answer and use_vision and selected_pdf is not None:
-                if not manual_visual_override:
-                    st.info(
-                        "Automatically detected:\n\n"
-                        f"{resolution.target_type.title()} {resolution.target_number}"
-                        + (f", panel {resolution.panel}" if resolution.panel else "")
-                        + f"\n\n{resolution.pdf_name}\n\nPDF page {resolution.page_number}"
-                    )
-                try:
-                    visual_answer = analyse_resolved_visual(
-                        question=question,
-                        resolution=resolution,
-                        debug_info=vision_debug,
-                        text_evidence=context,
-                    )
-                except Exception as error:
-                    vision_error = str(error)
-
-                if visual_answer:
-                    visual_context = (
-                        "[VISUAL ANALYSIS - VALID FIGURE/TABLE EVIDENCE]\n"
-                        f"Source: {selected_pdf.name}\n"
-                        f"PDF page: {int(vision_page_number)}\n"
-                        f"Result: {visual_answer}"
-                    )
-
-                    # Put visual evidence first so incomplete text extraction
-                    # does not override a clear reading of a figure or table.
-                    if context:
-                        context = (
-                            f"{visual_context}\n\n"
-                            f"[EXTRACTED PDF TEXT]\n{context}"
-                        )
-                    else:
-                        context = visual_context
-
-            # When the user explicitly enables vision and the vision model
-            # returns an answer, use that answer directly. This prevents the
-            # separate text model from contradicting a correct reading of the
-            # selected figure/table/page.
-            evidence = None
+            vision_debug = response.debug["vision"]
+            equation_debug = response.debug["equation"]
+            multi_debug = response.debug["multi_target"]
+            text_generation_debug = response.debug["text_generation"]
+            resolution_fallback_debug = response.debug["resolution_fallback"]
             visual_reference_requested = has_visual_reference(question)
 
-            if multi_answer:
-                answer = multi_answer
-                resolved_multi = [item for item in multi_resolutions if item.status == "resolved"]
-                first = resolved_multi[0] if resolved_multi else resolution
-                evidence = {
-                    "summary": "Grounded ordered multi-target analysis.",
-                    "analysis_kind": "Multi-target analysis",
-                    "pdf": first.pdf_name or "Unknown source",
-                    "page": int(first.page_number or 1),
-                    "visual_targets": [item.to_dict() for item in multi_resolutions],
-                }
-            elif equation_answer:
-                answer = (
-                    f"{equation_answer}\n\n"
-                    f"Source: **{resolution.pdf_name}**, "
-                    f"PDF page **{int(resolution.page_number)}**."
+            if use_vision and selected_pdf is not None and not manual_visual_override:
+                st.info(
+                    "Automatically detected:\n\n"
+                    f"{resolution.target_type.title()} {resolution.target_number}"
+                    + (f", panel {resolution.panel}" if resolution.panel else "")
+                    + f"\n\n{resolution.pdf_name}\n\nPDF page {resolution.page_number}"
                 )
-                evidence = {
-                    "summary": "Grounded analysis of an explicitly numbered equation.",
-                    "analysis_kind": "Equation analysis",
-                    "pdf": resolution.pdf_name,
-                    "page": int(resolution.page_number),
-                    "visual_target": resolution.to_dict(),
-                }
-            elif visual_answer:
-                cross_visual_comparison = bool(
-                    previous_visual_evidence
-                    and re.search(r"\b(?:compare|versus|vs\.?|difference)\b", question, re.I)
-                    and re.search(r"\b(?:it|that|previous|them)\b", question, re.I)
-                )
-                if cross_visual_comparison:
-                    comparison_context = (
-                        "[PREVIOUS VALIDATED VISUAL ANALYSIS]\n"
-                        f"Source: {previous_visual_evidence['pdf']}\n"
-                        f"PDF page: {previous_visual_evidence['page']}\n"
-                        f"Result: {previous_visual_evidence['vision_result']}\n\n"
-                        f"{context}"
-                    )
-                    answer = generate_answer(
-                        question=question,
-                        context=comparison_context,
-                        conversation_history=conversation_history,
-                        debug_info=text_generation_debug,
-                    )
-                else:
-                    answer = (
-                        f"{visual_answer}\n\n"
-                        f"Source: **{selected_pdf.name}**, "
-                        f"PDF page **{int(vision_page_number)}**."
-                    )
-                evidence = build_visual_evidence(
-                    resolution, visual_answer, vision_debug
-                )
-            elif resolution.status == "ambiguous" and visual_reference_requested:
-                answer = format_resolution_problem(resolution)
+            if resolution.status == "ambiguous" and visual_reference_requested:
                 st.session_state.pending_visual_resolution = resolution.to_dict()
-            elif resolution.status == "not_found" and visual_reference_requested:
-                answer = format_resolution_problem(resolution)
-            elif use_vision and selected_pdf is not None and vision_error:
-                answer = COULD_NOT_VERIFY_MESSAGE
-            elif resolution.target_type == "equation" and equation_error:
-                answer = "Could not verify the requested equation from indexed PDF text."
-            elif not context:
-                answer = (
-                    "No relevant information was found "
-                    "in the indexed papers."
-                )
-            else:
-                answer = generate_answer(
-                    question=question,
-                    context=context,
-                    conversation_history=conversation_history,
-                    debug_info=text_generation_debug,
-                )
 
             st.markdown(answer)
 

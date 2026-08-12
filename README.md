@@ -72,3 +72,18 @@ structured outputs, and failure details. Scientific expected values in
 `tests/fixtures/regression_cases.yaml` are protected: Codex must not alter them
 merely to obtain passing tests, and changing those values requires explicit user
 approval. Production code must not import test fixtures.
+
+# Automated scientific RAG evaluation
+
+The end-to-end evaluator calls the same `ResearchAssistant.ask(...)` backend as
+Streamlit. It uses the configured local Chroma collection, embedding/reranking
+models, Ollama text model, and (when applicable) Ollama vision model.
+
+```powershell
+python scripts/run_e2e_rag_eval.py --suite tests/evals/senescence_v13.json
+python scripts/run_e2e_rag_eval.py --suite tests/evals/senescence_v13.json --question Q05
+python scripts/run_e2e_rag_eval.py --suite tests/evals/senescence_v13.json --runs 3
+```
+
+Each run writes `answers.json`, `answers.md`, `scores.json`, `report.md`, and
+per-question debug JSON beneath `results/e2e_eval/<suite>/<timestamp>/`.
