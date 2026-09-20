@@ -18,3 +18,28 @@ data/chroma/
 data/extracted_text/
 data/pdf_index.csv
 data/visual_index/
+
+# Research papers and uploaded documents
+papers/
+*.pdf
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Local agent/development metadata
+.agents/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local databases and model files
+*.db
+*.sqlite
+*.sqlite3
+*.gguf
+*.safetensors
