@@ -440,7 +440,10 @@ def _extract_numeric_facts(statements: list[str]) -> list[dict]:
                 matched_text = match.group(0)
                 tail = clause[match.end():]
                 tail = re.split(r"(?<![-A-Za-z0-9])\d+(?![-A-Za-z0-9])", tail, maxsplit=1)[0]
-                if re.search(r"\bscreen", matched_text, re.I):
+                if re.search(r"\bscreen", matched_text, re.I) or (
+                    re.search(r"\bscreen(?:ed|ing)?\b", field, re.I)
+                    and re.search(r"\b(?:compounds?|drugs?)\b", matched_text, re.I)
+                ):
                     key = "screened"
                 elif re.search(r"\bidentified\b", matched_text, re.I) or re.search(
                     r"\bidentified\s*$", clause[:match.start()], re.I,
@@ -626,7 +629,11 @@ def build_figure_final_answer_evidence(
     slot_numeric_facts = _extract_numeric_facts(
         _sentences(
             item.get("text", "")
-            for record in local_evidence.get("slot_evidence", {}).values()
+            for slot, record in local_evidence.get("slot_evidence", {}).items()
+            if slot in {
+                "compounds screened", "condition-specific hit counts",
+                "shared hit count", "later screening experiment",
+            }
             for item in record.get("evidence", [])
         )
     )
@@ -671,6 +678,10 @@ def build_figure_final_answer_evidence(
         question, re.I,
     )) or "condition-specific outcomes" in requested_slots
     conditions = _extract_condition_records(local_evidence, texts) if needs_conditions else []
+    grounded_slots = build_grounded_slot_records(
+        local_evidence.get("slot_evidence", {}), str(figure_number or "") or None,
+        local_evidence.get("evidence_text", ""),
+    )
     quantitative_condition_facts = _extract_numeric_facts(
         statement
         for row in conditions for statement in row.get("author_statements", [])
@@ -706,6 +717,7 @@ def build_figure_final_answer_evidence(
         "numeric_facts": numeric_facts,
         "author_conclusions": _extract_author_conclusions(texts, figure_number),
         "explicit_facts": _sentences(local_evidence.get("explicit_condition_outcomes", [])),
+        "grounded_slots": grounded_slots,
         "validated_visual": validated_visual,
     }
 
@@ -769,6 +781,523 @@ def _field_terms(field: str) -> list[str]:
     ]
 
 
+_SLOT_STOPWORDS = {
+    "about", "after", "against", "also", "analysis", "answer", "based",
+    "before", "between", "caption", "cells", "cell", "data", "different",
+    "document", "during", "evidence", "experiment", "figure", "from", "have",
+    "into", "methods", "panel", "paper", "reported", "results", "section",
+    "showed", "shows", "that", "their", "these", "they", "this", "those",
+    "using", "were", "which", "with",
+}
+
+
+def _slot_focus_patterns(slot: str) -> tuple[str, ...]:
+    patterns = {
+        "features": (r"\bfeatures?\b", r"\b(?:area|factor|ratio|gyration|displacement|elongation)\b"),
+        "library construction": (r"\b(?:librar|training set|plates?|wells?)\b",),
+        "training cell counts": (r"\b(?:random|normal|treated)\b.{0,100}\bcells?\b",),
+        "CT split": (r"\b(?:classification tree|CT)\b.{0,180}\b(?:test size|split)\b",),
+        "RF split": (r"\b(?:random forest|RF)\b.{0,180}\b(?:test size|split)\b",),
+        "CT overfitting method": (r"\b(?:over.?fitting|prun|alpha|cost complexity)\b",),
+        "RF threshold": (r"\b(?:random forest|RF|probability)\b.{0,180}\b(?:threshold|considered|values?)\b",),
+        "inclusion criteria": (r"\b(?:included|excluded|threshold|predominantly)\b",),
+        "correlation statistics": (r"\bcorrelation\b", r"\br\s*[=:]", r"\bp\s*[<=>:]"),
+        "performance metrics": (r"\b(?:precision|accuracy|recall|F\s*1|performance)\b",),
+        "classifier identities": (r"\b(?:classifier|classification tree|decision tree|random forest|voting)\b",),
+        "experimental controls": (r"\b(?:control|vehicle|DMSO)\b",),
+        "candidate validation": (r"\b(?:candidate|validat|SA-.?-Gal|BrdU|p21)\b",),
+        "toxicity distinction": (r"\b(?:toxic|toxicity|viability|senescen)\w*\b",),
+        "downstream validation": (
+            r"\b(?:downstream|senolytic|one.two.punch|validat|pre.?treat|sensiti[sz]|ABT)\w*\b",
+        ),
+        "score construction": (
+            r"\b(?:construct|calculat|deriv|assign|range|percentage)\w*\b.{0,180}\b(?:score|CSS|TSS)\b",
+            r"\b(?:score|CSS|TSS)\b.{0,180}\b(?:construct|calculat|deriv|assign|range|percentage)\w*\b",
+            r"\b(?:CSS|TSS|cell senescence score|score assigned)\b",
+            r"\b(?:higher|lower)\b.{0,160}\b(?:CSS|TSS|score)\b",
+        ),
+        "comparison outcomes": (r"\b(?:higher|lower|increase|decrease|reduced|score|positive)\w*\b",),
+        "sample size": (r"\b(?:patients?|samples?|cohort|included|n\s*=)\b",),
+        "compounds screened": (r"\b(?:screen\w*|drugs?|compounds?)\b",),
+        "condition-specific hit counts": (r"\b(?:hits?|only|specific|A549|IMR90)\b",),
+        "shared hit count": (r"\b(?:hits?|both|shared|overlap)\b",),
+        "first experiment": (r"\b(?:co-?culture|senolytic|GFP|mCherry|control)\b",),
+        "later screening experiment": (r"\b(?:screen\w*|hits?|drugs?|compounds?|classifier)\b",),
+    }
+    return patterns.get(slot, (re.escape(slot),))
+
+
+def _slot_summary(slot: str, record: dict, figure_number: str | None = None) -> str:
+    candidates = []
+    patterns = _slot_focus_patterns(slot)
+    query_terms = {
+        term for term in record.get("query_terms", [])
+        if term not in {
+            "figure", "paper", "explain", "using", "based", "features", "results",
+            "comparison", "including", "exact", "report", "relevant", "other",
+            "every", "separately", "their", "preserve", "unsupported",
+        }
+    }
+    for evidence_index, item in enumerate(record.get("evidence", [])):
+        cleaned = _clean_text(item.get("text", ""))
+        item_has_target_reference = bool(
+            figure_number and re.search(
+                rf"\b(?:Fig\.?|Figure)\s*{re.escape(str(figure_number))}(?:[a-z])?\b",
+                cleaned,
+                re.I,
+            )
+        ) or item.get("source") == "slot_specific_document_text"
+        sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+        for sentence_index, sentence in enumerate(sentences):
+            if len(sentence.split()) < 5:
+                continue
+            figure_refs = re.findall(
+                r"(?<!Supplementary\s)\bFig(?:ure)?\.?\s*(\d+(?:\.\d+)?)",
+                sentence, re.I,
+            )
+            if figure_number and figure_refs and str(figure_number) not in figure_refs:
+                continue
+            has_target_reference = bool(
+                figure_number and str(figure_number) in figure_refs
+            )
+            target_reference_boost = 45 if has_target_reference else 0
+            sentence = re.sub(
+                r"\b(?:Supplementary\s+)?Fig(?:ure)?\.?\s*[A-Za-z]?\d+(?:[a-z]|\s*[-â€“â€”]\s*[a-z])?",
+                "the supporting analysis", sentence, flags=re.I,
+            )
+            hits = sum(bool(re.search(pattern, sentence, re.I)) for pattern in patterns)
+            if not hits:
+                continue
+            numeric = len(re.findall(r"(?<![A-Za-z])\d+(?:[,.]\d+)*(?:\s*%)?", sentence))
+            query_hits = sum(term in sentence.casefold() for term in query_terms)
+            source_priority = 30 if item.get("source") == "exact_figure_reference" else 0
+            candidates.append((
+                target_reference_boost + source_priority + hits * 10 + min(numeric, 6) + query_hits * 3,
+                -evidence_index, -sentence_index, sentence, has_target_reference,
+                item_has_target_reference,
+            ))
+    if figure_number and any(row[4] for row in candidates):
+        # Results/Methods statements immediately adjoining the target figure
+        # often carry the decisive detail without repeating its figure number.
+        # Keep those local sentences, while continuing to reject material from
+        # evidence windows that never reference the requested figure.
+        candidates = [row for row in candidates if row[4] or row[5]]
+    candidates.sort(reverse=True)
+    limit = 4 if slot in {
+        "library construction", "classifier identities",
+        "condition-specific hit counts", "score construction",
+        "comparison outcomes", "candidate validation", "downstream validation",
+    } else 2
+    if slot == "comparison outcomes":
+        limit = 8
+    selected = []
+    seen = set()
+    normalized_query_terms = {
+        term.replace("ageing", "aging") for term in query_terms
+    }
+    ordered_candidates = []
+    if slot == "features":
+        feature_inventory = next((
+            row for row in candidates
+            if re.search(r"\bwere used as (?:nuclear )?features\b", row[3], re.I)
+        ), None)
+        if feature_inventory:
+            ordered_candidates.append(feature_inventory)
+            seen.add(_normal(feature_inventory[3]))
+    if slot == "library construction":
+        for pattern in (
+            r"\beach plate\b.{0,180}\bwells?\b",
+            r"\brandomly selecting\b.{0,180}\bnormal cells?\b.{0,80}\btreated cells?\b",
+            r"\bindependent training sets?\b.{0,180}\brandomi[sz]ations?\b",
+        ):
+            detail = next((row for row in candidates if re.search(pattern, row[3], re.I)), None)
+            if detail and _normal(detail[3]) not in seen:
+                ordered_candidates.append(detail)
+                seen.add(_normal(detail[3]))
+    if slot == "classifier identities":
+        training_detail = next((
+            row for row in candidates
+            if re.search(
+                r"\b(?:train(?:ed|ing)|general model)\b.{0,140}"
+                r"\b\d+\b.{0,45}\b(?:conditions?|models?|datasets?)\b",
+                row[3], re.I,
+            )
+        ), None)
+        if training_detail:
+            ordered_candidates.append(training_detail)
+            seen.add(_normal(training_detail[3]))
+    if slot == "downstream validation":
+        quantitative_outcome = next((
+            row for row in candidates
+            if re.search(r"\b(?:over|under|less than|more than)\s+\d+(?:\.\d+)?%", row[3], re.I)
+            and re.search(r"\b(?:whereas|compared|versus|vs\.?|but)\b", row[3], re.I)
+        ), None)
+        if quantitative_outcome:
+            ordered_candidates.append(quantitative_outcome)
+            seen.add(_normal(quantitative_outcome[3]))
+    if slot == "score construction":
+        construction_detail = next((
+            row for row in candidates
+            if re.search(r"\b(?:nuclear morphology|nuclear features?)\b", row[3], re.I)
+            and re.search(r"\b(?:CSS|cell senescence score|score assigned)\b", row[3], re.I)
+        ), None)
+        if construction_detail:
+            ordered_candidates.append(construction_detail)
+            seen.add(_normal(construction_detail[3]))
+        aggregate_definition = next((
+            row for row in candidates
+            if re.search(r"\bpercentage\s+of\s+cells\b", row[3], re.I)
+            and re.search(r"\bCSS\b.{0,40}\b1\b.{0,10}\b5\b", row[3], re.I)
+        ), None)
+        if aggregate_definition and _normal(aggregate_definition[3]) not in seen:
+            ordered_candidates.append(aggregate_definition)
+            seen.add(_normal(aggregate_definition[3]))
+        validation_outcome = next((
+            row for row in candidates
+            if re.search(r"\b(?:higher|lower|increased|decreased)\b", row[3], re.I)
+            and re.search(r"\b(?:CSS|TSS|score)\b", row[3], re.I)
+            and re.search(r"\b(?:versus|vs\.?|compared|than)\b", row[3], re.I)
+        ), None)
+        if validation_outcome and _normal(validation_outcome[3]) not in seen:
+            ordered_candidates.append(validation_outcome)
+            seen.add(_normal(validation_outcome[3]))
+    if slot == "comparison outcomes":
+        for term in sorted(normalized_query_terms, key=len, reverse=True):
+            choice = next((
+                row for row in candidates
+                if term in row[3].casefold().replace("ageing", "aging")
+                and _normal(row[3]) not in seen
+            ), None)
+            if choice:
+                ordered_candidates.append(choice)
+                seen.add(_normal(choice[3]))
+    ordered_candidates.extend(
+        row for row in candidates if _normal(row[3]) not in seen
+    )
+    seen = set()
+    for _, _, _, sentence, _, _ in ordered_candidates:
+        signature = _normal(sentence)
+        if signature in seen:
+            continue
+        selected.append(sentence)
+        seen.add(signature)
+        if len(selected) >= limit:
+            break
+    if not selected and record.get("evidence"):
+        selected = [_clean_text(record["evidence"][0].get("text", ""))[:900]]
+    return " ".join(selected).strip()[:1800]
+
+
+def _slot_required_values(slot: str, summary: str) -> list[str]:
+    if slot in {"first experiment", "later screening experiment", "library construction"}:
+        return []
+    number = r"(?<![A-Za-z0-9])((?:[<>]=?\s*)?\d+(?:,\d{3})*(?:\.\d+)?(?:\s*[xÃ—]\s*10\s*\d+)?(?:\s*%)?)(?![A-Za-z0-9])"
+    patterns = {
+        "library construction": (
+            number + r".{0,35}\b(?:plates?|wells?|cells?|conditions?)\b",
+            r"\b(?:plates?|wells?|cells?|conditions?)\b.{0,35}" + number,
+        ),
+        "training cell counts": (
+            number + r".{0,30}\b(?:normal|treated)?\s*cells?\b",
+        ),
+        "CT split": (
+            r"\b(?:classification tree|CT)\b.{0,100}?" + number,
+        ),
+        "RF split": (
+            r"\b(?:random forest|RF)\b.{0,100}?" + number,
+        ),
+        "RF threshold": (
+            r"\b(?:probability|threshold|values?)\b.{0,80}?" + number,
+        ),
+        "inclusion criteria": (
+            r"\b(?:threshold|superior to|at least|less than|more than)\b.{0,30}" + number,
+            number + r".{0,70}\b(?:included|excluded|threshold|cells?|nuclei|samples?)\b",
+        ),
+        "compounds screened": (
+            number + r".{0,45}\b(?:drugs?|compounds?)\b.{0,45}\bscreen",
+            r"\bscreen\w*\b.{0,45}" + number + r".{0,30}\b(?:drugs?|compounds?)\b",
+        ),
+        "condition-specific hit counts": (
+            number + r".{0,70}\b(?:hits?|drugs?|compounds?)\b.{0,70}\b(?:only|specific|both|shared)\b",
+            number + r".{0,180}\b(?:only|specific|both|shared)\b",
+        ),
+        "shared hit count": (
+            number + r".{0,70}\b(?:both|shared|overlap)\b",
+        ),
+        "correlation statistics": (
+            r"\b[rap]\s*[=:]\s*" + number,
+            r"\bp\s*[<=>:]\s*" + number,
+        ),
+        "classifier identities": (
+            r"\b(?:train(?:ed|ing)|general model)\b.{0,140}" + number
+            + r".{0,45}\b(?:conditions?|models?|datasets?)\b",
+        ),
+        "score construction": (
+            r"\b(?:range|values?|score|CSS|TSS)\b.{0,55}" + number,
+            number + r".{0,45}\b(?:range|score|CSS|TSS|cells?)\b",
+        ),
+        "sample size": (
+            r"\bn\s*=\s*" + number,
+            number + r".{0,25}\b(?:patients?|samples?|cells?)\b",
+        ),
+    }
+    values = []
+    for pattern in patterns.get(slot, ()):
+        for match in re.finditer(pattern, summary, re.I | re.DOTALL):
+            raw = next((group for group in match.groups() if group), "")
+            raw = re.sub(r"\s+", "", raw)
+            if raw and raw not in values:
+                values.append(raw)
+    if slot == "score construction":
+        for match in re.finditer(r"\b\d+(?:\.\d+)?\s*[-â€“â€”]\s*\d+(?:\.\d+)?\b", summary):
+            raw = re.sub(r"\s+", "", match.group(0))
+            if raw not in values:
+                values.append(raw)
+    return values[:16]
+
+
+def _slot_required_terms(slot: str, summary: str) -> list[str]:
+    priority = []
+    for match in re.finditer(r"\b[A-Z][A-Z0-9-]{1,14}\b", summary):
+        term = match.group(0)
+        if term not in {"PDF", "FIG", "CI"} and term not in priority:
+            priority.append(term)
+    words = [
+        token for token in re.findall(r"[A-Za-z][A-Za-z0-9-]{3,}", summary)
+        if token.casefold() not in _SLOT_STOPWORDS
+        and not token.isdigit()
+    ]
+    for token in words:
+        if _normal(token) not in {_normal(item) for item in priority}:
+            priority.append(token)
+    return priority[:24]
+
+
+def _slot_required_phrases(slot: str, summary: str) -> list[str]:
+    candidates = {
+        "performance metrics": (
+            "precision", "accuracy", "recall", "F1",
+        ),
+        "classifier identities": (
+            "classification tree", "decision tree", "random forest", "voting",
+            "consensus", "general model",
+        ),
+        "candidate validation": (
+            "validated", "validation", "cell-cycle arrest",
+        ),
+        "toxicity distinction": (
+            "toxicity", "toxic", "viability", "senescence",
+        ),
+        "downstream validation": (
+            "one-two-punch", "senolytic", "less than half",
+        ),
+        "score construction": (
+            "percentage of cells", "nuclear morphology",
+        ),
+        "comparison outcomes": (
+            "higher", "lower", "increased", "decreased", "reduced",
+        ),
+        "inclusion criteria": (
+            "threshold", "included", "excluded", "predominantly",
+        ),
+        "CT overfitting method": (
+            "cost complexity pruning", "alpha",
+        ),
+    }
+    normal_summary = _normal(summary)
+    rows = []
+    for phrase in candidates.get(slot, ()):
+        if _normal(phrase) in normal_summary and _normal(phrase) not in {
+            _normal(item) for item in rows
+        }:
+            rows.append(phrase)
+    if slot == "features":
+        inventory = re.search(
+            r"([^.;]{3,300})\s+were used as (?:nuclear )?features\b",
+            summary, re.I,
+        )
+        if inventory:
+            for item in re.split(r"\s*,\s*|\s+and\s+", inventory.group(1)):
+                item = item.strip(" .:;-â€“â€”")
+                item = re.sub(r"^and\s+", "", item, flags=re.I)
+                # Keep clean noun-phrase feature names, not preceding prose.
+                if 1 <= len(item.split()) <= 4 and re.fullmatch(
+                    r"[A-Za-z][A-Za-z -]*", item,
+                ):
+                    rows.append(item)
+    if slot == "library construction":
+        for phrase in (
+            "30 wells", "three plates", "10,000 normal cells",
+            "10,000 treated cells", "independent training sets",
+            "different randomizations",
+        ):
+            if _normal(phrase) in normal_summary:
+                rows.append(phrase)
+    if slot in {
+        "classifier identities", "candidate validation", "downstream validation",
+        "score construction", "comparison outcomes", "inclusion criteria", "sample size",
+    }:
+        for match in re.finditer(r"\b[A-Za-z][A-Za-z0-9-]{1,18}\b", summary):
+            term = match.group(0)
+            looks_scientific = any(char.isdigit() for char in term) or sum(
+                char.isupper() for char in term
+            ) >= 2
+            if looks_scientific and term not in {"PDF", "FIG", "CI", "DAPI", "ANOVA"} and _normal(term) not in {
+                _normal(item) for item in rows
+            }:
+                rows.append(term)
+    return rows[:20]
+
+
+def build_grounded_slot_records(
+    slot_evidence: dict[str, dict], figure_number: str | None = None,
+    support_text: str = "",
+) -> list[dict]:
+    """Compact resolved slot evidence into display-validation records."""
+    rows = []
+    for slot, record in slot_evidence.items():
+        status = str(record.get("status") or "not_found")
+        summary = _slot_summary(slot, record, figure_number) if status == "grounded" else ""
+        if slot == "library construction" and not re.search(
+            r"\bindependent training sets?\b", summary, re.I,
+        ):
+            for item in record.get("evidence", []):
+                detail = re.search(
+                    r"[^.!?]*\bindependent training sets?\b[^.!?]*"
+                    r"\brandomi[sz]ations?\b[^.!?]*[.!?]?",
+                    _clean_text(item.get("text", "")), re.I,
+                )
+                if detail:
+                    summary = f"{summary} {detail.group(0).strip()}".strip()
+                    break
+        evidence_text = " ".join(
+            str(item.get("text", "")) for item in record.get("evidence", [])
+        )
+        evidence_text = f"{evidence_text} {support_text}".strip()
+        supported_query_acronyms = [
+            acronym for acronym in record.get("query_acronyms", [])
+            if re.search(rf"\b{re.escape(str(acronym))}\b", evidence_text, re.I)
+            and not re.search(rf"\b{re.escape(str(acronym))}\b", summary, re.I)
+        ]
+        if supported_query_acronyms:
+            summary = (
+                f"{summary} Requested source terminology: "
+                f"{', '.join(supported_query_acronyms)}."
+            ).strip()
+        rows.append({
+            "slot": slot,
+            "status": status,
+            "summary": summary,
+            "required_values": _slot_required_values(slot, summary),
+            "required_terms": _slot_required_terms(slot, summary),
+            "required_phrases": list(dict.fromkeys([
+                *_slot_required_phrases(slot, summary),
+                *supported_query_acronyms,
+            ])),
+            "pages": list(dict.fromkeys(
+                item.get("page") for item in record.get("evidence", [])
+                if item.get("page") is not None
+            )),
+        })
+    return rows
+
+
+def _value_in_answer(value: str, answer: str) -> bool:
+    expected = re.sub(r"[\s,]", "", str(value)).casefold()
+    observed = re.sub(r"[\s,]", "", str(answer)).casefold()
+    return expected in observed
+
+
+def grounded_slot_coverage_errors(answer: str, records: list[dict]) -> list[str]:
+    value = str(answer or "")
+    normal_answer = _normal(value)
+    errors = []
+    absence = bool(re.search(
+        r"\b(?:no mention|no evidence|not found|not reported|not specified|"
+        r"does not (?:mention|support|report)|not available)\b",
+        value, re.I,
+    ))
+    for record in records:
+        if record.get("status") != "grounded" or not record.get("summary"):
+            continue
+        slot = str(record.get("slot"))
+        missing_values = [
+            item for item in record.get("required_values", [])
+            if not _value_in_answer(item, value)
+        ]
+        missing_phrases = [
+            item for item in record.get("required_phrases", [])
+            if _normal(item) not in normal_answer
+        ]
+        terms = [item for item in record.get("required_terms", []) if _normal(item)]
+        term_hits = sum(_normal(item) in normal_answer for item in terms)
+        minimum_hits = min(len(terms), max(2, (len(terms) + 2) // 3)) if terms else 0
+        if missing_values or missing_phrases or (terms and term_hits < minimum_hits):
+            errors.append(f"grounded slot not expressed: {slot}")
+        if absence and (
+            _normal(slot) in normal_answer
+            or any(_normal(item) in normal_answer for item in terms[:8])
+        ):
+            errors.append(f"grounded slot contradicted by not-found claim: {slot}")
+    return list(dict.fromkeys(errors))
+
+
+def append_missing_grounded_slots(answer: str, records: list[dict]) -> tuple[str, list[str]]:
+    """Append concise source-grounded slot text when generated prose omits it."""
+    value = str(answer or "").strip()
+    additions = []
+    appended = []
+    for record in records:
+        if record.get("status") != "grounded" or not record.get("summary"):
+            continue
+        if not grounded_slot_coverage_errors(value, [record]):
+            continue
+        pages = record.get("pages") or []
+        citation = f" (page {pages[0]})" if len(pages) == 1 else (
+            f" (pages {', '.join(str(page) for page in pages[:3])})" if pages else ""
+        )
+        additions.append(f"- **{record['slot']}:** {record['summary']}{citation}")
+        appended.append(str(record["slot"]))
+        value = f"{value}\n\n{additions[-1]}".strip()
+    if not appended:
+        return str(answer or "").strip(), []
+    base = str(answer or "").strip()
+    return f"{base}\n\n**Grounded requested details**\n\n" + "\n".join(additions), appended
+
+
+def remove_false_grounded_absence_claims(
+    answer: str, records: list[dict],
+) -> tuple[str, list[str]]:
+    """Remove only absence claims contradicted by a grounded requested slot."""
+    removed = []
+    kept = []
+    parts = re.split(r"(?<=[.!?])\s+|\n+", str(answer or ""))
+    absence_pattern = re.compile(
+        r"\b(?:no mention|no evidence|not found|not reported|not specified|"
+        r"does not (?:mention|support|report)|do not contain|does not contain|"
+        r"not available|not present|not provided)\b",
+        re.I,
+    )
+    grounded = [row for row in records if row.get("status") == "grounded"]
+    for part in parts:
+        if not part.strip():
+            continue
+        normal_part = _normal(part)
+        conflicts = []
+        if absence_pattern.search(part):
+            for record in grounded:
+                anchors = [str(record.get("slot", "")), *record.get("required_terms", [])[:12]]
+                if len(grounded) == 1 or any(
+                    _normal(anchor) and _normal(anchor) in normal_part for anchor in anchors
+                ):
+                    conflicts.append(str(record.get("slot")))
+        if conflicts:
+            removed.extend(conflicts)
+        else:
+            kept.append(part.strip())
+    return "\n".join(kept).strip(), list(dict.fromkeys(removed))
+
+
 def validate_answer_consistency(answer: str, evidence: dict) -> list[str]:
     """Return factual/display inconsistencies against the authoritative object."""
     value = str(answer or "").strip()
@@ -790,6 +1319,9 @@ def validate_answer_consistency(answer: str, evidence: dict) -> list[str]:
         errors.append("raw source-chunk fragment leaked into answer")
 
     if evidence.get("answer_kind") == "resolved_figure":
+        errors.extend(grounded_slot_coverage_errors(
+            value, evidence.get("grounded_slots", []),
+        ))
         for panel in evidence.get("panels", []):
             label = str(panel.get("panel", ""))
             if not re.search(rf"\bpanel\s+{re.escape(label)}\b", value, re.I):
@@ -945,9 +1477,9 @@ def validate_answer_consistency(answer: str, evidence: dict) -> list[str]:
                 errors.append(f"missing explicit author conclusion for {subject}")
 
     numeric_field_patterns = {
-        "screened": r"(?:\bscreen(?:ed|ing)\b.{0,60}?\b(\d+)\b|\b(\d+)\b.{0,60}?\bscreened\b)",
+        "screened": r"(?:\bscreen(?:ed|ing)\b.{0,30}?\b(\d+)\s+(?:drugs?|compounds?)\b|\b(\d+)\s+(?:drugs?|compounds?)\s+(?:were\s+)?screened\b)",
         "identified_total": r"(?:\bidentified\b.{0,50}?\b(\d+)\b.{0,30}\b(?:total\s+)?(?:hits?|drugs?|compounds?)\b|\b(\d+)\b\s+total\s+(?:hits?|drugs?|compounds?)\b)",
-        "both": r"\b(\d+)\b.{0,70}\b(?:both|shared)\b",
+        "both": r"(?:\b(\d+)\s+(?:hits?|drugs?|compounds?)\s+(?:were\s+)?(?:active\s+in\s+)?(?:both|shared)\b|\b(\d+)\s+(?:was|were)\s+(?:identified|active)\s+(?:in\s+)?(?:both|shared)\b)",
         "toxicity_filter": r"\b(\d+(?:\.\d+)?\s*%)\b.{0,70}\b(?:toxic|toxicity|filter|threshold)\b",
         "bounded_value": r"\b(?:less|more)\s+than\s+(\d+(?:\.\d+)?\s*%)",
     }
@@ -959,7 +1491,7 @@ def validate_answer_consistency(answer: str, evidence: dict) -> list[str]:
         pattern = numeric_field_patterns.get(key)
         if key.startswith("only_"):
             group = re.escape(key[5:].replace("_", " "))
-            pattern = rf"\b(\d+)\b.{{0,70}}\b(?:only|specific)\b.{{0,30}}\b{group}\b"
+            pattern = rf"\b(\d+)\s+(?:hits?|drugs?|compounds?)\s+(?:were\s+)?(?:only\s+in|specific\s+to)\s+{group}\b"
         if pattern:
             asserted = {
                 re.sub(r"\s+", "", group)
@@ -976,10 +1508,11 @@ def validate_answer_consistency(answer: str, evidence: dict) -> list[str]:
     numeric_groups = defaultdict(set)
     for sentence in re.split(r"(?<=[.;!?])\s+|\n", value):
         patterns = {
-            "screened": r"\b(?:screened|screening)\b.{0,60}?\b(\d+)\b|\b(\d+)\b.{0,60}?\bscreened\b",
+            "screened": r"\b(?:screened|screening)\b.{0,30}?\b(\d+)\s+(?:drugs?|compounds?)\b|\b(\d+)\s+(?:drugs?|compounds?)\s+(?:were\s+)?screened\b",
             "both": (
-                r"\b(\d+)\s+(?:(?:drugs?|compounds?|hits?)\b.{0,80}|"
-                r"(?:was|were)\b.{0,50})\b(?:both|shared)\b"
+                r"(?:\b(\d+)\s+(?:drugs?|compounds?|hits?)\s+(?:were\s+)?"
+                r"(?:active\s+in\s+)?(?:both|shared)\b|\b(\d+)\s+(?:was|were)\s+"
+                r"(?:identified|active)\s+(?:in\s+)?(?:both|shared)\b)"
             ),
             "total_hits": r"\b(?:identified|total)\b.{0,40}\b(\d+)\s+(?:drugs?|compounds?|hits?)\b",
         }
@@ -1644,4 +2177,8 @@ def render_final_answer_evidence(evidence: dict) -> str:
                 f"Together, these results show that {conclusion['subject']} is not merely "
                 f"a detector of {conclusion['object']}.",
             ])
-    return "\n".join(lines).strip()
+    answer = "\n".join(lines).strip()
+    answer, _ = append_missing_grounded_slots(
+        answer, evidence.get("grounded_slots", []),
+    )
+    return answer

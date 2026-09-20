@@ -67,6 +67,65 @@ def test_complete_short_answer_does_not_trigger_continuation_or_summary_budget()
     assert not debug["continuation_used"]
 
 
+def test_methods_answer_uses_complete_output_budget():
+    debug = {}
+    with patch(
+        "services.ollama_service.ollama.chat",
+        return_value=_response("The exact method is reported."),
+    ) as chat:
+        generate_answer(
+            "Give the exact Methods.",
+            "[METHODS-AWARE RETRIEVAL]\nSource evidence", [], debug,
+        )
+    assert chat.call_args.kwargs["options"]["num_predict"] == SUMMARY_NUM_PREDICT
+
+
+def test_grounded_slot_blocks_false_not_found_and_repairs_displayed_answer():
+    context = (
+        '[QUESTION COVERAGE]\nRequested answer slots: ["inclusion criteria"]\n'
+        '[GROUNDED ANSWER SLOT EVIDENCE]\n'
+        '{"inclusion criteria":{"slot":"inclusion criteria","status":"grounded",'
+        '"evidence":[{"page":17,"source":"document_text","text":'
+        '"For patient samples, circularity > 0.7 selected nuclei predominantly from '
+        'hepatocytes rather than fibroblasts or immune cells."}]}}\n'
+        'Source: paper.pdf, page 17\nThe same grounded Methods sentence.'
+    )
+    debug = {}
+    with patch(
+        "services.ollama_service.ollama.chat",
+        side_effect=[
+            _response("The paper does not mention a circularity threshold."),
+            _response("The requested threshold is not available."),
+        ],
+    ):
+        answer = generate_answer(
+            "Why was the circularity threshold used and which cells did it include?",
+            context, [], debug,
+        )
+    lowered = answer.casefold()
+    assert "0.7" in answer and "hepatocytes" in lowered
+    assert "fibroblasts" in lowered and "immune cells" in lowered
+    assert "does not mention" not in lowered and "not available" not in lowered
+    assert debug["grounded_slots_appended"] == ["inclusion criteria"]
+    assert debug["final_grounded_slot_coverage_errors"] == []
+
+
+def test_grounded_slot_removes_not_provided_claim():
+    context = (
+        '[GROUNDED ANSWER SLOT EVIDENCE]\n'
+        '{"RF threshold":{"slot":"RF threshold","status":"grounded",'
+        '"evidence":[{"page":16,"source":"document_text","text":'
+        '"RF senescence probability values > 0.5 were considered senescent."}]}}'
+    )
+    with patch(
+        "services.ollama_service.ollama.chat",
+        return_value=_response("The RF threshold is not provided."),
+    ):
+        answer = generate_answer("What RF threshold was used?", context, [])
+    assert "not provided" not in answer.casefold()
+    assert "> 0.5" in answer
+
+
 def test_compound_screen_continuation_grammar_is_cleaned():
     cleaned, changed = _clean_generation_artifacts(
         "Finally, **1 were identified as selective and 18 were shared."
@@ -225,6 +284,27 @@ def test_explicit_plural_limitations_are_completed_without_losing_future_work():
     assert "approximately three times" in answer
     assert debug["explicit_runtime_examples_appended"]
     assert debug["final_missing_explicit_limitations"] == []
+
+
+def test_explicit_limitation_preserves_other_tissues_scope():
+    statement = (
+        "The TSS might need adaptation to identify senescence in other tissues."
+    )
+    context = (
+        "[SECTION-AWARE AUTHOR EVIDENCE]\n[EXPLICIT AUTHOR LIMITATIONS]\n"
+        + __import__("json").dumps({
+            "items": [{"key": "other_tissues", "statement": statement}],
+            "status": "explicit_author_limitations",
+        })
+    )
+    with patch(
+        "services.ollama_service.ollama.chat",
+        return_value=_response(
+            "The TSS might need adaptation for other types of senescent cells."
+        ),
+    ):
+        answer = generate_answer("What limitations do the authors state?", context, [])
+    assert "other tissues" in answer.casefold()
 
 
 def test_grounded_transient_comparison_is_preserved_after_summary_generation():

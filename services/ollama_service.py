@@ -4,15 +4,21 @@ import re
 import ollama
 
 from services.final_answer_composer import (
+    append_missing_grounded_slots,
+    build_grounded_slot_records,
     build_provenance_final_answer_evidence,
+    grounded_slot_coverage_errors,
     parse_final_evidence_context,
+    remove_false_grounded_absence_claims,
     render_final_answer_evidence,
     validate_answer_consistency,
 )
 from services.scientific_evidence import (
+    correct_unsupported_measurement_entities,
     document_glossary,
     extract_explicit_classifier_taxonomy,
     remove_unsupported_acronym_expansions,
+    remove_unsupported_acronym_names,
     validate_classifier_taxonomy_prose,
 )
 from settings import NORMAL_NUM_PREDICT, OLLAMA_MODEL, SUMMARY_NUM_PREDICT
@@ -52,6 +58,18 @@ def _validated_experimental_provenance(context: str) -> list[dict]:
     except (json.JSONDecodeError, TypeError):
         return []
     return [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
+
+
+def _grounded_answer_slots(context: str) -> list[dict]:
+    marker = "[GROUNDED ANSWER SLOT EVIDENCE]"
+    _, found, remainder = str(context or "").partition(marker)
+    if not found or (start := remainder.find("{")) < 0:
+        return []
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(remainder[start:])
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return build_grounded_slot_records(payload) if isinstance(payload, dict) else []
 
 
 def _enforce_experimental_figure_provenance(
@@ -321,16 +339,33 @@ def _validated_explicit_limitations(context: str) -> list[dict]:
 
 def _missing_explicit_limitations(answer: str, items: list[dict]) -> list[dict]:
     normalized_answer = set(re.findall(r"[a-z][a-z-]{3,}", str(answer or "").casefold()))
+    answer_text = str(answer or "")
     missing = []
     for item in items:
+        statement = str(item.get("statement", ""))
         statement_tokens = {
             token for token in re.findall(
-                r"[a-z][a-z-]{3,}", str(item.get("statement", "")).casefold()
+                r"[a-z][a-z-]{3,}", statement.casefold()
             )
             if token not in {"than", "more", "method", "study", "hybrid"}
         }
         overlap = len(statement_tokens.intersection(normalized_answer))
-        if statement_tokens and overlap / len(statement_tokens) < 0.55:
+        critical_patterns = []
+        if re.search(r"\bother tissues?\b", statement, re.I):
+            critical_patterns.append(r"\bother tissues?\b")
+        if re.search(r"\bperformed worse\b", statement, re.I):
+            critical_patterns.append(r"\bperformed worse\b|\bworse\b.{0,60}\bidentif")
+        if re.search(r"\bmorphology\b.{0,80}\bunchanged\b", statement, re.I):
+            critical_patterns.append(r"\bmorphology\b.{0,100}\bunchanged\b")
+        if re.search(r"\bmarkers?\b.{0,100}\baffect\w*\b.{0,80}\bcompar", statement, re.I):
+            critical_patterns.append(r"\bmarkers?\b.{0,100}\baffect\w*\b.{0,80}\bcompar")
+        critical_missing = any(
+            not re.search(pattern, answer_text, re.I | re.DOTALL)
+            for pattern in critical_patterns
+        )
+        if statement_tokens and (
+            overlap / len(statement_tokens) < 0.55 or critical_missing
+        ):
             missing.append(item)
     return missing
 
@@ -614,6 +649,7 @@ def generate_answer(
     summary_mode = "[DOCUMENT SUMMARY MODE]" in context
     requested_sections = _requested_summary_sections(question) if summary_mode else []
     grounded_items = _validated_framework_items(context)
+    grounded_answer_slots = _grounded_answer_slots(context)
     inferred_limitations = _validated_inferred_limitations(context)
     explicit_limitations = _validated_explicit_limitations(context)
     explicit_method_terms = []
@@ -699,6 +735,11 @@ EVIDENCE RULES:
   23. WHOLE-DOCUMENT EXPERIMENTAL-DOMAIN provenance supplies the only permitted
       figure identifiers for those evidence objects. Never infer a supplementary
       figure number from nearby semantic text.
+  24. GROUNDED ANSWER SLOT EVIDENCE is an explicit coverage contract. Express
+      every grounded slot, including its reported values, conditions and named
+      entities. Never call a grounded slot absent. Use Results for observed
+      outcomes and Methods for requested protocol details rather than merely
+      restating a caption.
 {section_rule}
 
 Supplied evidence:
@@ -726,7 +767,8 @@ text or the labelled visual analysis.
         },
     ]
 
-    num_predict = SUMMARY_NUM_PREDICT if summary_mode else NORMAL_NUM_PREDICT
+    methods_mode = "[METHODS-AWARE RETRIEVAL]" in context
+    num_predict = SUMMARY_NUM_PREDICT if summary_mode or methods_mode else NORMAL_NUM_PREDICT
     options = {
         "temperature": 0,
         "num_predict": num_predict,
@@ -760,6 +802,9 @@ text or the labelled visual analysis.
         slot for slot in coverage_slots
         if not re.search(re.escape(slot), answer, re.I)
     ]
+    initial_grounded_slot_errors = grounded_slot_coverage_errors(
+        answer, grounded_answer_slots,
+    )
     incomplete_ending = _ends_incomplete(answer)
     length_limited = done_reason.casefold() in {
         "length", "max_tokens", "max token", "num_predict",
@@ -770,6 +815,7 @@ text or the labelled visual analysis.
         or bool(missing_explicit_limitations)
         or bool(missing_method_terms)
         or bool(missing_coverage_slots)
+        or bool(initial_grounded_slot_errors)
     )
     attempts = [{
         "done": bool(_response_value(response, "done", False)),
@@ -807,6 +853,14 @@ text or the labelled visual analysis.
             )
         if missing_coverage_slots:
             missing_parts.append("requested methods fields: " + ", ".join(missing_coverage_slots))
+        if initial_grounded_slot_errors:
+            missing_parts.append(
+                "grounded answer slots: " + ", ".join(
+                    row["slot"] for row in grounded_answer_slots
+                    if row.get("status") == "grounded"
+                    and grounded_slot_coverage_errors(answer, [row])
+                )
+            )
         missing_text = "; ".join(missing_parts) or "the unfinished final thought"
         continuation_messages = [
             *messages,
@@ -938,15 +992,31 @@ text or the labelled visual analysis.
     )
     unsupported_completion_removed = False
     sentences = re.split(r"(?<=[.!?])\s+", answer)
+    unsupported_method_completion = re.compile(
+        r"\b(?:typically implied|standard practice would be|presumably|"
+        r"cross-validation|hold-out testing|default threshold)\b",
+        re.I,
+    )
     cleaned_sentences = [
         sentence for sentence in sentences
-        if not re.search(r"\b(?:typically implied|standard practice would be|presumably)\b", sentence, re.I)
+        if not unsupported_method_completion.search(sentence)
     ]
     if len(cleaned_sentences) != len(sentences):
         unsupported_completion_removed = True
         answer = " ".join(cleaned_sentences).strip()
+    answer, false_absence_claims_removed = remove_false_grounded_absence_claims(
+        answer, grounded_answer_slots,
+    )
+    answer, grounded_slots_appended = append_missing_grounded_slots(
+        answer, grounded_answer_slots,
+    )
+    grounded_slot_names = {
+        str(row.get("slot")) for row in grounded_answer_slots
+        if row.get("status") == "grounded"
+    }
     final_missing_coverage = [
-        slot for slot in coverage_slots if not re.search(re.escape(slot), answer, re.I)
+        slot for slot in coverage_slots
+        if slot not in grounded_slot_names and not re.search(re.escape(slot), answer, re.I)
     ]
     if final_missing_coverage:
         answer += "\n\n**Requested fields not explicitly covered**\n\n" + "\n".join(
@@ -960,8 +1030,14 @@ text or the labelled visual analysis.
         for row in classifier_taxonomy
     })
     answer = remove_unsupported_acronym_expansions(answer, supported_terms)
+    answer, unsupported_acronym_names_removed = remove_unsupported_acronym_names(
+        answer, context,
+    )
     answer, classifier_claims_removed = validate_classifier_taxonomy_prose(
         answer, classifier_taxonomy,
+    )
+    answer, measurement_entity_corrections = correct_unsupported_measurement_entities(
+        answer, context,
     )
     answer, invalid_figure_references, provenance_appended = (
         _enforce_experimental_figure_provenance(context, answer)
@@ -994,6 +1070,7 @@ text or the labelled visual analysis.
             "initial_missing_explicit_method_terms": [
                 item["acronym"] for item in missing_method_terms
             ],
+            "initial_grounded_slot_coverage_errors": initial_grounded_slot_errors,
             "initial_incomplete_ending": incomplete_ending,
             "initial_length_limited": length_limited,
             "continuation_used": len(attempts) == 2,
@@ -1010,6 +1087,11 @@ text or the labelled visual analysis.
             "inferred_limitations_appended": inferred_limitations_appended,
             "explicit_limitations_appended": explicit_limitations_appended,
             "explicit_method_terms_appended": explicit_method_terms_appended,
+            "grounded_slots_appended": grounded_slots_appended,
+            "false_grounded_absence_claims_removed": false_absence_claims_removed,
+            "final_grounded_slot_coverage_errors": grounded_slot_coverage_errors(
+                answer, grounded_answer_slots,
+            ),
             "explicit_runtime_examples_appended": runtime_examples_appended,
             "grounded_transient_comparison_appended": transient_comparison_appended,
             "multi_figure_details_appended": multi_figure_details_appended,
@@ -1020,6 +1102,8 @@ text or the labelled visual analysis.
             "final_missing_coverage_slots": final_missing_coverage,
             "unsupported_standard_practice_completion_removed": unsupported_completion_removed,
             "classifier_taxonomy_claims_removed": classifier_claims_removed,
+            "unsupported_acronym_names_removed": unsupported_acronym_names_removed,
+            "measurement_entity_corrections": measurement_entity_corrections,
             "invalid_figure_references_removed": invalid_figure_references,
             "experimental_provenance_appended": provenance_appended,
             "generation_artifacts_cleaned": generation_artifacts_cleaned,

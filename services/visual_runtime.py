@@ -13,9 +13,11 @@ from services.final_answer_composer import (
 from services.ollama_service import generate_answer
 from services.scientific_evidence import (
     caption_results_fallback,
+    correct_unsupported_measurement_entities,
     figure_local_evidence,
     merge_mixed_figure_with_caption,
     remove_unsupported_acronym_expansions,
+    remove_unsupported_acronym_names,
 )
 from services.structured_vision import format_structured_result, validate_typed_response
 from services.visual_locator import VisualResolution, resolved_analysis_question
@@ -131,6 +133,12 @@ def analyse_resolved_visual(
         if final_consistency_errors:
             answer = render_final_answer_evidence(final_answer_evidence)
         answer = remove_unsupported_acronym_expansions(answer, local_evidence["glossary"])
+        answer, unsupported_names = remove_unsupported_acronym_names(
+            answer, local_evidence["evidence_text"],
+        )
+        answer, entity_corrections = correct_unsupported_measurement_entities(
+            answer, local_evidence["evidence_text"],
+        )
         if debug_info is not None:
             debug_info.update({
                 "requested_answer_slots": slots,
@@ -142,6 +150,8 @@ def analyse_resolved_visual(
                     "final_answer_code_path", "grounded_evidence_composer"
                 ),
                 "final_answer_code_path": authoritative_path,
+                "unsupported_acronym_names_removed": unsupported_names,
+                "measurement_entity_corrections": entity_corrections,
             })
     elif debug_info is not None:
         debug_info["requested_answer_slots"] = []

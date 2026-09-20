@@ -33,10 +33,31 @@ def figure_evidence():
             "and the exception."
         ),
         "2": "Compare all conditions and explain the Figure 2 result.",
+        "3": (
+            "For Figure 3, explain panels C, D, E and G with their exact "
+            "correlation statistics, then explain panel I performance metrics."
+        ),
+        "4": (
+            "Using Figure 4, compare the classifier families and performance, "
+            "including GM, AEM and the other relevant classifiers."
+        ),
         "5": (
             "For Figure 5, how many compounds were screened, how many hits were "
             "specific to each cell line or active in both, and explain the first "
             "experiment and later screening experiment."
+        ),
+        "6": (
+            "Explain Figure 6: how selected candidates were validated, how "
+            "senescence was distinguished from toxicity, and the downstream "
+            "one-two-punch validation."
+        ),
+        "7": (
+            "Explain Figure 7: how the Tissue Senescence Score was constructed "
+            "and validated in the NrasG12V model using nuclear morphology scoring."
+        ),
+        "9": (
+            "Using Figure 9, explain the human NAFLD cohort, how p16INK4a "
+            "and TSS were compared, and report the correlation values."
         ),
     }
     targets = [
@@ -187,12 +208,47 @@ def test_figure_two_preserves_relevant_condition_distinctions(figure_evidence):
         assert f"**{condition}:**" in answer
 
 
+def test_figure_three_display_keeps_all_requested_correlation_values(figure_evidence):
+    answer = render_final_answer_evidence(figure_evidence["3"])
+    for value in ("0.8745", "0.9478", "0.8681", "0.9969"):
+        assert value in answer
+    assert "precision" in answer.casefold() and "accuracy" in answer.casefold()
+    assert "recall" in answer.casefold() and "F1" in answer
+    assert validate_answer_consistency(answer, figure_evidence["3"]) == []
+
+
+def test_figure_four_display_keeps_general_model_training_scope(figure_evidence):
+    answer = render_final_answer_evidence(figure_evidence["4"])
+    assert "GM" in answer
+    assert "12 different senescence conditions" in answer
+    assert validate_answer_consistency(answer, figure_evidence["4"]) == []
+
+
 def test_figure_five_display_contains_explicit_stage_one(figure_evidence):
     answer = render_final_answer_evidence(figure_evidence["5"])
     stage = next(line for line in answer.splitlines() if "**Stage 1" in line)
     for term in ("GFP", "mCherry", "DMSO", "ABT-263", "ABT-737", "AEM"):
         assert term in stage
     assert "selectively reduced" in stage
+
+
+def test_figure_six_display_keeps_quantitative_downstream_outcome(figure_evidence):
+    answer = render_final_answer_evidence(figure_evidence["6"])
+    assert "75%" in answer
+    assert "less than half" in answer.casefold()
+
+
+def test_figure_seven_display_keeps_construction_and_model_validation(figure_evidence):
+    answer = render_final_answer_evidence(figure_evidence["7"])
+    assert "nuclear morphology" in answer.casefold()
+    assert "percentage of cells" in answer.casefold() and "CSS 1–5" in answer
+    assert "higher TSS" in answer
+    assert "NRasG12V" in answer and "D38A" in answer
+
+
+def test_figure_nine_display_preserves_supported_question_acronym(figure_evidence):
+    answer = render_final_answer_evidence(figure_evidence["9"])
+    assert "TSS" in answer
 
 
 def test_figure_five_display_contains_explicit_stage_two(figure_evidence):

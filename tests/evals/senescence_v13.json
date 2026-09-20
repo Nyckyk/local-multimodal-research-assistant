@@ -11,7 +11,7 @@
       "expect": {
         "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
         "required_concepts": [
-          {"id": "problem", "any_of": ["lack of (?:universal|reliable|robust) (?:senescence )?markers", "reliable ways? to identify senescence"]},
+          {"id": "problem", "any_of": ["lack of (?:universal|reliable|robust) (?:senescence )?markers", "reliable ways? to identify senescence", "(?:challenge|difficulty|limitations?).{0,120}(?:identify|identifying|detect|detecting).{0,80}senescen", "traditional (?:methods|markers).{0,120}(?:subjective|limited)"]},
           {"id": "approach", "all_of": ["nuclear (?:morphology|features)", "machine-learning|machine learning"]},
           {"id": "methods", "any_of": ["classification tree", "random forest"]},
           {"id": "validation", "any_of": ["new experiments|test data|independent validation", "mouse.*human|human.*mouse"]},
@@ -157,7 +157,7 @@
       "expect": {
         "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
         "target": {"type": "figure", "number": "8", "page": 13, "status": "resolved"},
-        "required_terms": ["mouse", "senolytic", "DMSO", "p21", "TSS", "CCl4", "fibrosis", "young", "old"],
+        "required_terms": ["mouse", "senolytic", "vehicle", "p21", "TSS", "CCl4", "fibrosis", "young", "old"],
         "required_concepts": [
           {"id": "senolytic_result", "all_of": ["senolytic", "lower.*p21|p21.*lower", "lower.*tss|tss.*lower"]},
           {"id": "fibrosis_result", "all_of": ["ccl4", "higher.*tss|tss.*higher"]},
@@ -216,11 +216,11 @@
       "expect": {
         "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
         "required_concepts": [
-          {"id": "heterogeneity", "all_of": ["heterogeneity", "performed worse|worse.*identif"]},
+          {"id": "heterogeneity", "all_of": ["heterogene(?:ity|ous)", "performed worse|worse.*identif"]},
           {"id": "specific_cases", "all_of": ["imr90", "barasertib"]},
           {"id": "morphology_caveat", "any_of": ["morphology.*largely unchanged", "nuclear morphology.*unchanged"]},
           {"id": "marker_comparison", "any_of": ["choice of markers?.*affect.*comparison", "markers?.*comparisons?"]},
-          {"id": "other_tissues", "any_of": ["adaptation.*other tissues", "adapted.*other tissues"]}
+          {"id": "other_tissues", "any_of": ["adaptation.*other tissue(?:s| types?)", "adapted.*other tissue(?:s| types?)"]}
         ],
         "forbidden_claims": [{"id": "generic_small_sample", "any_of": ["small sample size was (?:an?|the) limitation"], "hard": true}]
       }

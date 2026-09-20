@@ -215,9 +215,92 @@ def remove_unsupported_acronym_expansions(answer: str, glossary: dict[str, str])
     """Preserve unexplained acronyms and remove unsupported parenthetical guesses."""
     def replace(match):
         acronym, expansion = match.group(1), match.group(2).strip()
+        # Statistical annotations and other compact measurements can follow a
+        # model name in parentheses (for example ``BAEM (r = ...; p < ...)``).
+        # They are evidence, not an attempted expansion of the acronym.
+        if re.search(r"(?:[=<>]|\b[rap]\s*[=:<>]|\bCI\b|\bn\s*=)", expansion, re.I):
+            return match.group(0)
         grounded = glossary.get(acronym)
         return match.group(0) if grounded and grounded.casefold() == expansion.casefold() else acronym
-    return re.sub(r"\b([A-Z][A-Z0-9-]{1,12})\s*\(([^)]{3,100})\)", replace, str(answer or ""))
+    value = re.sub(r"\b([A-Z][A-Z0-9-]{1,12})\s*\(([^)]{3,100})\)", replace, str(answer or ""))
+
+    # Also handle the inverse form "invented expansion (ABC)". If the source
+    # does not explicitly define that wording, retain only the stable acronym.
+    reverse = re.compile(
+        r"(?P<prefix>^|[,;:]\s*)"
+        r"(?P<expansion>[A-Z][A-Za-z-]*(?:\s+[A-Za-z][A-Za-z-]*){1,6})\s*"
+        r"\((?P<acronyms>[A-Z][A-Z0-9-]{1,12}(?:\s*/\s*[A-Z][A-Z0-9-]{1,12})*)\)",
+        re.MULTILINE,
+    )
+
+    def replace_reverse(match):
+        expansion = re.sub(r"\s+", " ", match.group("expansion")).strip()
+        acronyms = re.split(r"\s*/\s*", match.group("acronyms"))
+        grounded = [glossary.get(acronym) for acronym in acronyms]
+        if grounded and all(
+            item and item.casefold() == expansion.casefold() for item in grounded
+        ):
+            return match.group(0)
+        return f"{match.group('prefix')}{'/'.join(acronyms)}"
+
+    return reverse.sub(replace_reverse, value)
+
+
+def remove_unsupported_acronym_names(answer: str, source_text: str) -> tuple[str, list[str]]:
+    """Remove classifier/model identifiers that never occur in supplied evidence."""
+    supported = {
+        token for token in re.findall(r"\b[A-Z][A-Z0-9-]{2,15}\b", str(source_text or ""))
+    }
+    removed = []
+    value = str(answer or "")
+    for match in list(re.finditer(r"\b[A-Z][A-Z0-9-]{2,15}\b", value)):
+        token = match.group(0)
+        if token in supported or token in {"PDF", "JSON", "RAG", "DOI", "CI", "ANOVA"}:
+            continue
+        value = re.sub(rf"\b{re.escape(token)}\b", "", value)
+        removed.append(token)
+    value = re.sub(r"\s+([,.;:])", r"\1", value)
+    value = re.sub(r" {2,}", " ", value)
+    return value.strip(), list(dict.fromkeys(removed))
+
+
+def correct_unsupported_measurement_entities(answer: str, source_text: str) -> tuple[str, list[dict]]:
+    """Correct a measurement entity only when source evidence gives one unique alternative."""
+    entities = ("cells", "nuclei", "pixels", "patients", "samples")
+    value = str(answer or "")
+    source = str(source_text or "")
+    corrections = []
+    sentence_pattern = re.compile(r"[^.!?]*(?:percentage|proportion)\s+of\s+(?:" + "|".join(entities) + r")[^.!?]*[.!?]?", re.I)
+    for sentence_match in list(sentence_pattern.finditer(value)):
+        sentence = sentence_match.group(0)
+        entity_match = re.search(r"\b(?:percentage|proportion)\s+of\s+(" + "|".join(entities) + r")\b", sentence, re.I)
+        if not entity_match:
+            continue
+        observed = entity_match.group(1).casefold()
+        acronyms = re.findall(r"\b[A-Z][A-Z0-9-]{1,12}\b", sentence)
+        if not acronyms:
+            continue
+        grounded_entities = set()
+        for acronym in acronyms:
+            for anchor in re.finditer(rf"\b{re.escape(acronym)}\b", source):
+                window = source[max(0, anchor.start() - 650):anchor.end() + 650]
+                grounded_entities.update(
+                    found.casefold() for found in re.findall(
+                        r"\b(?:percentage|proportion)\s+(?:based on|of)\s+(?:the\s+)?(?:number of\s+)?(cells|nuclei|pixels|patients|samples)\b",
+                        window, re.I,
+                    )
+                )
+        if observed in grounded_entities or len(grounded_entities) != 1:
+            continue
+        replacement = next(iter(grounded_entities))
+        corrected_sentence = re.sub(
+            r"\b((?:percentage|proportion)\s+of\s+)" + re.escape(observed) + r"\b",
+            rf"\1{replacement}", sentence, flags=re.I,
+        )
+        value = value[:sentence_match.start()] + corrected_sentence + value[sentence_match.end():]
+        corrections.append({"from": observed, "to": replacement, "acronyms": acronyms})
+        break
+    return value, corrections
 
 
 @dataclass
@@ -344,27 +427,41 @@ def experimental_evidence_object(
 
 
 def requested_answer_slots(question: str) -> list[str]:
+    value = str(question or "")
     patterns = (
-        ("features", r"\b(?:features?|variables?|measurements?)\b"),
-        ("library construction", r"\b(?:librar(?:y|ies)|training sets? assembled|constructed)\b"),
+        # A paper title may itself contain "nuclear features". Only treat it as
+        # an answer slot when the question grammatically asks for those fields.
+        ("features", r"\b(?:which|what|list|name|exact|include|including|cover)\b.{0,60}\b(?:nuclear\s+)?features?\b|\b(?:nuclear\s+)?features?\b\s*(?:that\s+|were\s+|are\s+)?(?:used|included|measured|changed?|differ(?:ed)?)\b|\bmethods?\b.{0,220}\bnuclear features?\b"),
+        ("library construction", r"\blibrar(?:y|ies)\b|\btraining sets?\s+(?:assembled|constructed)\b"),
         ("training cell counts", r"\b(?:number of cells|cell counts?|how many cells)\b"),
         ("CT split", r"\b(?:CT|classification tree).{0,40}\b(?:split|test|proportion)\b"),
         ("RF split", r"\b(?:RF|random forest).{0,40}\b(?:split|test|proportion)\b"),
         ("CT overfitting method", r"\b(?:overfitting|over-fitting|pruning|alpha)\b"),
         ("RF threshold", r"\b(?:RF|random forest).{0,40}\bthreshold\b|\bthreshold.{0,40}(?:RF|random forest)\b"),
-        ("inclusion criteria", r"\b(?:inclusion|exclusion|criteria|threshold for these samples)\b"),
-        ("compounds screened", r"\b(?:how many|number of).{0,35}\b(?:compounds?|drugs?)\b|\b(?:compounds?|drugs?).{0,35}\b(?:screened|tested)\b"),
-        ("condition-specific hit counts", r"\b(?:specific|selective|unique|only).{0,45}\b(?:hits?|compounds?|drugs?|cell lines?)\b|\b\w+-specific\b.{0,45}\b(?:hits?|compounds?|drugs?)\b|\bhow many\b.{0,45}\b(?:specific|unique)\b.{0,35}\b(?:cell|condition|group)\b|\bhits?\b.{0,45}\b(?:cell|condition|group)"),
-        ("shared hit count", r"\b(?:both|shared|overlap).{0,35}\b(?:hits?|compounds?|drugs?|active)\b|\b(?:hits?|compounds?|drugs?|active).{0,35}\b(?:both|shared|overlap)\b"),
-        ("first experiment", r"\b(?:first|initial|earlier)\s+(?:experiment|stage|assay)\b|\b(?:two|both)\s+experiments?\b"),
-        ("later screening experiment", r"\b(?:second|later|subsequent|screening|high-throughput)\s+(?:experiment|stage|assay|screen)?\b|\b(?:two|both)\s+experiments?\b"),
-        ("changing nuclear features", r"\bwhich\s+(?:nuclear\s+)?features?\s+(?:change|differ)|\b(?:features?|measurements?)\b.{0,35}\b(?:senescence|changed?|differ)\b"),
+        ("inclusion criteria", r"\b(?:inclusion|exclusion|criteria|threshold for these samples)\b|"
+         r"\bcircularity\b.{0,40}\bthreshold\b|\bthreshold\b.{0,40}\bcircularity\b"),
+        ("compounds screened", r"\b(?:how many|number of).{0,35}\b(?:compounds?|drugs?)\b|\b(?:compounds?|drugs?).{0,35}\b(?:screened|tested|screening)\b|\bcompound screening\b.{0,80}\b(?:all|counts?|results?)\b"),
+        ("condition-specific hit counts", r"\bhit counts?\b|\b(?:specific|selective|unique|only).{0,45}\b(?:hits?|compounds?|drugs?|cell lines?)\b|\b\w+-specific\b.{0,45}\b(?:hits?|compounds?|drugs?)\b|\bhow many\b.{0,45}\b(?:specific|unique)\b.{0,35}\b(?:cell|condition|group)\b|\bhits?\b.{0,45}\b(?:cell|condition|group)"),
+        ("shared hit count", r"\b(?:all\s+)?hit counts?\b|\b(?:both|shared|overlap).{0,35}\b(?:hits?|compounds?|drugs?|active)\b|\b(?:hits?|compounds?|drugs?|active).{0,35}\b(?:both|shared|overlap)\b"),
+        ("first experiment", r"\b(?:first|initial|earlier|stage\s*1)\s+(?:experiment|stage|assay|senolytic)?\b|\b(?:two|both)\s+experiments?\b"),
+        ("later screening experiment", r"\b(?:second|later|subsequent|screening|high-throughput|stage\s*2)\s+(?:experiment|stage|assay|screen|compound)?\b|\b(?:two|both)\s+experiments?\b"),
+        ("changing nuclear features", r"\bwhich\s+(?:nuclear\s+)?features?\s+(?:change|differ)|\b(?:features?|measurements?)\b.{0,35}\b(?:changed?|differ(?:ed|ent)?)\b"),
         ("feature exceptions", r"\b(?:except|exception|did not change|not significant|unchanged)\b.{0,40}\bfeatures?\b|\bfeatures?\b.{0,40}\b(?:except|exception|unchanged)\b"),
         ("panel roles", r"\b(?:role|purpose|represents?)\b.{0,40}\bpanels?\b|\bpanels?\b.{0,40}\b(?:role|purpose|represents?)\b"),
         ("condition-specific outcomes", r"\b(?:conditions?|groups?)\b.{0,80}\b(?:cells?|treatments?|markers?|senescen\w*|result)\b|\b(?:cells?|treatments?)\b.{0,80}\b(?:conditions?|groups?)\b"),
         ("experimental domains", r"\b(?:cell culture|in vitro|cell line)\b.{0,120}\b(?:mouse|animal|patient|clinical|human tissue)\b|\b(?:mouse|animal)\b.{0,120}\b(?:patient|clinical|human tissue)\b"),
+        ("correlation statistics", r"\b(?:exact\s+)?correlation\s+(?:statistics?|values?)\b|\breport\b.{0,60}\bcorrelation\b.{0,60}\b(?:r|p)\b"),
+        ("performance metrics", r"\bperformance(?:\s+metrics?)?\b|\b(?:precision|accuracy|recall|f1)\b.{0,80}\b(?:metric|performance|compare)"),
+        ("classifier identities", r"\bclassifier\s+(?:famil(?:y|ies)|identit(?:y|ies)|names?)\b|\b(?:all\s+)?classifiers?\b.{0,80}\b(?:include|including|compare|control)"),
+        ("experimental controls", r"\b(?:all\s+)?controls?\b|\b(?:vehicle|control)\s+(?:group|condition|versus|vs\.?)\b"),
+        ("candidate validation", r"\bcandidates?\b.{0,70}\bvalidat(?:e|ed|ion)\b|\bvalidat(?:e|ed|ion)\b.{0,70}\bcandidates?\b"),
+        ("toxicity distinction", r"\b(?:simple\s+)?toxicit(?:y|ies)\b|\bdistinguish\b.{0,70}\btoxic"),
+        ("downstream validation", r"\b(?:downstream|one[- ]two[- ]punch)\b.{0,80}\bvalidat(?:e|ed|ion)?\b|\bdownstream\s+(?:experiment|assay)\b"),
+        ("score construction", r"\b(?:how\b.{0,30})?(?:score|index|metric)\b.{0,50}\b(?:construct(?:ed|ion)|calculat(?:ed|ion)|deriv(?:ed|ation)|built)\b|\bconstructed\b.{0,50}\b(?:score|index|metric)\b"),
+        ("comparison outcomes", r"\bwhat\b.{0,50}\b(?:results?|score|comparison)\b.{0,40}\bshow\b|\bwhat (?:happened|changed)\b|\b(?:higher|lower|increase|decrease|direction)\b.{0,60}\b(?:comparison|result)"),
+        ("sample size", r"\b(?:cohort|patients?|samples?)\b.{0,80}\b(?:size|number|n\s*=|included|inclusion)\b|\bn\s*=\s*\d+\b"),
     )
-    return [name for name, pattern in patterns if re.search(pattern, str(question or ""), re.I)]
+    return [name for name, pattern in patterns if re.search(pattern, value, re.I)]
 
 
 def explicit_condition_outcomes(text: str) -> list[str]:
@@ -642,7 +739,88 @@ _SLOT_EVIDENCE_PATTERNS = {
         r"\b(?:significant|positive|negative|less than|identified|predicted)\b.{0,220}\b(?:treated|irradiat|condition|cells?)\b",
         r"\b(?:treated|irradiat|condition|cells?)\b.{0,220}\b(?:significant|positive|negative|less than|identified|predicted)\b",
     ),
+    "library construction": (
+        r"\b(?:training|parameter)\s+librar(?:y|ies)\b.{0,400}\b(?:plates?|wells?|control|random)",
+        r"\b(?:plates?|wells?)\b.{0,300}\b(?:training sets?|librar(?:y|ies))\b",
+        r"\bindependent training sets?\b.{0,240}\brandomi[sz]ations?\b",
+    ),
+    "training cell counts": (
+        r"\b(?:randomly selecting|selected)\b.{0,180}\b\d[\d,]*\s+(?:normal|treated)?\s*cells?\b",
+        r"\b\d[\d,]*\s+(?:normal|treated)\s+cells?\b",
+    ),
+    "CT split": (
+        r"\b(?:classification tree|CT)(?:-based)?\b.{0,240}\b(?:test size|split|training set)\b",
+    ),
+    "RF split": (
+        r"\b(?:random forest|RF)(?:-based)?\b.{0,240}\b(?:test size|split|training set)\b",
+    ),
+    "CT overfitting method": (
+        r"\b(?:cost complexity|prun(?:e|ed|ing)|optimal\s+alpha)\b.{0,180}\b(?:over\s*fitting|classification tree|CT)\b",
+        r"\b(?:classification tree|CT)\b.{0,260}\b(?:cost complexity|prun(?:e|ed|ing)|alpha)\b",
+    ),
+    "RF threshold": (
+        r"\b(?:random forest|RF)\b.{0,260}\b(?:probability|values?)\s*[><=]+\s*\d",
+        r"\bsenescence probability\b.{0,120}[><=]+\s*\d",
+    ),
+    "inclusion criteria": (
+        r"\b(?:included|excluded|inclusion|threshold)\b.{0,360}\b(?:samples?|cells?|nuclei|patients?)\b",
+        r"\b(?:samples?|nuclei|patients?)\b.{0,360}\b(?:included|excluded|threshold)\b",
+    ),
+    "correlation statistics": (
+        r"\bcorrelation\b.{0,360}\br\s*[=:]\s*\d",
+        r"\br\s*[=:]\s*\d.{0,120}\bp\s*[<=>:]\s*\d",
+    ),
+    "performance metrics": (
+        r"\b(?:precision|accuracy|recall|F\s*1)\b.{0,360}\b(?:classifier|performance|score|heatmap)",
+    ),
+    "classifier identities": (
+        r"\b(?:classification|decision)\s+tree\b.{0,420}\brandom forest\b",
+        r"\b(?:classifiers?|algorithms?)\b.{0,420}\b(?:voting|consensus|general model)\b",
+    ),
+    "experimental controls": (
+        r"\b(?:control|vehicle|DMSO)\b.{0,320}\b(?:treated|experiment|comparison|cells?|mice)\b",
+    ),
+    "candidate validation": (
+        r"\b(?:selected|candidate)\s+(?:drugs?|compounds?)\b.{0,520}\b(?:SA-?beta-?Gal|p21|BrdU|validat)",
+        r"\b(?:SA-?beta-?Gal|p21|BrdU)\b.{0,520}\b(?:selected|candidate)\s+(?:drugs?|compounds?)\b",
+        r"\bvalidat(?:e|ed|ion)\b.{0,420}\b(?:drugs?|compounds?|senescence)\b",
+    ),
+    "toxicity distinction": (
+        r"\b(?:toxic|toxicity|viability)\b.{0,360}\b(?:senescen|cell count|excluded|filter)",
+        r"\b(?:cell cycle arrest|SASP|p21|SA-?beta-?Gal)\b.{0,420}\b(?:senescen|induction|A549|IMR90)\b",
+        r"\b(?:senescen|induction|A549|IMR90)\b.{0,420}\b(?:cell cycle arrest|SASP|p21|SA-?beta-?Gal)\b",
+    ),
+    "downstream validation": (
+        r"\b(?:one[- ]two[- ]punch|senolytic|downstream)\b.{0,420}\b(?:validat|treated|reduced|activity)",
+        r"\b(?:one[- ]two[- ]punch|combined with senolytics?)\b.{0,520}\b(?:ABT|sensiti[sz]|pre-?treat)",
+        r"\b(?:pre-?treat|sensiti[sz])\w*\b.{0,520}\b(?:senolytic|ABT|one[- ]two[- ]punch)",
+    ),
+    "score construction": (
+        r"\b(?:cell|tissue)\s+senescence score\b.{0,500}\b(?:percentage|range|values?|nuclear|construct|calculat)",
+        r"\b(?:CSS|TSS)\b.{0,500}\b(?:percentage|range|values?|nuclear|construct|calculat)",
+    ),
+    "comparison outcomes": (
+        r"\b(?:higher|lower|increase[sd]?|decrease[sd]?|reduced|induced)\b.{0,360}\b(?:score|TSS|marker|positive cells?)\b",
+        r"\b(?:score|TSS|marker|positive cells?)\b.{0,360}\b(?:higher|lower|increase[sd]?|decrease[sd]?|reduced|induced)\b",
+    ),
+    "sample size": (
+        r"\b(?:n\s*=\s*\d+|\d+\s+(?:patients?|samples?))\b.{0,300}\b(?:included|cohort|samples?|patients?)\b",
+    ),
 }
+
+
+def ground_retrieved_answer_slots(question: str, selected_results: list[dict]) -> dict[str, dict]:
+    """Resolve requested slots only against the chunks selected for display."""
+    slots = requested_answer_slots(question)
+    if not slots:
+        return {}
+    pages = [
+        (int(row.get("page")) if str(row.get("page", "")).isdigit() else index,
+         str(row.get("document", "")))
+        for index, row in enumerate(selected_results, start=1)
+        if str(row.get("document", "")).strip()
+    ]
+    return resolve_slot_evidence(slots, question, None, [], pages, [])
 
 
 def _evidence_windows(all_pages: list[tuple[int, str]]) -> list[dict]:
@@ -734,8 +912,15 @@ def resolve_slot_evidence(
     records: dict[str, dict] = {}
     question_terms = {
         token for token in re.findall(r"[a-z0-9][a-z0-9-]{3,}", str(question or "").casefold())
-        if token not in {"figure", "explain", "which", "what", "with", "from", "that", "this"}
+        if token not in {
+            "figure", "explain", "which", "what", "with", "from", "that", "this",
+            "detection", "senescence", "using", "machine", "learning", "algorithms",
+            "based", "nuclear", "features", "paper",
+        }
     }
+    question_acronyms = list(dict.fromkeys(re.findall(
+        r"\b[A-Z][A-Z0-9-]{1,14}\b", str(question or ""),
+    )))
     for slot in slots:
         if slot in {"first experiment", "later screening experiment"} and stages:
             stage = stages[0] if slot == "first experiment" else stages[-1]
@@ -744,6 +929,8 @@ def resolve_slot_evidence(
                 "status": "grounded",
                 "stage": stage["stage"],
                 "evidence": stage["evidence"],
+                "query_terms": sorted(question_terms),
+                "query_acronyms": question_acronyms,
             }
             continue
         patterns = _SLOT_EVIDENCE_PATTERNS.get(slot, (re.escape(slot),))
@@ -796,6 +983,32 @@ def resolve_slot_evidence(
                 "page": row["page"], "source": "exact_figure_reference",
                 "text": row["text"],
             })
+        # Construction questions need at least one mechanics-bearing passage,
+        # even when caption and figure-reference windows already occupy the
+        # normal evidence budget.
+        preferred_ranked = []
+        if slot == "score construction":
+            mechanics = [
+                row for _, row in ranked
+                if re.search(r"\b(?:nuclear morphology|nuclear features?)\b", row["text"], re.I)
+                and re.search(r"\b(?:CSS|cell senescence score|score assigned)\b", row["text"], re.I)
+            ][:1]
+            validation = [
+                row for _, row in ranked
+                if re.search(r"\b(?:higher|lower|increased|decreased)\b", row["text"], re.I)
+                and re.search(r"\b(?:CSS|TSS|score)\b", row["text"], re.I)
+                and re.search(r"\b(?:versus|vs\.?|compared|than)\b", row["text"], re.I)
+            ][:1]
+            preferred_ranked = [*mechanics, *validation]
+        for row in preferred_ranked:
+            if not any(
+                item["page"] == row["page"] and item["text"] == row["text"]
+                for item in evidence
+            ):
+                evidence.append({
+                    "page": row["page"], "source": "slot_specific_document_text",
+                    "text": row["text"],
+                })
         for _, row in ranked:
             if any(
                 item["page"] == row["page"] and item["text"] == row["text"]
@@ -811,6 +1024,8 @@ def resolve_slot_evidence(
             "slot": slot,
             "status": "grounded" if evidence else "not_found_after_local_search",
             "evidence": evidence,
+            "query_terms": sorted(question_terms),
+            "query_acronyms": question_acronyms,
         }
     # Quantitative screen slots belong to the later screening stage, never to
     # a preceding validation/senolytic stage. Attach their locally retrieved

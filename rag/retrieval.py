@@ -6,6 +6,7 @@ from services.scientific_evidence import (
     classify_experimental_evidence,
     extract_explicit_classifier_taxonomy,
     experimental_evidence_object,
+    ground_retrieved_answer_slots,
     requested_answer_slots,
 )
 from settings import FINAL_RESULTS, INITIAL_RESULTS
@@ -28,7 +29,7 @@ _LIMITATION_PATTERNS = (
     (
         "numerical_2d",
         r"\b2D model\b",
-        "The work uses a numerical 2D model rather than an in-vivo experiment.",
+        "The work uses a two-dimensional (2D) numerical model rather than an in-vivo experiment.",
     ),
     (
         "fixed_tissue_properties",
@@ -152,12 +153,15 @@ def extract_explicit_limitations(documents: list[str]) -> dict:
 
 def extract_discussion_limitations(documents: list[str]) -> dict:
     """Capture limitations explicitly stated in Discussion even without a heading."""
-    text = re.sub(r"[ \t]+", " ", "\n".join(str(item or "") for item in documents))
-    protected_text = re.sub(r"\be\.g\.", "e§g§", text, flags=re.I)
-    sentences = [
-        re.sub(r"\s+", " ", sentence.replace("e§g§", "e.g.")).strip()
-        for sentence in re.split(r"(?<=[.!?])\s+", protected_text)
-    ]
+    sentences = []
+    for document in documents:
+        text = re.sub(r"(?<=[A-Za-z])-\s+(?=[a-z])", "", str(document or ""))
+        text = re.sub(r"[ \t]+", " ", text)
+        protected_text = re.sub(r"\be\.g\.", "e§g§", text, flags=re.I)
+        sentences.extend(
+            re.sub(r"\s+", " ", sentence.replace("e§g§", "e.g.")).strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", protected_text)
+        )
     limitation_language = re.compile(
         r"\b(?:limitation|caveat|however|while ideally|depends? on|"
         r"affect(?:s|ed)? (?:the )?(?:comparisons?|performance|interpretation)|"
@@ -170,7 +174,7 @@ def extract_discussion_limitations(documents: list[str]) -> dict:
         r"false positives?|predictor|classifier|score|TSS|morphology|cell type|stressor|condition)\b",
         re.I,
     )
-    items, seen = [], set()
+    items, seen_signatures = [], []
     for sentence in sentences:
         if not limitation_language.search(sentence) or not topic_language.search(sentence):
             continue
@@ -178,9 +182,30 @@ def extract_discussion_limitations(documents: list[str]) -> dict:
             continue
         key = re.sub(r"[^a-z0-9]+", "_", sentence.casefold())[:72].strip("_")
         signature = frozenset(re.findall(r"[a-z]{5,}", sentence.casefold()))
-        if any(len(signature & prior) / max(1, min(len(signature), len(prior))) > 0.7 for prior in seen):
+        duplicate_index = next((
+            index for index, prior in enumerate(seen_signatures)
+            if len(signature & prior) / max(1, min(len(signature), len(prior))) > 0.7
+        ), None)
+        if duplicate_index is not None:
+            existing = items[duplicate_index]["statement"]
+            candidate_quality = (
+                len(topic_language.findall(sentence)), len(signature), len(sentence)
+            )
+            existing_signature = seen_signatures[duplicate_index]
+            existing_quality = (
+                len(topic_language.findall(existing)),
+                len(existing_signature),
+                len(existing),
+            )
+            if candidate_quality > existing_quality:
+                items[duplicate_index] = {
+                    "key": f"discussion_{key}",
+                    "statement": sentence,
+                    "evidence": [sentence],
+                }
+                seen_signatures[duplicate_index] = signature
             continue
-        seen.add(signature)
+        seen_signatures.append(signature)
         items.append({"key": f"discussion_{key}", "statement": sentence, "evidence": [sentence]})
     return {"items": items, "status": "explicit_author_limitations"} if items else {}
 
@@ -688,6 +713,44 @@ def _question_coverage_prefix(question: str) -> str:
         f"Requested answer slots: {json.dumps(slots)}\n"
         "Answer every slot from evidence, explicitly mark it not found, or clearly label inference."
     )
+
+
+def _grounded_slot_prefix(question: str, selected_results: list[dict]) -> str:
+    records = ground_retrieved_answer_slots(question, selected_results)
+    if not records:
+        return ""
+    compact = {}
+    for slot, record in records.items():
+        compact[slot] = {
+            "slot": slot,
+            "status": record.get("status"),
+            "evidence": [
+                {
+                    "page": item.get("page"),
+                    "source": item.get("source"),
+                    "text": str(item.get("text", ""))[:1800],
+                }
+                for item in record.get("evidence", [])[:3]
+            ],
+        }
+    return (
+        "[GROUNDED ANSWER SLOT EVIDENCE]\n"
+        + json.dumps(compact, ensure_ascii=False)
+        + "\nThe JSON records whether each requested slot is grounded. A grounded "
+        "slot must be expressed in the displayed answer; do not claim it is absent."
+    )
+
+
+def _attach_question_coverage(
+    question: str, context: str, selected_results: list[dict],
+) -> str:
+    prefixes = [
+        value for value in (
+            _question_coverage_prefix(question),
+            _grounded_slot_prefix(question, selected_results),
+        ) if value
+    ]
+    return "\n".join([*prefixes, context]) if prefixes else context
 
 
 def _query_candidates(queries, collection, embedder, n_results):
@@ -1641,23 +1704,20 @@ def retrieve_context(
             question, collection, embedder, reranker, available_chunks,
             selected_source=selected_source,
         )
-        prefix = _question_coverage_prefix(question)
-        return (f"{prefix}\n{context}" if prefix else context), sources
+        return _attach_question_coverage(question, context, sources), sources
 
     if is_cross_domain_evidence_question(question):
         context, sources = _retrieve_cross_domain_context(
             question, collection, embedder, reranker, available_chunks,
             selected_source=selected_source,
         )
-        prefix = _question_coverage_prefix(question)
-        return (f"{prefix}\n{context}" if prefix else context), sources
+        return _attach_question_coverage(question, context, sources), sources
 
     if is_multi_figure_evidence_question(question):
         context, sources = _retrieve_multi_figure_context(
             question, collection, embedder, reranker, available_chunks
         )
-        prefix = _question_coverage_prefix(question)
-        return (f"{prefix}\n{context}" if prefix else context), sources
+        return _attach_question_coverage(question, context, sources), sources
 
     if is_methods_question(resolved_question):
         context, sources = _retrieve_methods_context(
@@ -1665,8 +1725,7 @@ def retrieve_context(
             selected_source=selected_source,
         )
         if context:
-            prefix = _question_coverage_prefix(question)
-            return (f"{prefix}\n{context}" if prefix else context), sources
+            return _attach_question_coverage(question, context, sources), sources
 
     if is_section_aware_question(question) or is_reported_trend_question(question) or (
         previous_question and re.search(r"\b(?:error|trend|increase|decrease)\b", question, re.I)
@@ -1676,8 +1735,7 @@ def retrieve_context(
             selected_source=selected_source,
         )
         if context:
-            prefix = _question_coverage_prefix(question)
-            return (f"{prefix}\n{context}" if prefix else context), sources
+            return _attach_question_coverage(question, context, sources), sources
 
     # Existing focused-question retrieval path.
     query_embedding = embedder.encode(
@@ -1729,4 +1787,5 @@ def retrieve_context(
         chunks_per_page[page_key] = chunks_per_page.get(page_key, 0) + 1
         if len(selected_results) >= FINAL_RESULTS:
             break
-    return _format_context(selected_results, _question_coverage_prefix(question)), selected_results
+    context = _format_context(selected_results)
+    return _attach_question_coverage(question, context, selected_results), selected_results

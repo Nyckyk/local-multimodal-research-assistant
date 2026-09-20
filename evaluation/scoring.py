@@ -23,9 +23,57 @@ def normalize_text(value: Any) -> str:
     return text
 
 
+def _match_variants(value: Any) -> list[str]:
+    """Return meaning-preserving typography variants for deterministic matching."""
+    normalized = normalize_text(value)
+    variants = [normalized]
+    # Scientific prose commonly alternates between "classification-tree-based"
+    # and "classification tree based". Treat only intra-word hyphens as word
+    # boundaries; numeric signs and comparison operators remain untouched.
+    dehyphenated = re.sub(r"(?<=[a-z])-(?=[a-z])", " ", normalized)
+    depunctuated = re.sub(r"[(),;:/]+", " ", dehyphenated)
+    for candidate in (dehyphenated, re.sub(r"\s+", " ", depunctuated).strip()):
+        if candidate not in variants:
+            variants.append(candidate)
+    number_words = {
+        "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+        "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+    }
+    numeric = variants[-1]
+    for word, digit in number_words.items():
+        numeric = re.sub(rf"\b{word}\b", digit, numeric)
+    if numeric not in variants:
+        variants.append(numeric)
+    return variants
+
+
 def _matches(text: str, patterns: list[str], mode: str = "any") -> bool:
-    results = [bool(re.search(pattern, text, re.IGNORECASE)) for pattern in patterns]
+    variants = _match_variants(text)
+    results = [
+        any(re.search(pattern, variant, re.IGNORECASE) for variant in variants)
+        for pattern in patterns
+    ]
     return all(results) if mode == "all" else any(results)
+
+
+def _term_present(text: str, term: str) -> bool:
+    term_variants = _match_variants(term)
+    irregular = {
+        "mouse": "mice", "mice": "mouse",
+        # In biomedical cohort descriptions, a patient is necessarily human.
+        "human": "patient", "patient": "human",
+    }
+    for candidate in list(term_variants):
+        alternate = irregular.get(candidate)
+        if alternate and alternate not in term_variants:
+            term_variants.append(alternate)
+        if candidate == "human" and "patients" not in term_variants:
+            term_variants.append("patients")
+    return any(
+        candidate and candidate in text_variant
+        for candidate in term_variants
+        for text_variant in _match_variants(text)
+    )
 
 
 def _numeric_occurrences(text: str) -> list[float]:
@@ -47,7 +95,9 @@ def numeric_match(answer: str, requirement: dict) -> bool:
         search_texts = []
         for pattern in contexts:
             for match in re.finditer(pattern, normalized, re.IGNORECASE):
-                start, end = max(0, match.start() - 100), min(len(normalized), match.end() + 100)
+                # Headings and short Markdown bullets often separate a label
+                # from its value. Keep this local to the adjacent clause/bullet.
+                start, end = max(0, match.start() - 240), min(len(normalized), match.end() + 240)
                 search_texts.append(normalized[start:end])
     expected = float(requirement["value"])
     tolerance = float(requirement.get("tolerance", 0.0))
@@ -123,7 +173,7 @@ def score_case(case: dict, response: dict) -> dict:
         if isinstance(term, str):
             term = {"term": term}
         value = str(term["term"])
-        present = normalize_text(value) in text
+        present = _term_present(text, value)
         checks.append(_check(
             str(term.get("id") or f"term:{value}"), present,
             kind="required_term", detail=f"required term: {value}",
@@ -219,6 +269,40 @@ def score_case(case: dict, response: dict) -> dict:
             detail=str(item.get("description") or patterns), weight=item.get("weight", 1.5),
             hard=item.get("hard", False),
         ))
+
+    # Evidence is never counted as answer text. It is consulted here only to
+    # reject the stronger contradiction that a requested fact is absent when
+    # the selected evidence explicitly contains it.
+    absence_claim = bool(re.search(
+        r"\b(?:no mention|no evidence|not found|not reported|not specified|"
+        r"does not (?:mention|support|report)|is not (?:available|provided))\b",
+        text, re.I,
+    ))
+    if absence_claim:
+        evidence_text = normalize_text(
+            f"{response.get('sources', [])} {debug.get('final_answer_evidence', '')}"
+        )
+        evidence_has_requested_fact = any(
+            _term_present(evidence_text, str(item.get("term") if isinstance(item, dict) else item))
+            for item in expected.get("required_terms", [])
+        ) or any(
+            numeric_match(evidence_text, item)
+            for item in expected.get("numeric_requirements", [])
+        ) or any(
+            _matches(
+                evidence_text,
+                item.get("all_of") or item.get("any_of") or [],
+                "all" if item.get("all_of") else "any",
+            )
+            for item in expected.get("required_concepts", [])
+            if isinstance(item, dict)
+        )
+        if evidence_has_requested_fact:
+            checks.append(_check(
+                "unsupported_not_found", False, kind="contradiction",
+                detail="answer claims requested evidence is absent although selected evidence contains it",
+                weight=3, hard=True,
+            ))
 
     total = sum(row["weight"] for row in checks) or 1.0
     earned = sum(row["weight"] for row in checks if row["passed"])

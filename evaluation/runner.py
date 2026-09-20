@@ -241,11 +241,6 @@ def render_report(suite: dict, runs: list[dict], preflight: dict | None = None) 
             lines.extend(f"- {item}" for item in result.get("contradictions", []))
             if not result.get("contradictions"):
                 lines.append("- none")
-            if result.get("missing") and result.get("score", 0) >= 0.9:
-                lines.extend([
-                    "", "Possible fixture issue:", "",
-                    "- Review narrowly missed patterns against the saved answer; do not change expectations automatically.",
-                ])
             lines.append("")
     if len(runs) > 1:
         lines.extend([

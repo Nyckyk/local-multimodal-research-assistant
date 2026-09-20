@@ -18,6 +18,7 @@ from services.scientific_evidence import (
     classify_experimental_evidence,
     classify_experimental_domain,
     contradiction_check_condition_prose,
+    correct_unsupported_measurement_entities,
     document_glossary,
     enforce_authoritative_panel_prose,
     experimental_evidence_object,
@@ -26,6 +27,7 @@ from services.scientific_evidence import (
     figure_local_evidence,
     merge_mixed_figure_with_caption,
     remove_unsupported_acronym_expansions,
+    remove_unsupported_acronym_names,
     requested_answer_slots,
     structured_semantically_sufficient,
     unsupported_source_completion,
@@ -231,6 +233,15 @@ def test_figure_nine_methods_inclusion_criteria_are_retrieved():
     assert "circularity >0.7" in context and "below 10,000 cells" in context
 
 
+def test_circularity_followup_uses_grounded_inclusion_slot():
+    context, _ = retrieve_context(
+        "Why was the circularity threshold used for the human patient samples?", "",
+        EvidenceCollection(), Embedder(), Reranker(), selected_source=PDF_NAME,
+    )
+    assert '"inclusion criteria"' in context
+    assert "circularity >0.7" in context
+
+
 def test_followup_these_samples_resolves_recent_human_experiment():
     question = "Why did they impose that threshold for these samples?"
     history = [{"role": "assistant", "content": "The analysis used human NAFLD liver samples."}]
@@ -268,6 +279,25 @@ def test_discussion_limitations_are_author_stated():
     assert len(result["items"]) == 2
 
 
+def test_discussion_limitation_dehyphenates_pdf_line_wrap():
+    result = extract_discussion_limitations([
+        "The TSS might need adap-\ntation to identify senescence in other tissues."
+    ])
+    statements = " ".join(item["statement"] for item in result["items"])
+    assert "adaptation" in statements and "other tissues" in statements
+
+
+def test_discussion_limitation_prefers_complete_overlapping_chunk():
+    result = extract_discussion_limitations([
+        "While the TSS might need adaptation to identify sen",
+        "While the TSS might need adaptation to identify senescence in other tissues, "
+        "the results support use of the classifier.",
+    ])
+    statements = " ".join(item["statement"] for item in result["items"])
+    assert "adaptation to identify senescence in other tissues" in statements
+    assert "adaptation to identify sen " not in statements
+
+
 def test_experimental_domains_remain_distinct():
     assert classify_experimental_domain("A549 human cells were treated in culture") == "in_vitro_human_cell_line"
     assert classify_experimental_domain("mouse liver tissue in vivo") == "mouse_animal_tissue"
@@ -284,6 +314,46 @@ def test_unsupported_acronym_expansion_is_removed():
     answer = remove_unsupported_acronym_expansions("AEM (assumption-based etoposide model); IEM (Isolation Forest model)", glossary)
     assert "assumption-based etoposide model" in answer
     assert "Isolation Forest" not in answer and "IEM" in answer
+
+
+def test_acronym_guard_preserves_parenthetical_statistics():
+    answer = remove_unsupported_acronym_expansions(
+        "BAEM (r = 0.9969; p < 0.0001) correlated with the marker.",
+        {},
+    )
+    assert "BAEM (r = 0.9969; p < 0.0001)" in answer
+
+
+def test_unsupported_classifier_name_and_reverse_expansion_are_removed():
+    source = "The source defines classification tree-based AEM and lists MEM and HERFM."
+    glossary = document_glossary(source)
+    answer = remove_unsupported_acronym_expansions(
+        "Decision tree algorithm (YEMCP); Mouse Embryo-derived cells (MEM); "
+        "Human Embryonic Kidney cells (HERFM).",
+        glossary,
+    )
+    answer, removed = remove_unsupported_acronym_names(answer, source)
+    assert "YEMCP" in removed and "YEMCP" not in answer
+    assert "Mouse Embryo-derived" not in answer and "MEM" in answer
+    assert "Human Embryonic Kidney" not in answer and "HERFM" in answer
+
+
+def test_measurement_entity_guard_uses_explicit_metric_grounding():
+    answer, corrections = correct_unsupported_measurement_entities(
+        "TSS is the percentage of pixels with CSS values from 1 to 5.",
+        "The tissue senescence score (TSS) was calculated as the percentage of cells "
+        "with a CSS between 1 and 5.",
+    )
+    assert "percentage of cells" in answer
+    assert corrections[0]["from"] == "pixels"
+
+
+def test_document_title_does_not_create_an_unrequested_feature_slot():
+    slots = requested_answer_slots(
+        f"Using Figure 4 in {TITLE}, compare classifier performance."
+    )
+    assert "features" not in slots
+    assert "performance metrics" in slots
 
 
 def test_partial_mixed_vision_is_completed_only_from_caption(targets):

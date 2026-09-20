@@ -82,6 +82,96 @@ def test_numeric_and_text_normalization():
     })
 
 
+def test_scientific_hyphen_variants_match_without_weakening_model_type():
+    result = score_case(case(required_concepts=[{
+        "id": "classifier_types",
+        "all_of": ["aem.*classification tree", "aerfm.*random forest"],
+    }]), response(answer=(
+        "AEM is the classification-tree-based model and AERFM is the "
+        "random-forest-based model."
+    )))
+    assert result["status"] == "PASS"
+
+
+def test_unicode_hyphens_and_harmless_parentheses_normalize_for_matching():
+    result = score_case(case(required_concepts=[{
+        "id": "classifier_type",
+        "all_of": ["classification tree based", "random forest based"],
+    }]), response(answer="classification\u2011tree\u2011based; random (forest) based"))
+    assert result["status"] == "PASS"
+
+
+def test_required_mouse_term_accepts_scientific_plural_mice():
+    result = score_case(case(required_terms=["mouse"]), response(
+        answer="The experiment used young and old mice.",
+    ))
+    assert result["status"] == "PASS"
+
+
+def test_human_cohort_term_accepts_explicit_patient_wording():
+    result = score_case(case(required_terms=["human"]), response(
+        answer="The NAFLD cohort contained 34 patients.",
+    ))
+    assert result["status"] == "PASS"
+
+
+def test_number_word_variant_matches_required_numeric_term():
+    result = score_case(case(required_terms=["3 plates"]), response(
+        answer="Data were derived from at least three plates.",
+    ))
+    assert result["status"] == "PASS"
+
+
+def test_debug_evidence_does_not_satisfy_displayed_answer_requirement():
+    result = score_case(case(required_terms=["0.9969"]), response(
+        answer="Panel G reports a strong correlation.",
+        debug={"final_answer_evidence": {"value": "0.9969"}},
+    ))
+    assert "term:0.9969" in result["missing"]
+
+
+def test_retrieved_chunks_are_not_scored_as_displayed_answer():
+    result = score_case(case(required_terms=["grounded-value"]), response(
+        answer="The answer omits the value.",
+        sources=[{"source": "paper.pdf", "page": 3, "document": "grounded-value"}],
+    ))
+    assert "term:grounded-value" in result["missing"]
+
+
+def test_displayed_value_satisfies_requirement():
+    result = score_case(case(required_terms=["0.9969"]), response(
+        answer="Panel G reports r = 0.9969.",
+    ))
+    assert result["status"] == "PASS"
+
+
+def test_not_found_claim_is_hard_failure_when_selected_evidence_contains_value():
+    result = score_case(case(required_terms=["0.7", "hepatocytes"]), response(
+        answer="The paper does not mention a circularity threshold.",
+        sources=[{"source": "paper.pdf", "page": 17,
+                  "document": "A circularity threshold >0.7 selected predominantly hepatocytes."}],
+    ))
+    assert result["status"] == "FAIL"
+    assert "unsupported_not_found" in result["hard_failures"]
+
+
+def test_semantic_research_problem_equivalent_can_pass():
+    result = score_case(case(required_concepts=[{
+        "id": "problem",
+        "any_of": [r"(?:challenge|difficulty).{0,120}(?:identifying|detecting).{0,80}senescen"],
+    }]), response(answer=(
+        "The study addresses the challenge of identifying senescent cells because "
+        "traditional markers are limited."
+    )))
+    assert result["status"] == "PASS"
+
+
+def test_numeric_context_crosses_short_heading_and_bullet_boundary():
+    assert numeric_match("**Panel G**\n\n- Pearson correlation: r = 0.9969.", {
+        "value": 0.9969, "tolerance": 0.00001, "context_any": ["panel g"],
+    })
+
+
 @dataclass
 class FakeResponse:
     payload: dict
@@ -158,6 +248,16 @@ def test_output_report_generation(tmp_path):
     assert json.loads((output / "scores.json").read_text())["aggregate"]["counts"]["PARTIAL"] == 1
 
 
+def test_report_does_not_infer_fixture_issue_from_high_partial_score():
+    suite = {"name": "example", "tests": []}
+    runs = [{"run": 1, "duration_seconds": 0.1, "results": [{
+        "id": "Q1", "question": "why", "answer": "answer", "status": "PARTIAL",
+        "score": 0.99, "passed": ["document"], "missing": ["displayed_fact"],
+        "contradictions": [], "hard_failures": [], "debug": {},
+    }]}]
+    assert "Possible fixture issue" not in render_report(suite, runs)
+
+
 def test_senescence_fixture_retains_original_conversation_contract():
     suite = load_suite(__import__("pathlib").Path("tests/evals/senescence_v13.json"))
     assert len(suite["tests"]) == 15
@@ -166,3 +266,5 @@ def test_senescence_fixture_retains_original_conversation_contract():
     assert cases["Q11"]["setup_case_ids"] == ["Q10"]
     assert cases["Q15"]["fresh_conversation"] is True
     assert cases["Q15"]["select_document"] is False
+    assert "vehicle" in cases["Q09"]["expect"]["required_terms"]
+    assert "DMSO" not in cases["Q09"]["expect"]["required_terms"]

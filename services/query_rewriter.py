@@ -49,8 +49,23 @@ def _recent_referent(question: str, conversation_history: list[dict]) -> str | N
         if isinstance(message, dict)
     )
     noun = "samples" if kind == "threshold" else kind
+    if noun == "samples":
+        # Prefer an explicit human cohort phrase from the prior question over
+        # a longer incidental phrase in the prior answer (for example a graph
+        # description ending in "samples").
+        cohort = re.search(
+            r"\bhuman(?:\s+(?!(?:cohort|patients?|samples?)\b)[A-Za-z0-9-]+){0,5}"
+            r"\s+(?:cohort|patients?|samples?)\b",
+            history,
+            re.I,
+        )
+        if cohort:
+            return re.sub(
+                r"\b(?:cohort|patients?|samples?)\b$", "samples",
+                cohort.group(0), flags=re.I,
+            )
     candidates = re.findall(
-        rf"\b((?:human|patient|clinical|mouse|murine|primary|treated|control|[A-Z][A-Za-z0-9-]*)"
+        rf"\b((?:human|patient|clinical|mouse|murine|primary|treated|control)"
         rf"(?:\s+[A-Za-z0-9-]+){{0,6}}\s+{re.escape(noun)})\b",
         history,
         re.I,
