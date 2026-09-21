@@ -420,6 +420,10 @@ def _assert_figure_1(case, value):
 def _assert_figure_6(case, value):
     expected = case["expected_structured_fields"]
     _assert_required_and_prohibited(case, value)
+    labels = [re.sub(r"[^a-z0-9]+", "", _normal(item))
+              for group in ("primary", "antagonistic", "integrative", "uncertain")
+              for item in value[group]]
+    assert len(labels) == len(set(labels)) == 9, "Figure 6 must contain nine unique hallmarks"
     for group in ("primary", "antagonistic", "integrative"):
         assert {
             re.sub(r"[^a-z0-9]+", "", _normal(item))
