@@ -14,7 +14,7 @@ from services.visual_reference_parser import canonical_identifier
 from settings import PAPERS_FOLDER, VISUAL_INDEX_PATH
 
 
-INDEX_VERSION = 5
+INDEX_VERSION = 6
 _IDENTIFIER = r"(?:[A-Za-z]\.)?\d+(?:\.\d+)?|[A-Za-z]\d+"
 _FIGURE_CAPTION_PATTERN = re.compile(
     rf"^\s*(?P<kind>fig(?:ure)?\.?)\s*(?P<number>{_IDENTIFIER})(?:\s*[.:]\s*|\s+)(?P<title>.+)$",
@@ -134,18 +134,70 @@ def _caption_blocks(page: fitz.Page) -> list[dict]:
                 match = table_match
         if not match:
             continue
-        caption = block["text"]
+        caption_parts = [block["text"]]
         # Some PDFs put only "Table 1" or "Fig. A.1" in one text block.
         # Join a close following block, but never scan across the whole page.
-        if len(caption.split()) <= 4 and index + 1 < len(blocks):
+        if len(caption_parts[0].split()) <= 4 and index + 1 < len(blocks):
             following = blocks[index + 1]
             vertical_gap = following["y0"] - block["y1"]
             if -3 <= vertical_gap <= page.rect.height * 0.035:
-                caption = _clean_text(f"{caption} {following['text']}")
+                caption_parts.append(following["text"])
+
+        connected = [block]
+        changed = True
+        while changed:
+            changed = False
+            for candidate in blocks:
+                if candidate in connected or candidate["text"] in caption_parts:
+                    continue
+                if _FIGURE_CAPTION_PATTERN.match(candidate["text"]) or _TABLE_CAPTION_PATTERN.match(candidate["text"]):
+                    continue
+                touches = any(
+                    (
+                        min(candidate["y1"], current["y1"])
+                        - max(candidate["y0"], current["y0"])
+                    ) >= min(candidate["y1"] - candidate["y0"], current["y1"] - current["y0"]) * 0.35
+                    or (
+                        abs(candidate["x0"] - current["x0"]) <= getattr(page.rect, "width", 600) * 0.04
+                        and -3 <= candidate["y0"] - current["y1"] <= page.rect.height * 0.012
+                    )
+                    for current in connected
+                )
+                if touches and not re.match(
+                    r"^(?:Article\s+https?://|Nature\s+Communications)", candidate["text"], re.I
+                ):
+                    connected.append(candidate)
+                    changed = True
+        connected.sort(key=lambda candidate: (candidate["x0"], candidate["y0"]))
+        caption_parts.extend(
+            candidate["text"] for candidate in connected
+            if candidate["text"] not in caption_parts
+        )
+
+        # Journal captions commonly continue in an adjacent column. When a
+        # caption begins in the page header band, collect every geometrically
+        # connected header-band block in column order. This preserves long
+        # multi-panel captions without swallowing the Results text below.
+        if block["y0"] <= page.rect.height * 0.25:
+            header_blocks = [
+                candidate for candidate in blocks
+                if candidate["y0"] <= page.rect.height * 0.25
+                and candidate["y1"] <= page.rect.height * 0.30
+                and candidate["text"] not in caption_parts
+                and not re.match(r"^(?:Article\s+https?://|Nature\s+Communications)", candidate["text"], re.I)
+                and not _FIGURE_CAPTION_PATTERN.match(candidate["text"])
+                and not _TABLE_CAPTION_PATTERN.match(candidate["text"])
+            ]
+            header_blocks.sort(key=lambda candidate: (candidate["x0"], candidate["y0"]))
+            caption_parts.extend(candidate["text"] for candidate in header_blocks)
+        caption = _clean_text(" ".join(caption_parts))
         captions.append({
             "target_type": "table" if match.group("kind").casefold().startswith("table") else "figure",
             "target_number": match.group("number"),
-            "caption": caption[:1600],
+            "caption": caption,
+            "full_caption": caption,
+            "short_caption": caption[:360].rsplit(" ", 1)[0] + ("…" if len(caption) > 360 else ""),
+            "caption_y0": float(block["y0"]),
             "confidence": 0.96,
         })
     return captions
@@ -201,6 +253,29 @@ def _index_pdf(path: Path, signature: dict) -> dict:
                 extract_page_record(page, index + 1)
                 for index, page in enumerate(document)
             ]
+            for page_index, page_record in enumerate(pages):
+                page = document[page_index]
+                current_images = sum(
+                    rect.get_area() for image in page.get_images(full=True)
+                    for rect in page.get_image_rects(image[0])
+                ) / max(1.0, page.rect.get_area())
+                previous_images = 0.0
+                if page_index:
+                    previous_page = document[page_index - 1]
+                    previous_images = sum(
+                        rect.get_area() for image in previous_page.get_images(full=True)
+                        for rect in previous_page.get_image_rects(image[0])
+                    ) / max(1.0, previous_page.rect.get_area())
+                for caption in page_record["captions"]:
+                    caption["caption_page_number"] = page_index + 1
+                    caption["visual_page_number"] = page_index + 1
+                    if (
+                        caption["target_type"] == "figure"
+                        and page_index
+                        and caption.get("caption_y0", page.rect.height) <= page.rect.height * 0.16
+                        and previous_images >= max(0.08, current_images * 1.5)
+                    ):
+                        caption["visual_page_number"] = page_index
         return {
             "pdf_filename": path.name,
             "signature": signature,
@@ -307,7 +382,9 @@ def flatten_visual_targets(index: dict, papers_folder: Path = PAPERS_FOLDER) -> 
                     **caption,
                     "pdf_name": filename,
                     "pdf_path": str(Path(papers_folder) / filename),
-                    "page_number": int(page["pdf_page"]),
+                    "page_number": int(caption.get("visual_page_number", page["pdf_page"])),
+                    "visual_page_number": int(caption.get("visual_page_number", page["pdf_page"])),
+                    "caption_page_number": int(caption.get("caption_page_number", page["pdf_page"])),
                     "printed_page_number": page.get("printed_page_number"),
                     "nearby_text": page.get("nearby_text", ""),
                     "match_kind": "caption",

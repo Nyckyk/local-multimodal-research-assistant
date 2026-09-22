@@ -3,7 +3,11 @@ from __future__ import annotations
 import re
 from unittest.mock import patch
 
-from services.ollama_service import generate_answer
+from services.ollama_service import (
+    _clean_generation_artifacts,
+    _enforce_experimental_figure_provenance,
+    generate_answer,
+)
 from settings import NORMAL_NUM_PREDICT, SUMMARY_NUM_PREDICT
 
 
@@ -61,6 +65,90 @@ def test_complete_short_answer_does_not_trigger_continuation_or_summary_budget()
     assert chat.call_count == 1
     assert chat.call_args.kwargs["options"]["num_predict"] == NORMAL_NUM_PREDICT
     assert not debug["continuation_used"]
+
+
+def test_methods_answer_uses_complete_output_budget():
+    debug = {}
+    with patch(
+        "services.ollama_service.ollama.chat",
+        return_value=_response("The exact method is reported."),
+    ) as chat:
+        generate_answer(
+            "Give the exact Methods.",
+            "[METHODS-AWARE RETRIEVAL]\nSource evidence", [], debug,
+        )
+    assert chat.call_args.kwargs["options"]["num_predict"] == SUMMARY_NUM_PREDICT
+
+
+def test_grounded_slot_blocks_false_not_found_and_repairs_displayed_answer():
+    context = (
+        '[QUESTION COVERAGE]\nRequested answer slots: ["inclusion criteria"]\n'
+        '[GROUNDED ANSWER SLOT EVIDENCE]\n'
+        '{"inclusion criteria":{"slot":"inclusion criteria","status":"grounded",'
+        '"evidence":[{"page":17,"source":"document_text","text":'
+        '"For patient samples, circularity > 0.7 selected nuclei predominantly from '
+        'hepatocytes rather than fibroblasts or immune cells."}]}}\n'
+        'Source: paper.pdf, page 17\nThe same grounded Methods sentence.'
+    )
+    debug = {}
+    with patch(
+        "services.ollama_service.ollama.chat",
+        side_effect=[
+            _response("The paper does not mention a circularity threshold."),
+            _response("The requested threshold is not available."),
+        ],
+    ):
+        answer = generate_answer(
+            "Why was the circularity threshold used and which cells did it include?",
+            context, [], debug,
+        )
+    lowered = answer.casefold()
+    assert "0.7" in answer and "hepatocytes" in lowered
+    assert "fibroblasts" in lowered and "immune cells" in lowered
+    assert "does not mention" not in lowered and "not available" not in lowered
+    assert debug["grounded_slots_appended"] == ["inclusion criteria"]
+    assert debug["final_grounded_slot_coverage_errors"] == []
+
+
+def test_grounded_slot_removes_not_provided_claim():
+    context = (
+        '[GROUNDED ANSWER SLOT EVIDENCE]\n'
+        '{"RF threshold":{"slot":"RF threshold","status":"grounded",'
+        '"evidence":[{"page":16,"source":"document_text","text":'
+        '"RF senescence probability values > 0.5 were considered senescent."}]}}'
+    )
+    with patch(
+        "services.ollama_service.ollama.chat",
+        return_value=_response("The RF threshold is not provided."),
+    ):
+        answer = generate_answer("What RF threshold was used?", context, [])
+    assert "not provided" not in answer.casefold()
+    assert "> 0.5" in answer
+
+
+def test_compound_screen_continuation_grammar_is_cleaned():
+    cleaned, changed = _clean_generation_artifacts(
+        "Finally, **1 were identified as selective and 18 were shared."
+    )
+    assert changed
+    assert "1 was identified" in cleaned
+    assert cleaned.count("**") % 2 == 0
+
+
+def test_whole_document_provenance_rejects_invented_supplementary_figure():
+    context = (
+        '[WHOLE-DOCUMENT EXPERIMENTAL-DOMAIN EVIDENCE]\n'
+        '[{"document":"paper.pdf","figure_number":"8","figure_label":"Figure 8",'
+        '"panel":null,"page":11,"experimental_domain":"mouse_animal_tissue",'
+        '"species":"mouse","sample_type":"liver","source_text":"caption",'
+        '"source_provenance":["full_caption"]}]\nEvidence'
+    )
+    answer, invalid, appended = _enforce_experimental_figure_provenance(
+        context, "Mouse ageing is shown in implied Figure S10.",
+    )
+    assert invalid == ["Figure S10"]
+    assert "Figure S10" not in answer
+    assert "Figure 8" in answer and appended
 
 
 def test_missing_requested_summary_section_triggers_only_one_retry():
@@ -198,6 +286,27 @@ def test_explicit_plural_limitations_are_completed_without_losing_future_work():
     assert debug["final_missing_explicit_limitations"] == []
 
 
+def test_explicit_limitation_preserves_other_tissues_scope():
+    statement = (
+        "The TSS might need adaptation to identify senescence in other tissues."
+    )
+    context = (
+        "[SECTION-AWARE AUTHOR EVIDENCE]\n[EXPLICIT AUTHOR LIMITATIONS]\n"
+        + __import__("json").dumps({
+            "items": [{"key": "other_tissues", "statement": statement}],
+            "status": "explicit_author_limitations",
+        })
+    )
+    with patch(
+        "services.ollama_service.ollama.chat",
+        return_value=_response(
+            "The TSS might need adaptation for other types of senescent cells."
+        ),
+    ):
+        answer = generate_answer("What limitations do the authors state?", context, [])
+    assert "other tissues" in answer.casefold()
+
+
 def test_grounded_transient_comparison_is_preserved_after_summary_generation():
     context = (
         "[DOCUMENT SUMMARY MODE]\n"
@@ -222,6 +331,29 @@ def test_grounded_transient_comparison_is_preserved_after_summary_generation():
         )
     assert "TWMBT initially forecasts lower heat rise than Pennes' equation" in answer
     assert debug["grounded_transient_comparison_appended"] is True
+
+
+def test_summary_methods_complete_explicit_source_method_terminology():
+    context = (
+        "[DOCUMENT SUMMARY MODE]\n"
+        "Source: paper.pdf, page 1, section abstract\n"
+        "The equations use the finite element method (FEM) for solving."
+    )
+    debug = {}
+    with patch(
+        "services.ollama_service.ollama.chat",
+        side_effect=[
+            _response("Research question: Q. Methods: Numerical solution. Main results: R."),
+            _response("The source method should also be named explicitly."),
+        ],
+    ) as chat:
+        answer = generate_answer(
+            "Summarise the research question, methods and main results.",
+            context, [], debug,
+        )
+    assert chat.call_count == 2
+    assert "finite element method" in answer.casefold()
+    assert debug["explicit_method_terms_appended"] == ["FEM"]
 
 
 def test_multi_figure_completion_keeps_trends_attached_to_their_figure():

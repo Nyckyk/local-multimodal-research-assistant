@@ -1,0 +1,258 @@
+{
+  "schema_version": 1,
+  "name": "senescence_v13",
+  "description": "Original 15-question blind evaluation for the unseen senescence paper. Expectations are a protected scientific contract.",
+  "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
+  "tests": [
+    {
+      "id": "Q01",
+      "question": "Summarise the paper Detection of senescence using machine learning algorithms based on nuclear features. Cover the research problem, experimental approach, machine-learning methods, validation, main findings, applications and author-stated limitations.",
+      "fresh_conversation": true,
+      "expect": {
+        "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
+        "required_concepts": [
+          {"id": "problem", "any_of": ["lack of (?:universal|reliable|robust) (?:senescence )?markers", "reliable ways? to identify senescence", "(?:challenge|difficulty|limitations?).{0,120}(?:identify|identifying|detect|detecting).{0,80}senescen", "traditional (?:methods|markers).{0,120}(?:subjective|limited)"]},
+          {"id": "approach", "all_of": ["nuclear (?:morphology|features)", "machine-learning|machine learning"]},
+          {"id": "methods", "any_of": ["classification tree", "random forest"]},
+          {"id": "validation", "any_of": ["new experiments|test data|independent validation", "mouse.*human|human.*mouse"]},
+          {"id": "findings", "all_of": ["senescence", "tissue senescence score|tss"]},
+          {"id": "applications", "any_of": ["senolytic", "senotherap", "drug screen"]},
+          {"id": "limitations", "any_of": ["heterogeneity", "performed worse", "adapt(?:ed|ation).*other tissues", "author-stated limitation"]}
+        ],
+        "debug": {"max_missing_slots": 1}
+      }
+    },
+    {
+      "id": "Q02",
+      "question": "In Figure 1 of Detection of senescence using machine learning algorithms based on nuclear features, explain every panel A-I: the workflow and microscopy, which nuclear features changed and the exception, how AEM and AERFM were trained, and both training and independent test validation.",
+      "fresh_conversation": true,
+      "expect": {
+        "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
+        "target": {"type": "figure", "number": "1", "page": 3, "status": "resolved"},
+        "required_terms": ["nuclear area", "gyration radius", "compactness", "chord ratio", "displacement", "elongation", "form factor", "AEM", "AERFM", "etoposide", "DMSO"],
+        "required_concepts": [
+          {"id": "feature_exception", "any_of": ["all (?:features )?(?:except|but) form factor", "form factor.*(?:not significant|did not significantly)"]},
+          {"id": "training_labels", "all_of": ["etoposide.*senescent", "dmso.*(?:normal|non-senescent)"]},
+          {"id": "classifier_types", "all_of": ["aem.*classification tree|classification tree.*aem", "aerfm.*random forest|random forest.*aerfm"]},
+          {"id": "validation_split", "all_of": ["training", "(?:independent )?(?:test|validation)"]}
+        ]
+      }
+    },
+    {
+      "id": "Q03",
+      "question": "Using Figure 2 in Detection of senescence using machine learning algorithms based on nuclear features, compare growing, quiescent, irradiated DNA-damaged, MLN8054-senescent and etoposide-senescent cells using BrdU, SA-beta-Gal, 53BP1 and AEM. Explain what this shows about whether AEM merely detects DNA damage.",
+      "fresh_conversation": true,
+      "expect": {
+        "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
+        "target": {"type": "figure", "number": "2", "page": 5, "status": "resolved"},
+        "required_terms": ["growing", "quiescent", "irradiated", "MLN8054", "etoposide", "BrdU", "SA-beta-Gal", "53BP1", "AEM"],
+        "required_concepts": [
+          {"id": "irradiated_damage", "all_of": ["irradiat", "53bp1", "significant"]},
+          {"id": "etoposide_damage", "all_of": ["etoposide", "53bp1", "significant"]},
+          {"id": "mln8054_no_damage", "all_of": ["mln8054", "(?:no|not|without).*significant.*53bp1|53bp1.*(?:no|not).*significant"]},
+          {"id": "aem_detects_mln8054", "all_of": ["aem", "mln8054", "senesc"]},
+          {"id": "not_merely_damage", "any_of": ["not (?:just|merely|simply) detect(?:ing)? dna damage", "combination of nuclear features"]}
+        ],
+        "numeric_requirements": [{"id": "irradiated_under_30", "value": 30, "operator": "lt", "context_any": ["irradiat|aem"]}],
+        "forbidden_claims": [
+          {"id": "no_senescent_damage", "any_of": ["senescent cells do not show dna damage"], "hard": true},
+          {"id": "only_irradiated_damage", "any_of": ["only irradiated cells show dna damage"], "hard": true},
+          {"id": "aem_completely_excludes_damage", "any_of": ["aem completely excludes dna-damaged cells"], "hard": true}
+        ]
+      }
+    },
+    {
+      "id": "Q04",
+      "question": "For Figure 3 in Detection of senescence using machine learning algorithms based on nuclear features, explain panels C, D, E and G with their exact correlation statistics, then explain the panel I performance metrics.",
+      "fresh_conversation": true,
+      "expect": {
+        "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
+        "target": {"type": "figure", "number": "3", "page": 6, "status": "resolved"},
+        "required_terms": ["SA-beta-Gal", "p21", "BrdU", "p53", "BAEM", "precision", "accuracy", "recall", "F1"],
+        "numeric_requirements": [
+          {"id": "panel_c_r", "value": 0.8745, "tolerance": 0.00001, "context_any": ["panel c|sa-beta-gal"]},
+          {"id": "panel_d_r", "value": 0.9478, "tolerance": 0.00001, "context_any": ["panel d|brdu"]},
+          {"id": "panel_e_r", "value": 0.8681, "tolerance": 0.00001, "context_any": ["panel e|p53"]},
+          {"id": "panel_g_r", "value": 0.9969, "tolerance": 0.00001, "context_any": ["panel g|baem"]}
+        ],
+        "required_concepts": [{"id": "p_values", "any_of": ["p\\s*<\\s*0\\.0001"]}]
+      }
+    },
+    {
+      "id": "Q05",
+      "question": "Using Figure 4 in Detection of senescence using machine learning algorithms based on nuclear features, compare the classifier families and performance, including GM, AEM and the other relevant classifiers. Preserve the paper's exact classifier names and do not invent acronym expansions or unsupported taxonomy.",
+      "fresh_conversation": true,
+      "expect": {
+        "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
+        "target": {"type": "figure", "number": "4", "page": 7, "status": "resolved"},
+        "required_terms": ["GM", "AEM", "AERFM", "VCA", "precision", "F1"],
+        "required_concepts": [
+          {"id": "tree_and_forest", "all_of": ["classification tree|decision tree", "random forest"]},
+          {"id": "gm_training", "any_of": ["gm.*12 different senescence conditions", "general model.*different cell types|general model.*different.*conditions"]},
+          {"id": "strong_classifiers", "any_of": ["gm,? aem,? and iem", "gm.*aem.*iem"]}
+        ],
+        "forbidden_claims": [{"id": "invented_umbrella", "any_of": ["umbrella (?:classifier )?family"], "hard": true}]
+      }
+    },
+    {
+      "id": "Q06",
+      "question": "For Figure 5 in Detection of senescence using machine learning algorithms based on nuclear features, explain Stage 1 senolytic evaluation and Stage 2 compound screening separately, including all controls, classifiers and hit counts.",
+      "fresh_conversation": true,
+      "expect": {
+        "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
+        "target": {"type": "figure", "number": "5", "page": 8, "status": "resolved"},
+        "required_terms": ["Stage 1", "Stage 2", "GFP", "mCherry", "DMSO", "ABT-263", "ABT-737", "AEM", "GM", "A549", "IMR90"],
+        "numeric_requirements": [
+          {"id": "screened", "value": 676, "context_any": ["stage 2|screen"]},
+          {"id": "total_hits", "value": 56, "context_any": ["stage 2|hits"]},
+          {"id": "a549_hits", "value": 27, "context_any": ["a549"]},
+          {"id": "imr90_hits", "value": 11, "context_any": ["imr90"]},
+          {"id": "both_hits", "value": 18, "context_any": ["both|shared"]}
+        ],
+        "required_concepts": [
+          {"id": "selective_decrease", "all_of": ["senescent.*(?:decrease|reduc)", "aem.*(?:decrease|reduc|track)"]},
+          {"id": "toxic_filtered", "any_of": ["toxic.*(?:filter|exclude)", "toxicity filter"]}
+        ],
+        "forbidden_claims": [{
+          "id": "stage_two_leakage", "any_of": ["abt-263", "abt-737", "gfp", "mcherry", "aem"],
+          "scope_after": "stage 2", "hard": true,
+          "description": "Stage 1 entities must not be assigned to the Stage 2 screen"
+        }]
+      }
+    },
+    {
+      "id": "Q07",
+      "question": "Explain Figure 6 in Detection of senescence using machine learning algorithms based on nuclear features: how selected candidates were validated in A549 versus IMR90, how senescence induction was distinguished from simple toxicity, and the downstream one-two-punch validation.",
+      "fresh_conversation": true,
+      "expect": {
+        "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
+        "target": {"type": "figure", "number": "6", "page": 9, "status": "resolved"},
+        "required_terms": ["A549", "IMR90", "MLN8054", "ARQ621", "SA-beta-Gal", "BrdU", "p21", "SASP", "ABT-263"],
+        "required_concepts": [
+          {"id": "selectivity", "any_of": ["mln8054.*arq621.*a549.*not.*imr90", "preferentially.*a549"]},
+          {"id": "not_toxicity", "any_of": ["cell cycle arrest.*p21|p21.*cell cycle arrest", "sa-beta-gal.*sasp|sasp.*sa-beta-gal"]},
+          {"id": "downstream", "all_of": ["one-two punch|senolytic", "abt-263", "75%|less than half"]}
+        ]
+      }
+    },
+    {
+      "id": "Q08",
+      "question": "Using Figure 7 in Detection of senescence using machine learning algorithms based on nuclear features, explain how the Tissue Senescence Score was constructed and validated in the NrasG12V model using p21, uPAR, ORF1 and nuclear morphology scoring.",
+      "fresh_conversation": true,
+      "expect": {
+        "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
+        "target": {"type": "figure", "number": "7", "page": 11, "status": "resolved"},
+        "required_terms": ["Tissue Senescence Score", "NrasG12V", "D38A", "p21", "uPAR", "ORF1", "hematoxylin", "nuclear morphology"],
+        "required_concepts": [
+          {"id": "score_construction", "all_of": ["cell senescence score|css", "1-5", "percentage.*cells"]},
+          {"id": "model_validation", "all_of": ["nrasg12v", "d38a", "higher.*tss|tss.*higher"]},
+          {"id": "markers", "all_of": ["p21", "upar", "orf-?1"]}
+        ]
+      }
+    },
+    {
+      "id": "Q09",
+      "question": "Explain all experiments in Figure 8 of Detection of senescence using machine learning algorithms based on nuclear features: the mouse senolytic experiment, fibrosis model and ageing comparison, and what the TSS results show.",
+      "fresh_conversation": true,
+      "expect": {
+        "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
+        "target": {"type": "figure", "number": "8", "page": 13, "status": "resolved"},
+        "required_terms": ["mouse", "senolytic", "vehicle", "p21", "TSS", "CCl4", "fibrosis", "young", "old"],
+        "required_concepts": [
+          {"id": "senolytic_result", "all_of": ["senolytic", "lower.*p21|p21.*lower", "lower.*tss|tss.*lower"]},
+          {"id": "fibrosis_result", "all_of": ["ccl4", "higher.*tss|tss.*higher"]},
+          {"id": "age_result", "all_of": ["old", "young", "higher.*tss|tss.*higher"]}
+        ],
+        "forbidden_claims": [{"id": "not_human", "any_of": ["figure 8.*human (?:patient|evidence)", "human patients.*figure 8"], "hard": true}]
+      }
+    },
+    {
+      "id": "Q10",
+      "question": "Using Figure 9 in Detection of senescence using machine learning algorithms based on nuclear features, explain the human NAFLD cohort and sample inclusion, how p16INK4a and TSS were compared, and report the correlation r and p values.",
+      "fresh_conversation": true,
+      "expect": {
+        "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
+        "target": {"type": "figure", "number": "9", "page": 14, "status": "resolved"},
+        "required_terms": ["human", "NAFLD", "p16INK4a", "TSS", "34 patients", "10,000 cells"],
+        "numeric_requirements": [
+          {"id": "correlation_r", "value": 0.3862, "tolerance": 0.00001, "context_any": ["correlation|r"]},
+          {"id": "correlation_p", "value": 0.024, "tolerance": 0.00001, "context_any": ["correlation|p"]}
+        ]
+      }
+    },
+    {
+      "id": "Q11",
+      "question": "Why did they impose that circularity threshold for these samples, and which cell types did it preferentially include and exclude?",
+      "fresh_conversation": false,
+      "setup_case_ids": ["Q10"],
+      "expect": {
+        "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
+        "required_terms": ["0.7", "hepatocytes", "fibroblasts", "immune cells"],
+        "required_concepts": [
+          {"id": "threshold_purpose", "any_of": ["captured nuclei.*predominantly.*hepatocytes", "preferentially include.*hepatocytes"]},
+          {"id": "excluded_cells", "all_of": ["fibroblasts", "immune cells", "exclude|not"]}
+        ]
+      }
+    },
+    {
+      "id": "Q12",
+      "question": "For Detection of senescence using machine learning algorithms based on nuclear features, give the exact machine-learning Methods: training-library construction and size, normal versus treated sampling, nuclear features, CT and RF train/test methods, overfitting control and RF threshold.",
+      "fresh_conversation": true,
+      "expect": {
+        "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
+        "required_terms": ["30 wells", "3 plates", "10,000 normal", "10,000 treated", "Area", "Form Factor", "Elongation", "Compactness", "Chord Ratio", "Gyration", "Displacement", "classification tree", "random forest", "cost complexity pruning"],
+        "numeric_requirements": [
+          {"id": "ct_test_size", "value": 30, "context_any": ["classification tree|ct.*test"]},
+          {"id": "rf_test_size", "value": 0.5, "context_any": ["random forest|rf.*test"]},
+          {"id": "rf_threshold", "value": 0.5, "context_any": ["probability|senescence probability"]}
+        ],
+        "required_concepts": [{"id": "independent_randomization", "any_of": ["independent.*randomi[sz]", "different randomi[sz]ations"]}]
+      }
+    },
+    {
+      "id": "Q13",
+      "question": "What limitations do the authors explicitly state in Detection of senescence using machine learning algorithms based on nuclear features? Separate author-stated limitations from any inference.",
+      "fresh_conversation": true,
+      "expect": {
+        "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
+        "required_concepts": [
+          {"id": "heterogeneity", "all_of": ["heterogene(?:ity|ous)", "performed worse|worse.*identif"]},
+          {"id": "specific_cases", "all_of": ["imr90", "barasertib"]},
+          {"id": "morphology_caveat", "any_of": ["morphology.*largely unchanged", "nuclear morphology.*unchanged"]},
+          {"id": "marker_comparison", "any_of": ["choice of markers?.*affect.*comparison", "markers?.*comparisons?"]},
+          {"id": "other_tissues", "any_of": ["adaptation.*other tissue(?:s| types?)", "adapted.*other tissue(?:s| types?)"]}
+        ],
+        "forbidden_claims": [{"id": "generic_small_sample", "any_of": ["small sample size was (?:an?|the) limitation"], "hard": true}]
+      }
+    },
+    {
+      "id": "Q14",
+      "question": "Which figures provide evidence from cell-culture, mouse animal/tissue and human-patient tissue experiments in Detection of senescence using machine learning algorithms based on nuclear features? Synthesize the conclusions while keeping those biological domains separate.",
+      "fresh_conversation": true,
+      "expect": {
+        "document": "Detection of senescence using machine learning algorithms based on nuclear features.pdf",
+        "required_terms": ["Figure 1", "Figure 3", "Figure 7", "Figure 8", "Figure 9"],
+        "expected_provenance": [
+          {"id": "cell_culture_provenance", "all_of": ["in_vitro_human_cell_line|cell culture|in vitro", "figure 1", "figure 3"]},
+          {"id": "mouse_provenance", "all_of": ["mouse_animal_tissue|mouse", "figure 7", "figure 8"]},
+          {"id": "patient_provenance", "all_of": ["human_patient_tissue|human patient", "figure 9"]}
+        ],
+        "forbidden_claims": [
+          {"id": "cell_lines_not_patients", "any_of": ["a549"], "scope_after": "human patient-tissue evidence", "hard": true},
+          {"id": "figure8_not_human", "any_of": ["figure 8"], "scope_after": "human patient-tissue evidence", "hard": true}
+        ]
+      }
+    },
+    {
+      "id": "Q15",
+      "question": "Explain Figure 1.",
+      "fresh_conversation": true,
+      "select_document": false,
+      "expect": {
+        "target": {"type": "figure", "number": "1", "status": "ambiguous"},
+        "required_concepts": [{"id": "asks_for_paper", "any_of": ["which (?:paper|document)", "choose.*paper", "select.*paper", "ambiguous", "clarif"]}],
+        "forbidden_claims": [{"id": "must_not_guess", "any_of": ["automatically detected", "source:.*figure 1"], "hard": true}]
+      }
+    }
+  ]
+}

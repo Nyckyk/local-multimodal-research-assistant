@@ -13,6 +13,7 @@ from rag.embeddings import load_embedder, load_reranker
 from rag.retrieval import retrieve_context
 from services.equation_service import analyse_resolved_equation
 from services.ollama_service import generate_answer
+from services.research_assistant import ResearchAssistant
 from services.structured_vision import StructuredOutputError, TruncatedJSONError
 from services.visual_index import load_or_build_visual_index
 from services.visual_locator import resolve_visual_target
@@ -91,6 +92,78 @@ def _write_debug(artifact_writer, case_id, debug, error=None, answer=""):
 
 def _case_by_id(cases, case_id):
     return next(case for case in cases if case["case_id"] == case_id)
+
+
+def _production_assistant() -> ResearchAssistant:
+    return ResearchAssistant(
+        collection=get_collection(),
+        embedder=load_embedder(),
+        reranker=load_reranker(),
+        visual_index=load_or_build_visual_index(),
+    )
+
+
+def test_figure_6_auto_hallmarks_research_assistant_live_path(
+    require_ollama_models, artifact_writer,
+):
+    question = (
+        "According to Figure 6, which hallmarks are classified as primary, "
+        "antagonistic and integrative? Use the visual grouping in the figure."
+    )
+    response = _production_assistant().ask(question, conversation_messages=[])
+    debug = response.debug["vision"]
+    value = debug.get("normalized_json")
+    try:
+        assert response.resolution.pdf_name == "hall marks of aging.pdf"
+        assert response.resolution.page_number == 46
+        assert response.debug["final_answer_code_path"] == "validated_structured_vision"
+        assert debug["completeness"]["status"] == "complete"
+        assert [len(value[group]) for group in ("primary", "antagonistic", "integrative")] == [4, 3, 2]
+        assert value["uncertain"] == []
+        labels = [
+            re.sub(r"[^a-z0-9]+", "", _normal(label))
+            for group in ("primary", "antagonistic", "integrative")
+            for label in value[group]
+        ]
+        assert len(labels) == len(set(labels)) == 9
+        _write_debug(artifact_writer, "figure_6_research_assistant_live", debug, answer=response.answer)
+    except BaseException as error:
+        _write_debug(artifact_writer, "figure_6_research_assistant_live", debug, error, response.answer)
+        raise
+
+
+def test_figure_9_six_panel_bode_graph_research_assistant_live_path(
+    require_ollama_models, artifact_writer,
+):
+    question = (
+        "Analyse Figure 9. Compare the magnitude between Groups 1, 2 and 3 and "
+        "identify which group shows the greatest phase complexity."
+    )
+    response = _production_assistant().ask(question, conversation_messages=[])
+    debug = response.debug["vision"]
+    value = debug.get("validated_json")
+    try:
+        assert response.resolution.pdf_name == "Bioimpedance spectroscopy for characterizing volume-dependent structural.pdf"
+        assert response.resolution.page_number == 8
+        assert response.debug["final_answer_code_path"] == "validated_typed_vision"
+        assert debug.get("final_answer_path") != "could_not_verify_compact_graph"
+        assert value["comparisons"]["magnitude_order_high_to_low"] == [
+            "Group 3", "Group 1", "Group 2",
+        ]
+        assert value["comparisons"]["greatest_phase_complexity_group"] == "Group 2"
+        assert all(
+            panel["x_axis"]["scale"] == "log" for panel in value["panels"]
+        )
+        assert all(
+            panel["y_axis"]["scale"] == "linear"
+            for panel in value["panels"]
+            if panel["graph_kind"] == "magnitude"
+        )
+        assert value["comparisons"]["magnitude_y_axis"]["scale"] == "linear"
+        _write_debug(artifact_writer, "figure_9_research_assistant_live", debug, answer=response.answer)
+    except BaseException as error:
+        _write_debug(artifact_writer, "figure_9_research_assistant_live", debug, error, response.answer)
+        raise
 
 
 @pytest.mark.parametrize(
@@ -420,6 +493,10 @@ def _assert_figure_1(case, value):
 def _assert_figure_6(case, value):
     expected = case["expected_structured_fields"]
     _assert_required_and_prohibited(case, value)
+    labels = [re.sub(r"[^a-z0-9]+", "", _normal(item))
+              for group in ("primary", "antagonistic", "integrative", "uncertain")
+              for item in value[group]]
+    assert len(labels) == len(set(labels)) == 9, "Figure 6 must contain nine unique hallmarks"
     for group in ("primary", "antagonistic", "integrative"):
         assert {
             re.sub(r"[^a-z0-9]+", "", _normal(item))

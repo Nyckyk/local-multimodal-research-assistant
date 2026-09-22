@@ -6,11 +6,13 @@ import unicodedata
 from copy import deepcopy
 from html import unescape
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import fitz
 import ollama
 
 from services.scientific_metrics import grounded_table_trends, infer_metric_semantics
+from services.scientific_evidence import structured_semantically_sufficient
 
 from settings import NYQUIST_LOCAL_DEVIATION_THRESHOLD, VISION_MODEL
 
@@ -23,7 +25,7 @@ DIAGRAM_TYPES = {
     "labelled_diagram", "anatomical_schematic", "circuit", "flowchart",
     "microscopy_photo", "contour_heatmap",
 }
-VISUAL_TYPES = {*DIAGRAM_TYPES, "graph", "table"}
+VISUAL_TYPES = {*DIAGRAM_TYPES, "graph", "table", "mixed_figure"}
 VISUAL_IDENTIFIER_PATTERN = r"(?:[A-Za-z]\.)?\d+(?:\.\d+)?|[A-Za-z]\d+"
 
 
@@ -165,6 +167,27 @@ def detect_visual_type(question: str, page_text: str = "") -> str | None:
 
 
 def _schema_text(visual_type: str) -> str:
+    if visual_type == "mixed_figure":
+        return """{
+  "figure_number": "...",
+  "panels": [
+    {
+      "panel": "a",
+      "visual_type": "workflow|microscopy|graph|heatmap|table|other",
+      "structured_analysis": {
+        "summary": "...",
+        "labels": ["..."],
+        "components": ["..."],
+        "measurements": ["..."],
+        "observations": ["..."]
+      },
+      "confidence": 0.0,
+      "uncertain_items": ["..."]
+    }
+  ],
+  "explanation": "...",
+  "uncertain_items": ["..."]
+}"""
     if visual_type in DIAGRAM_TYPES:
         return """{
   "diagram_kind": "circuit|other",
@@ -286,6 +309,13 @@ def build_structured_prompt(
             "Transcribe columns and rows in display order. Repeat visually merged group "
             "cells on each applicable row. Every row must contain exactly one value per "
             "column. Use null for unreadable cells and record their positions."
+        ),
+        "mixed_figure": (
+            "Detect panel labels first and analyse every panel independently. "
+            "A panel may be a workflow, microscopy image, graph, heatmap, table, "
+            "or another scientific visual. Do not force all panels into one schema. "
+            "Keep each panel summary concise and report only visible or caption-grounded "
+            "content. Panel letters alone are not an analysis."
         ),
     }[visual_type]
     return f"""
@@ -1004,26 +1034,36 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
                 valid_references.add(_normal_name(node["label"]))
         for branch in value["circuit_topology"]["branches"]:
             valid_references.add(_normal_name(branch["id"]))
+    validated_relationships = []
     for relationship in value["spatial_relationships"]:
         if not isinstance(relationship, dict):
-            raise StructuredOutputError("Each spatial relationship must be an object.")
-        _require_keys(
-            relationship,
-            {"subject", "relationship", "object"},
-            "Spatial relationship",
-        )
-        if not all(
+            if diagram_kind == "circuit":
+                raise StructuredOutputError("Each spatial relationship must be an object.")
+            value["uncertain_items"].append("An invalid optional spatial relationship was removed.")
+            continue
+        if not {"subject", "relationship", "object"}.issubset(relationship) or not all(
             isinstance(relationship[field], str) and relationship[field].strip()
             for field in ("subject", "relationship", "object")
         ):
-            raise StructuredOutputError(
-                "Spatial relationship fields must be non-empty strings."
-            )
+            if diagram_kind == "circuit":
+                raise StructuredOutputError("Spatial relationship fields must be non-empty strings.")
+            value["uncertain_items"].append("An incomplete optional spatial relationship was removed.")
+            continue
+        validated_relationships.append(relationship)
+    value["spatial_relationships"] = validated_relationships
     grounded_evidence = _normal_name(evidence_text)
+    validated_connections = []
     for connection in value["connections"]:
         if not isinstance(connection, dict):
-            raise StructuredOutputError("Each diagram connection must be an object.")
-        _require_keys(connection, {"from", "to", "relationship"}, "Diagram connection")
+            if diagram_kind == "circuit":
+                raise StructuredOutputError("Each diagram connection must be an object.")
+            value["uncertain_items"].append("An invalid optional connection was removed.")
+            continue
+        if not {"from", "to", "relationship"}.issubset(connection):
+            if diagram_kind == "circuit":
+                raise StructuredOutputError("Diagram connection is incomplete.")
+            value["uncertain_items"].append("An incomplete optional connection was removed.")
+            continue
         endpoints = {_normal_name(connection["from"]), _normal_name(connection["to"])}
         unknown = endpoints.difference(valid_references)
         if diagram_kind != "circuit":
@@ -1032,9 +1072,16 @@ def validate_labelled_diagram(value: dict, evidence_text: str = "") -> dict:
                 if not endpoint or endpoint not in grounded_evidence
             }
         if valid_references and unknown:
-            raise StructuredOutputError(
-                "A diagram connection references an unknown component, label, node or branch."
+            if diagram_kind == "circuit":
+                raise StructuredOutputError(
+                    "A diagram connection references an unknown component, label, node or branch."
+                )
+            value["uncertain_items"].append(
+                "An optional connection with an unverified endpoint was removed."
             )
+            continue
+        validated_connections.append(connection)
+    value["connections"] = validated_connections
 
     series_sentences = [
         sentence.lower()
@@ -1489,6 +1536,36 @@ def _add_nyquist_scale_comparison(value: dict) -> None:
     value["comparisons"].append(comparison)
 
 
+def normalize_panel_identity(panel: dict) -> None:
+    """Canonicalize explicit panel markers without guessing from arbitrary titles."""
+    raw = str(panel.get("panel", "")).strip()
+    match = re.fullmatch(r"([A-Za-z]|\d+)", raw)
+    if not match:
+        match = re.fullmatch(r"(?:\(([A-Za-z]|\d+)\)|[Pp]anel\s+([A-Za-z]|\d+)\b)\s*[:.\-]?\s*(.*)", raw)
+        if match:
+            identifier = match.group(1) or match.group(2)
+            title = match.group(3).strip()
+            if title:
+                panel.setdefault("panel_title", title)
+                if not panel.get("group"):
+                    panel["group"] = title
+            panel["panel"] = identifier.lower()
+    else:
+        panel["panel"] = match.group(1).lower()
+
+
+def normalize_compact_group_identity(value) -> str:
+    """Canonicalize explicit compact-graph group IDs without guessing names."""
+    text = str(value or "").strip()
+    prefixed = re.search(r"\bgroup\s*([A-Za-z0-9]+)\b", text, re.IGNORECASE)
+    if prefixed:
+        return f"Group {prefixed.group(1)}"
+    # Compact panel crops often show only a numeric group marker. Restrict the
+    # shorthand to digits so arbitrary titles are never silently reclassified.
+    bare = re.fullmatch(r"\(?([0-9]+)\)?", text)
+    return f"Group {bare.group(1)}" if bare else text
+
+
 def validate_graph(value: dict, evidence_text: str = "") -> dict:
     _require_keys(
         value,
@@ -1511,6 +1588,7 @@ def validate_graph(value: dict, evidence_text: str = "") -> dict:
             },
             "Graph panel",
         )
+        normalize_panel_identity(panel)
         if not panel.get("group"):
             combined_identity = re.fullmatch(
                 r"\s*\(?([A-Za-z0-9]+)\)?\s+(.+?)\s*",
@@ -1692,6 +1770,31 @@ def validate_table(value: dict) -> dict:
 
 
 def validate_typed_response(visual_type: str, value: dict, evidence_text: str = "") -> dict:
+    if visual_type == "mixed_figure":
+        _require_keys(value, {"figure_number", "panels", "explanation", "uncertain_items"}, "Mixed figure")
+        if not isinstance(value["panels"], list) or not isinstance(value["uncertain_items"], list):
+            raise StructuredOutputError("Mixed figure panels and uncertain_items must be lists.")
+        valid_panels, warnings, seen = [], [], set()
+        for panel in value["panels"]:
+            if not isinstance(panel, dict):
+                warnings.append("discarded non-object panel")
+                continue
+            required = {"panel", "visual_type", "structured_analysis", "confidence", "uncertain_items"}
+            if not required.issubset(panel) or not isinstance(panel.get("structured_analysis"), dict):
+                warnings.append(f"discarded invalid panel {panel.get('panel', '?')}")
+                continue
+            key = str(panel["panel"]).strip().casefold()
+            if not key or key in seen:
+                warnings.append(f"discarded duplicate/empty panel {panel.get('panel', '?')}")
+                continue
+            seen.add(key)
+            valid_panels.append(panel)
+        if not valid_panels:
+            raise StructuredOutputError("Mixed figure contains no valid panel analyses.")
+        value["panels"] = valid_panels
+        if warnings:
+            value["validation_warnings"] = warnings
+        return value
     if visual_type in DIAGRAM_TYPES:
         return validate_labelled_diagram(value, evidence_text)
     if visual_type == "graph":
@@ -2229,6 +2332,36 @@ def _validate_compact_axis(axis: dict, panel: str, name: str) -> None:
         raise StructuredOutputError(f"Compact panel {panel} {name}-axis scale is invalid.")
 
 
+def normalize_compact_axis_scale(axis: dict, graph_kind: str = "") -> None:
+    """Correct transformed-value scale labels unless ticks prove a log axis."""
+    if not isinstance(axis, dict):
+        return
+    descriptor = " ".join((
+        str(graph_kind),
+        str(axis.get("label", "")),
+        str(axis.get("unit", "")),
+    )).casefold()
+    # Decibels are already logarithmically transformed values plotted on a
+    # linear coordinate axis. Preserve a true log coordinate only when optional
+    # tick evidence explicitly establishes powers-of-ten spacing; a model's
+    # bare scale label is not independent visual evidence. Signed phase angles
+    # likewise cannot use a logarithmic coordinate axis because negative ticks
+    # are visible.
+    tick_scale = infer_axis_scale(
+        axis.get("tick_labels", []), axis.get("scientific_multiplier")
+    )
+    if (("db" in descriptor and tick_scale != "log")
+            or "phase" in descriptor or "°" in descriptor):
+        axis["scale"] = "linear"
+
+
+def normalize_compact_y_axis_scale(panel: dict) -> None:
+    """Normalize one compact panel's y-axis after all label merges."""
+    normalize_compact_axis_scale(
+        panel.get("y_axis"), str(panel.get("graph_kind", ""))
+    )
+
+
 def validate_compact_panel_response(value: dict, expected_panels: list[str]) -> dict:
     _require_keys(value, {"panels", "uncertain_values"}, "Compact graph response")
     if not isinstance(value["panels"], list) or not isinstance(value["uncertain_values"], list):
@@ -2245,8 +2378,11 @@ def validate_compact_panel_response(value: dict, expected_panels: list[str]) -> 
             },
             "Compact graph panel",
         )
-        panel_id = re.sub(r"[^a-z0-9]+", "", str(panel["panel"]).lower())
+        normalize_panel_identity(panel)
+        panel_id = str(panel["panel"])
         panel["panel"] = panel_id
+        panel["group"] = normalize_compact_group_identity(panel["group"])
+        normalize_compact_y_axis_scale(panel)
         observed.append(panel_id)
         _validate_compact_axis(panel["x_axis"], panel_id, "x")
         _validate_compact_axis(panel["y_axis"], panel_id, "y")
@@ -2277,6 +2413,15 @@ def _comparison_expectations(panels: list[dict]) -> tuple[list[str], str | None]
     ]
     magnitude.sort(key=lambda panel: panel["approximate_curve_level"], reverse=True)
     order = [str(panel["group"]) for panel in magnitude]
+    verified = [p for p in panels if "magnitude" in str(p["graph_kind"]).lower()
+                and p.get("magnitude_verification")]
+    if verified:
+        order = magnitude_reading_order([p["magnitude_verification"] for p in verified])
+    # A stable sort is not visual evidence for a strict order between ties.
+    if not verified and any(math.isclose(a["approximate_curve_level"], b["approximate_curve_level"],
+                        rel_tol=0.01, abs_tol=1e-6)
+           for a, b in zip(magnitude, magnitude[1:])):
+        order = []
     phase = [
         panel for panel in panels
         if "phase" in str(panel["graph_kind"]).lower()
@@ -2286,6 +2431,144 @@ def _comparison_expectations(panels: list[dict]) -> tuple[list[str], str | None]
         if phase else None
     )
     return order, most_complex
+
+
+def _finite_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def magnitude_reading_order(records: list[dict]) -> list[str]:
+    """Require at least two agreeing comparisons for every pair, with no reversal."""
+    if len(records) < 2 or len({r["source_panel"] for r in records}) != len(records):
+        return []
+    wins = {r["source_panel"]: 0 for r in records}
+    for index, left in enumerate(records):
+        for right in records[index + 1:]:
+            a = {r["x"]: r for r in left["readings"]}
+            b = {r["x"]: r for r in right["readings"]}
+            signs = []
+            for x in a.keys() & b.keys():
+                ra, rb = a[x], b[x]
+                if not all(r["readability"] and r["confidence"] >= .7 for r in (ra, rb)):
+                    continue
+                ya, yb = ra["calibrated_y"], rb["calibrated_y"]
+                tolerance = .01 * max(abs(ya), abs(yb), 1)
+                if abs(ya - yb) > tolerance:
+                    signs.append(1 if ya > yb else -1)
+            if len(signs) < 2 or len(set(signs)) != 1:
+                return []
+            winner = left if signs[0] > 0 else right
+            wins[winner["source_panel"]] += 1
+    if sorted(wins.values()) != list(range(len(records))):
+        return []
+    return [r["source_group"] for r in sorted(records, key=lambda r: wins[r["source_panel"]], reverse=True)]
+
+
+def _source_magnitude_readings(task: dict, payload: dict, shared_x: list[float]) -> dict:
+    rows = payload.get("readings", [])
+    if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+        raise StructuredOutputError("Magnitude readings must be objects.")
+    by_x = {r.get("x"): r for r in rows}
+    if len(by_x) != len(rows) or set(by_x) != set(shared_x):
+        raise StructuredOutputError("Magnitude readings must cover each shared x exactly once.")
+    validated = []
+    for x in shared_x:
+        row = by_x[x]
+        confidence = row.get("confidence")
+        if row.get("readability") is not True or not _finite_number(confidence) or not .7 <= confidence <= 1:
+            raise StructuredOutputError("Magnitude reading is not sufficiently readable.")
+        y, position = row.get("y"), row.get("vertical_position")
+        if not _finite_number(y):
+            if not _finite_number(position) or not 0 <= position <= 1:
+                raise StructuredOutputError("Magnitude requires y or a readable vertical position.")
+            lo, hi = task["y_min"], task["y_max"]
+            y = (10 ** (math.log10(lo) + position * math.log10(hi / lo))
+                 if task["y_scale"] == "log" else lo + position * (hi - lo))
+        if not task["y_min"] <= y <= task["y_max"]:
+            raise StructuredOutputError("Magnitude reading lies outside its own y axis.")
+        validated.append({"x": x, "y": row.get("y"), "vertical_position": position,
+                          "calibrated_y": y, "readability": True, "confidence": confidence})
+    # Ignore all model-provided panel/group identities: this is one known crop.
+    return {"source_panel": task["source_panel"], "source_group": task["source_group"],
+            "readings": validated}
+
+
+def verify_magnitude_levels(image_paths: list[Path], panels: list[dict],
+                            panel_groups: list[list[str]], debug_info=None) -> tuple[list[str], list[str]]:
+    from PIL import Image
+    magnitude = {p["panel"]: p for p in panels if "magnitude" in str(p["graph_kind"]).lower()}
+    raw_attempts, errors, tasks = [], [], []
+    with TemporaryDirectory(prefix="magnitude_reread_") as temporary:
+        folder = Path((debug_info or {}).get("crop_folder") or temporary)
+        for path, source_ids in zip(image_paths, panel_groups):
+            for index, source_id in enumerate(source_ids):
+                if source_id not in magnitude:
+                    continue
+                panel = magnitude[source_id]
+                output = folder / f"magnitude_{source_id}.png"
+                with Image.open(path) as image:
+                    box = (round(image.width * index / len(source_ids)), 0,
+                           round(image.width * (index + 1) / len(source_ids)), image.height)
+                    image.crop(box).save(output)
+                tasks.append({"source_panel": source_id, "source_group": panel["group"],
+                              "crop_path": str(output), "source_image": str(path), "crop_box": box,
+                              "y_scale": panel["y_axis"]["scale"]})
+        if {t["source_panel"] for t in tasks} != set(magnitude) or len(tasks) != len(magnitude):
+            raise StructuredOutputError("Magnitude source crop mapping is incomplete or duplicated.")
+        try:
+            for task in tasks:
+                raw = _call_model(Path(task["crop_path"]),
+                    'Read only the numeric axis bounds of this single plot. Return JSON with '
+                    'x_min, x_max, y_min, y_max, confidence. Include multipliers. '
+                    'Use actual numbers for visible ticks; confidence is your estimated reliability '
+                    'between 0 and 1. Use null if unreadable. Do not identify groups.', 220)
+                raw_attempts.append(raw)
+                axis = parse_json_response(raw)
+                if not all(_finite_number(axis.get(k)) for k in ("x_min", "x_max", "y_min", "y_max", "confidence")) or not .7 <= axis["confidence"] <= 1:
+                    raise StructuredOutputError("Magnitude axis calibration is unreadable.")
+                if not 0 < axis["x_min"] < axis["x_max"] or not axis["y_min"] < axis["y_max"]:
+                    raise StructuredOutputError("Magnitude axis bounds are invalid.")
+                task.update({k: axis[k] for k in ("x_min", "x_max", "y_min", "y_max")})
+            lo, hi = max(t["x_min"] for t in tasks), min(t["x_max"] for t in tasks)
+            # Use the first two fully shared decade ticks, avoiding extrapolation.
+            shared_x = [float(10 ** exponent) for exponent in range(math.ceil(math.log10(lo)),
+                        math.floor(math.log10(hi)) + 1)][:2] if lo < hi else []
+            if len(shared_x) < 2:
+                raise StructuredOutputError("Insufficient shared log-frequency ticks.")
+            for attempt in range(2):
+                records = []
+                try:
+                    for task in tasks:
+                        raw = _call_model(Path(task["crop_path"]),
+                            f'Read this single magnitude plot at x values {json.dumps(shared_x)}. '
+                            'At each x read the centre of the actual visible curves, not the axis limits. '
+                            'Return JSON {"readings": [objects with x, y, vertical_position, readability, confidence]}. '
+                            'Each x must appear exactly once. y is a numeric curve reading or null. '
+                            'If y is hard to read, give vertical_position from 0 (plot bottom) to 1 (plot top). '
+                            'readability is true only for visible curves. confidence is your actual estimated '
+                            'reliability from 0 to 1, not a placeholder. No panel or group identification is needed.'
+                            + (' Reinspect ticks carefully; the previous readings were inconsistent.' if attempt else ''), 400)
+                        raw_attempts.append(raw)
+                        records.append(_source_magnitude_readings(task, parse_json_response(raw), shared_x))
+                    if not magnitude_reading_order(records):
+                        raise StructuredOutputError("Shared-x readings are tied or contradictory.")
+                    for record in records:
+                        panel = magnitude[record["source_panel"]]
+                        panel["magnitude_verification"] = record
+                        panel["approximate_curve_level"] = sum(r["calibrated_y"] for r in record["readings"]) / len(shared_x)
+                    if debug_info is not None:
+                        debug_info["magnitude_reread_tasks"] = tasks
+                        debug_info["magnitude_shared_x"] = shared_x
+                    return raw_attempts, []
+                except (StructuredOutputError, KeyError, TypeError, ValueError) as error:
+                    errors.append(str(error))
+        except (StructuredOutputError, KeyError, TypeError, ValueError) as error:
+            errors.append(str(error))
+        if debug_info is not None:
+            debug_info["magnitude_reread_tasks"] = tasks
+    for panel in magnitude.values():
+        panel["approximate_curve_level"] = None
+    return raw_attempts, ["Magnitude ordering could not be verified from readable common-x curve samples.", *errors]
 
 
 def validate_compact_comparison(value: dict, panels: list[dict]) -> dict:
@@ -2299,9 +2582,18 @@ def validate_compact_comparison(value: dict, panels: list[dict]) -> dict:
     )
     if not isinstance(value["magnitude_order_high_to_low"], list) or not isinstance(value["uncertain"], list):
         raise StructuredOutputError("Compact graph comparison lists are invalid.")
+    value["magnitude_order_high_to_low"] = [
+        normalize_compact_group_identity(group)
+        for group in value["magnitude_order_high_to_low"]
+    ]
+    value["greatest_phase_complexity_group"] = normalize_compact_group_identity(
+        value["greatest_phase_complexity_group"]
+    )
     _validate_compact_axis(value["x_axis"], "merged", "x")
     _validate_compact_axis(value["magnitude_y_axis"], "merged", "magnitude-y")
     expected_order, expected_complexity = _comparison_expectations(panels)
+    if not expected_order and len([p for p in panels if "magnitude" in str(p["graph_kind"]).lower()]) > 1 and not value["uncertain"]:
+        raise StructuredOutputError("Indistinguishable magnitude levels require explicit uncertainty.")
     if value["magnitude_order_high_to_low"] != expected_order:
         raise StructuredOutputError(
             "Compact comparison contradicts independently estimated curve levels."
@@ -2505,6 +2797,24 @@ def analyse_compact_multi_panel_graph(
     axis_label_retry_raw = ""
     try:
         comparison_candidate = parse_json_response(comparison_raw)
+        expected_order, _ = _comparison_expectations(panels)
+        magnitude_panel_count = sum(
+            "magnitude" in str(panel["graph_kind"]).lower() for panel in panels
+        )
+        # A redundant whole-figure comparison agreeing with coarse per-panel
+        # estimates is not independent visual confirmation. For multiple
+        # magnitude panels, always bind shared-x rereads to their source crops
+        # before accepting a strict order.
+        if (magnitude_panel_count > 1 or not expected_order
+                or comparison_candidate.get("magnitude_order_high_to_low") != expected_order
+                or not isinstance(comparison_candidate.get("confidence"), (int, float))
+                or comparison_candidate["confidence"] < 0.7):
+            readings, uncertainty = verify_magnitude_levels(image_paths, panels, panel_groups, debug_info)
+            comparison_candidate["magnitude_order_high_to_low"] = _comparison_expectations(panels)[0]
+            comparison_candidate.setdefault("uncertain", []).extend(uncertainty)
+            if debug_info is not None:
+                debug_info["raw_magnitude_verification"] = readings
+                debug_info["magnitude_verification_errors"] = uncertainty
         magnitude_axis = comparison_candidate.get("magnitude_y_axis")
         original_magnitude_label = (
             magnitude_axis.get("label", "") if isinstance(magnitude_axis, dict) else ""
@@ -2526,20 +2836,13 @@ def analyse_compact_multi_panel_graph(
                 axis_label_image_paths, evidence_text
             )
             magnitude_axis["label"] = corrected_label
+        normalize_compact_axis_scale(magnitude_axis, "magnitude")
         if (
             isinstance(comparison_candidate.get("confidence"), (int, float))
             and comparison_candidate["confidence"] >= 0.7
             and isinstance(comparison_candidate.get("x_axis"), dict)
             and isinstance(comparison_candidate.get("magnitude_y_axis"), dict)
         ):
-            x_scale = _consensus_panel_scale(panels, "x_axis")
-            magnitude_scale = _consensus_panel_scale(
-                panels, "y_axis", "magnitude"
-            )
-            if x_scale != "unknown":
-                comparison_candidate["x_axis"]["scale"] = x_scale
-            if magnitude_scale != "unknown":
-                comparison_candidate["magnitude_y_axis"]["scale"] = magnitude_scale
             for panel in panels:
                 panel["x_axis"] = _merge_shared_axis_reading(
                     panel["x_axis"], comparison_candidate["x_axis"]
@@ -2549,6 +2852,18 @@ def analyse_compact_multi_panel_graph(
                         panel["y_axis"],
                         comparison_candidate["magnitude_y_axis"],
                     )
+                    normalize_compact_y_axis_scale(panel)
+            x_scale = _consensus_panel_scale(panels, "x_axis")
+            magnitude_scale = _consensus_panel_scale(
+                panels, "y_axis", "magnitude"
+            )
+            if x_scale != "unknown":
+                comparison_candidate["x_axis"]["scale"] = x_scale
+            if magnitude_scale != "unknown":
+                comparison_candidate["magnitude_y_axis"]["scale"] = magnitude_scale
+            normalize_compact_axis_scale(
+                comparison_candidate["magnitude_y_axis"], "magnitude"
+            )
         comparison = validate_compact_comparison(comparison_candidate, panels)
     except StructuredOutputError as error:
         if debug_info is not None:
@@ -2735,6 +3050,20 @@ def _format_hierarchical_table(value: dict) -> list[str] | None:
 
 
 def format_structured_result(visual_type: str, value: dict) -> str:
+    if visual_type == "mixed_figure":
+        label = _display_figure_label(value.get("figure_number"))
+        lines = [f"**{label} panel analysis**"]
+        for panel in value.get("panels", []):
+            analysis = panel.get("structured_analysis", {})
+            summary = str(analysis.get("summary", "")).strip()
+            observations = analysis.get("observations") or analysis.get("measurements") or []
+            detail = summary or "; ".join(map(str, observations)) or "No verified panel detail."
+            lines.append(f"\n- **Panel {panel.get('panel')} ({panel.get('visual_type')}):** {detail}")
+        if value.get("explanation"):
+            lines.extend(["", str(value["explanation"])])
+        if value.get("uncertain_items"):
+            lines.append("\n**Uncertain:** " + ", ".join(map(str, value["uncertain_items"])))
+        return "\n".join(lines)
     if visual_type == "table":
         title = value.get("title") or f"Table {value.get('table_number', '')}".strip()
         if value.get("header_rows"):
@@ -2990,6 +3319,14 @@ def analyse_typed_image(
     try:
         parsed = parse_json_response(raw)
         value = validate_typed_response(visual_type, parsed, evidence_text)
+        sufficient, semantic_debug = structured_semantically_sufficient(
+            visual_type, value, question
+        )
+        if not sufficient:
+            raise StructuredOutputError(
+                "structured_vision_schema_valid_but_semantically_insufficient: "
+                + json.dumps(semantic_debug, ensure_ascii=False)
+            )
     except StructuredOutputError as first_error:
         errors.append(str(first_error))
         initial_validation_errors.append(str(first_error))
@@ -3007,6 +3344,14 @@ def analyse_typed_image(
                 value = validate_typed_response(
                     visual_type, repaired_json, evidence_text
                 )
+                sufficient, semantic_debug = structured_semantically_sufficient(
+                    visual_type, value, question
+                )
+                if not sufficient:
+                    raise StructuredOutputError(
+                        "structured_vision_schema_valid_but_semantically_insufficient: "
+                        + json.dumps(semantic_debug, ensure_ascii=False)
+                    )
                 repaired_validation_result = "passed"
                 retry_kind = "grounded_topology_repair"
                 used_repair = True
@@ -3100,6 +3445,11 @@ def analyse_typed_image(
                             "validation_error": " | ".join(errors),
                             "final_answer_path": fallback_path,
                             "final_answer_code_path": fallback_path,
+                            "semantic_validation_status": (
+                                "structured_vision_schema_valid_but_semantically_insufficient"
+                                if any("semantically_insufficient" in item for item in errors)
+                                else "not_reached_or_failed_schema_validation"
+                            ),
                         })
                     if topology_retry or circuit_context:
                         return (
@@ -3151,6 +3501,7 @@ def analyse_typed_image(
                 "validated_repaired_structured_vision"
                 if used_repair else "validated_structured_vision"
             ),
+            "semantic_validation_status": "passed",
         })
     if visual_type in DIAGRAM_TYPES and re.search(
         r"\bboundary conditions?\b", question, re.I

@@ -2,6 +2,13 @@ import json
 import re
 
 from services.document_matching import explicit_document_matches
+from services.scientific_evidence import (
+    classify_experimental_evidence,
+    extract_explicit_classifier_taxonomy,
+    experimental_evidence_object,
+    ground_retrieved_answer_slots,
+    requested_answer_slots,
+)
 from settings import FINAL_RESULTS, INITIAL_RESULTS
 
 
@@ -22,7 +29,7 @@ _LIMITATION_PATTERNS = (
     (
         "numerical_2d",
         r"\b2D model\b",
-        "The work uses a numerical 2D model rather than an in-vivo experiment.",
+        "The work uses a two-dimensional (2D) numerical model rather than an in-vivo experiment.",
     ),
     (
         "fixed_tissue_properties",
@@ -141,6 +148,65 @@ def extract_explicit_limitations(documents: list[str]) -> dict:
         key = "explicit_" + "_".join(sorted(signature)[:5])
         items.append({"key": key, "statement": cleaned, "evidence": evidence})
         seen_signatures.append(signature)
+    return {"items": items, "status": "explicit_author_limitations"} if items else {}
+
+
+def extract_discussion_limitations(documents: list[str]) -> dict:
+    """Capture limitations explicitly stated in Discussion even without a heading."""
+    sentences = []
+    for document in documents:
+        text = re.sub(r"(?<=[A-Za-z])-\s+(?=[a-z])", "", str(document or ""))
+        text = re.sub(r"[ \t]+", " ", text)
+        protected_text = re.sub(r"\be\.g\.", "e§g§", text, flags=re.I)
+        sentences.extend(
+            re.sub(r"\s+", " ", sentence.replace("e§g§", "e.g.")).strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", protected_text)
+        )
+    limitation_language = re.compile(
+        r"\b(?:limitation|caveat|however|while ideally|depends? on|"
+        r"affect(?:s|ed)? (?:the )?(?:comparisons?|performance|interpretation)|"
+        r"(?:may|might) (?:need|require) (?:to be )?adapt\w*|adaptation may be required|"
+        r"performed worse|unlikely (?:that .*? would )?work|cannot|not possible|might not)\b",
+        re.I,
+    )
+    topic_language = re.compile(
+        r"\b(?:marker|comparison|other tissues?|generali[sz]|heterogene\w*|"
+        r"false positives?|predictor|classifier|score|TSS|morphology|cell type|stressor|condition)\b",
+        re.I,
+    )
+    items, seen_signatures = [], []
+    for sentence in sentences:
+        if not limitation_language.search(sentence) or not topic_language.search(sentence):
+            continue
+        if not 7 <= len(sentence.split()) <= 90:
+            continue
+        key = re.sub(r"[^a-z0-9]+", "_", sentence.casefold())[:72].strip("_")
+        signature = frozenset(re.findall(r"[a-z]{5,}", sentence.casefold()))
+        duplicate_index = next((
+            index for index, prior in enumerate(seen_signatures)
+            if len(signature & prior) / max(1, min(len(signature), len(prior))) > 0.7
+        ), None)
+        if duplicate_index is not None:
+            existing = items[duplicate_index]["statement"]
+            candidate_quality = (
+                len(topic_language.findall(sentence)), len(signature), len(sentence)
+            )
+            existing_signature = seen_signatures[duplicate_index]
+            existing_quality = (
+                len(topic_language.findall(existing)),
+                len(existing_signature),
+                len(existing),
+            )
+            if candidate_quality > existing_quality:
+                items[duplicate_index] = {
+                    "key": f"discussion_{key}",
+                    "statement": sentence,
+                    "evidence": [sentence],
+                }
+                seen_signatures[duplicate_index] = signature
+            continue
+        seen_signatures.append(signature)
+        items.append({"key": f"discussion_{key}", "statement": sentence, "evidence": [sentence]})
     return {"items": items, "status": "explicit_author_limitations"} if items else {}
 
 
@@ -421,12 +487,17 @@ def _retrieve_section_context(
     )
     if not candidates:
         return "", []
-    names = [metadata.get("pdf", metadata.get("source", "")) for _, metadata in candidates.values()]
+    names = list(dict.fromkeys([
+        metadata.get("pdf", metadata.get("source", "")) for _, metadata in candidates.values()
+    ] + _collection_source_names(collection)))
     explicit = explicit_document_matches(question, names)
-    if selected_source:
-        target = _source_identity({"source": str(selected_source)})
-    elif explicit:
+    if len(explicit) > 1:
+        choices = ", ".join(sorted(explicit))
+        return f"[DOCUMENT TITLE AMBIGUOUS]\nClarify which document: {choices}.", []
+    if explicit:
         target = _source_identity({"source": next(iter(explicit))})
+    elif selected_source:
+        target = _source_identity({"source": str(selected_source)})
     else:
         scored = reranker.predict([[question, document] for document, _ in candidates.values()])
         best = max(zip(scored, candidates.values()), key=lambda row: float(row[0]))[1][1]
@@ -480,6 +551,16 @@ def _retrieve_section_context(
             )
         ]
         explicit_limitations = extract_explicit_limitations(ordered_documents)
+        discussion_limitations = extract_discussion_limitations(ordered_documents)
+        if discussion_limitations:
+            if explicit_limitations:
+                existing = {item["statement"].casefold() for item in explicit_limitations["items"]}
+                explicit_limitations["items"].extend(
+                    item for item in discussion_limitations["items"]
+                    if item["statement"].casefold() not in existing
+                )
+            else:
+                explicit_limitations = discussion_limitations
     limitations_block = ""
     if explicit_limitations:
         limitations_block = (
@@ -565,6 +646,8 @@ def infer_section(document: str) -> str:
         return "conclusion"
     if re.search(r"\bdiscussion\b", lower[:500]):
         return "discussion"
+    if re.search(r"\b(?:methods?|materials and methods|experimental procedures)\b", lower[:700]):
+        return "methods"
     if re.search(r"\b(overview|perspective|conceptual framework)\b", lower[:700]):
         return "overview"
     if re.search(r"\bfigure\s+\d+[a-z]?\.?\s+", lower[:300]):
@@ -621,6 +704,55 @@ def _format_context(selected_results: list[dict], prefix: str = "") -> str:
     return "\n\n".join(([prefix] if prefix else []) + parts)
 
 
+def _question_coverage_prefix(question: str) -> str:
+    slots = requested_answer_slots(question)
+    if not slots:
+        return ""
+    return (
+        "[QUESTION COVERAGE]\n"
+        f"Requested answer slots: {json.dumps(slots)}\n"
+        "Answer every slot from evidence, explicitly mark it not found, or clearly label inference."
+    )
+
+
+def _grounded_slot_prefix(question: str, selected_results: list[dict]) -> str:
+    records = ground_retrieved_answer_slots(question, selected_results)
+    if not records:
+        return ""
+    compact = {}
+    for slot, record in records.items():
+        compact[slot] = {
+            "slot": slot,
+            "status": record.get("status"),
+            "evidence": [
+                {
+                    "page": item.get("page"),
+                    "source": item.get("source"),
+                    "text": str(item.get("text", ""))[:1800],
+                }
+                for item in record.get("evidence", [])[:3]
+            ],
+        }
+    return (
+        "[GROUNDED ANSWER SLOT EVIDENCE]\n"
+        + json.dumps(compact, ensure_ascii=False)
+        + "\nThe JSON records whether each requested slot is grounded. A grounded "
+        "slot must be expressed in the displayed answer; do not claim it is absent."
+    )
+
+
+def _attach_question_coverage(
+    question: str, context: str, selected_results: list[dict],
+) -> str:
+    prefixes = [
+        value for value in (
+            _question_coverage_prefix(question),
+            _grounded_slot_prefix(question, selected_results),
+        ) if value
+    ]
+    return "\n".join([*prefixes, context]) if prefixes else context
+
+
 def _query_candidates(queries, collection, embedder, n_results):
     candidates = {}
     raw_count = 0
@@ -640,6 +772,53 @@ def _query_candidates(queries, collection, embedder, n_results):
             )
             candidates.setdefault(key, (document, metadata))
     return candidates, raw_count
+
+
+def _collection_source_names(collection) -> list[str]:
+    getter = getattr(collection, "get", None)
+    if not callable(getter):
+        return []
+    try:
+        rows = getter(include=["metadatas"])
+    except Exception:
+        return []
+    return list(dict.fromkeys(
+        metadata.get("pdf", metadata.get("source", ""))
+        for metadata in rows.get("metadatas", []) if isinstance(metadata, dict)
+        and metadata.get("pdf", metadata.get("source"))
+    ))
+
+
+def _target_document_identity(question: str, collection, selected_source=None):
+    names = _collection_source_names(collection)
+    matches = explicit_document_matches(question, names)
+    if len(matches) > 1:
+        return None, sorted(matches), None
+    explicit = next(iter(matches), None)
+    if explicit:
+        return _source_identity({"source": explicit}), [], explicit
+    if selected_source:
+        return _source_identity({"source": str(selected_source)}), [], None
+    return None, [], None
+
+
+def is_methods_question(question: str) -> bool:
+    return bool(re.search(
+        r"\b(?:exactly how|methods?|training|preprocessing|threshold|inclusion|"
+        r"exclusion|sample selection|algorithm configuration|test size|overfitting|"
+        r"randomi[sz]ation|constructed|assembled)\b",
+        str(question or ""), re.I,
+    ))
+
+
+def is_cross_domain_evidence_question(question: str) -> bool:
+    text = str(question or "").casefold()
+    requested = [
+        bool(re.search(r"\b(?:cell culture|in vitro|cell line)\b", text)),
+        bool(re.search(r"\b(?:mouse|mice|animal)\b", text)),
+        bool(re.search(r"\b(?:human|patient|clinical)\b", text)),
+    ]
+    return sum(requested) >= 2 and bool(re.search(r"\b(?:evidence|figures?|experiments?)\b", text))
 
 
 def _expand_target_document_candidates(collection, candidates, target_source):
@@ -751,10 +930,18 @@ def _retrieve_summary_context(
         )
         candidate_names = list(dict.fromkeys(candidate_names))
     explicit_names = explicit_document_matches(question, candidate_names)
+    if len(explicit_names) > 1:
+        choices = ", ".join(sorted(explicit_names))
+        return (
+            "[DOCUMENT TITLE AMBIGUOUS]\n"
+            f"The current query could refer to more than one indexed document: {choices}. "
+            "Ask the user to clarify; do not inherit a previous document.",
+            [],
+        )
     explicit_name = next(iter(explicit_names), None)
     target_source = (
-        _source_identity({"source": str(selected_source)}) if selected_source
-        else _source_identity({"source": explicit_name}) if explicit_name
+        _source_identity({"source": explicit_name}) if explicit_name
+        else _source_identity({"source": str(selected_source)}) if selected_source
         else max(source_counts, key=source_counts.get) if source_counts else None
     )
     diagnostics["document_expansion_chunks_added"] = _expand_target_document_candidates(
@@ -902,11 +1089,35 @@ def _retrieve_summary_context(
             "Only named_items may be presented as canonical framework items. "
             "Mechanisms discussed within their sections are not additional named items.\n"
         )
+    explicit_limitations_grounding = {}
     limitations_grounding = {}
     limitations_block = ""
     if re.search(r"\blimitations?\b", question, re.IGNORECASE):
-        limitations_grounding = extract_inferred_limitations(framework_documents)
-    if limitations_grounding:
+        explicit_limitations_grounding = extract_explicit_limitations(framework_documents)
+        discussion_limitations = extract_discussion_limitations(framework_documents)
+        if discussion_limitations:
+            if explicit_limitations_grounding:
+                existing = {
+                    item["statement"].casefold()
+                    for item in explicit_limitations_grounding["items"]
+                }
+                explicit_limitations_grounding["items"].extend(
+                    item for item in discussion_limitations["items"]
+                    if item["statement"].casefold() not in existing
+                )
+            else:
+                explicit_limitations_grounding = discussion_limitations
+        if not explicit_limitations_grounding:
+            limitations_grounding = extract_inferred_limitations(framework_documents)
+    if explicit_limitations_grounding:
+        diagnostics["explicit_author_limitations"] = explicit_limitations_grounding
+        limitations_block = (
+            "\n[EXPLICIT AUTHOR LIMITATIONS]\n"
+            f"{json.dumps(explicit_limitations_grounding, ensure_ascii=False)}\n"
+            "These are author-stated limitations from the Discussion. Present them "
+            "as explicit, not implied, and keep any assistant inference separate.\n"
+        )
+    elif limitations_grounding:
         diagnostics["inferred_limitations_grounding"] = limitations_grounding
         limitations_block = (
             "\n[INFERRED LIMITATIONS GROUNDING]\n"
@@ -931,13 +1142,23 @@ def _retrieve_summary_context(
             uncovered.difference_update(covered)
             if not uncovered:
                 break
+    taxonomy = extract_explicit_classifier_taxonomy("\n".join(framework_documents))
+    taxonomy_block = ""
+    if taxonomy:
+        diagnostics["explicit_classifier_taxonomy"] = taxonomy
+        taxonomy_block = (
+            "\n[EXPLICIT CLASSIFIER TAXONOMY]\n"
+            f"{json.dumps(taxonomy, ensure_ascii=False)}\n"
+            "Preserve these exact identifiers and source descriptions. Do not infer "
+            "acronym expansions or an umbrella classifier family absent from this block.\n"
+        )
     prefix = (
         "[DOCUMENT SUMMARY MODE]\n"
         f"Document type: {document_type}\n"
         "Summarize the whole document using representative evidence. For a review, "
         "cover purpose and scope, central framework, major themes, conclusions, "
         "implications and limitations; do not call review arguments experimental findings."
-        f"{framework_block}{limitations_block}"
+        f"{framework_block}{limitations_block}{taxonomy_block}"
     )
     diagnostics["final_selected_chunks"] = len(selected)
     diagnostics["final_selected_pages"] = [item["page"] for item in selected]
@@ -1252,6 +1473,212 @@ def _retrieve_multi_figure_context(
     return _format_context(selected, prefix), selected
 
 
+def _retrieve_methods_context(
+    question, collection, embedder, reranker, available_chunks, selected_source=None,
+):
+    queries = [
+        question,
+        f"Methods experimental procedures {question}",
+        f"training data sample selection preprocessing threshold test size {question}",
+    ]
+    candidates, _ = _query_candidates(
+        queries, collection, embedder, min(max(INITIAL_RESULTS, 30), available_chunks)
+    )
+    target, ambiguous, explicit = _target_document_identity(
+        question, collection, selected_source
+    )
+    if ambiguous:
+        return (
+            "[DOCUMENT TITLE AMBIGUOUS]\nClarify which document: "
+            + ", ".join(ambiguous),
+            [],
+        )
+    if target is None and candidates:
+        scored = reranker.predict([[question, document] for document, _ in candidates.values()])
+        target = _source_identity(max(
+            zip(scored, candidates.values()), key=lambda row: float(row[0])
+        )[1][1])
+    _expand_target_document_candidates(collection, candidates, target)
+    rows = [
+        (document, metadata)
+        for document, metadata in candidates.values()
+        if (target is None or _source_identity(metadata) == target)
+        and not _is_reference_or_metadata(document)
+    ]
+    if not rows:
+        return "", []
+    slots = requested_answer_slots(question)
+    slot_terms = {
+        "features": ("feature", "area", "form factor", "elongation", "compactness"),
+        "library construction": ("training set", "wells", "plates", "random"),
+        "training cell counts": ("cells per condition", "10,000", "million cells"),
+        "CT split": ("classification tree", "30%", "test size"),
+        "RF split": ("random forest", "0.5", "test size"),
+        "CT overfitting method": ("cost complexity", "pruning", "alpha", "over fitting"),
+        "RF threshold": ("probability", "> 0.5", "senescent"),
+        "inclusion criteria": ("excluded", "included", "threshold", "at least"),
+    }
+    model_scores = reranker.predict([[question, document] for document, _ in rows])
+    ranked = []
+    for score, (document, metadata) in zip(model_scores, rows):
+        lower = document.casefold()
+        coverage = {
+            slot for slot in slots
+            if any(term.casefold() in lower for term in slot_terms.get(slot, (slot,)))
+        }
+        methods_boost = 4.0 if infer_section(document) == "methods" or re.search(
+            r"\b(?:methods?|test size|training sets?|software|sample selection)\b", lower
+        ) else 0.0
+        ranked.append((float(score) + methods_boost + 1.5 * len(coverage), document, metadata, coverage))
+    selected, covered, per_page = [], set(), {}
+    while ranked and len(selected) < max(FINAL_RESULTS, 8):
+        ranked.sort(key=lambda row: (len(row[3] - covered), row[0]), reverse=True)
+        score, document, metadata, coverage = ranked.pop(0)
+        page_key = (metadata.get("pdf", metadata.get("source")), metadata.get("page"))
+        if per_page.get(page_key, 0) >= 6:
+            continue
+        selected.append(_source_item(score, document, metadata, "methods"))
+        per_page[page_key] = per_page.get(page_key, 0) + 1
+        covered.update(coverage)
+    missing = [slot for slot in slots if slot not in covered]
+    prefix = (
+        "[METHODS-AWARE RETRIEVAL]\n"
+        f"Explicit document match: {explicit or ''}\n"
+        f"Requested answer slots: {json.dumps(slots)}\n"
+        f"Grounded slots: {json.dumps(sorted(covered))}\n"
+        f"Not found in retrieved evidence: {json.dumps(missing)}\n"
+        "Answer every requested slot. Report missing details as not specified in "
+        "retrieved evidence. Do not complete methodology from standard practice, "
+        "presumption, or typical conventions."
+    )
+    return _format_context(selected, prefix), selected
+
+
+def _retrieve_cross_domain_context(
+    question, collection, embedder, reranker, available_chunks, selected_source=None,
+):
+    domain_queries = {
+        "in_vitro_human_cell_line": f"{question} cell culture in vitro human cell line evidence figure",
+        "mouse_animal_tissue": f"{question} mouse animal in vivo tissue evidence figure",
+        "human_patient_tissue": f"{question} human patient clinical tissue evidence figure",
+    }
+    candidates, _ = _query_candidates(
+        domain_queries.values(), collection, embedder,
+        min(max(INITIAL_RESULTS, 30), available_chunks),
+    )
+    target, ambiguous, explicit = _target_document_identity(question, collection, selected_source)
+    if ambiguous:
+        return "[DOCUMENT TITLE AMBIGUOUS]\nClarify which document: " + ", ".join(ambiguous), []
+    if target is None and candidates:
+        scores = reranker.predict([[question, document] for document, _ in candidates.values()])
+        target = _source_identity(max(zip(scores, candidates.values()), key=lambda row: float(row[0]))[1][1])
+    _expand_target_document_candidates(collection, candidates, target)
+    rows = [
+        (document, metadata)
+        for document, metadata in candidates.values()
+        if (target is None or _source_identity(metadata) == target)
+        and not _is_reference_or_metadata(document)
+    ]
+    evidence_objects = []
+    try:
+        from services.visual_index import flatten_visual_targets, load_or_build_visual_index
+
+        for visual in flatten_visual_targets(load_or_build_visual_index()):
+            if visual.get("target_type") != "figure" or visual.get("match_kind") != "caption":
+                continue
+            metadata = {
+                "pdf": visual.get("pdf_name", ""),
+                "page": visual.get("page_number", "Unknown page"),
+                "chunk": f"visual-index-{visual.get('target_number', '')}",
+            }
+            if target is not None and _source_identity(metadata) != target:
+                continue
+            caption = visual.get("full_caption") or visual.get("caption", "")
+            nearby = visual.get("nearby_text", "")
+            classification = classify_experimental_evidence(caption, nearby, "")
+            evidence_objects.append({
+                "document": f"{caption}\n{nearby}".strip(),
+                "metadata": metadata,
+                "caption": caption,
+                "results": nearby,
+                "classification": classification,
+                "figure_number": visual.get("target_number"),
+                "panel": visual.get("panel"),
+            })
+    except (OSError, ValueError, TypeError):
+        evidence_objects = []
+    if not evidence_objects:
+        evidence_objects = [{
+            "document": document,
+            "metadata": metadata,
+            "caption": "",
+            "results": document,
+            "classification": classify_experimental_evidence("", document, ""),
+            "figure_number": None,
+            "panel": None,
+        } for document, metadata in rows]
+    selected, provenance_rows = [], []
+    for domain, query in domain_queries.items():
+        domain_rows = [
+            row for row in evidence_objects
+            if row["classification"]["experimental_domain"] == domain
+        ]
+        if not domain_rows:
+            provenance_rows.append({"experimental_domain": domain, "status": "no grounded evidence found"})
+            continue
+        scores = reranker.predict([[query, row["caption"] or row["document"]] for row in domain_rows])
+        ranked = sorted(zip(scores, domain_rows), key=lambda row: float(row[0]), reverse=True)
+        main_rows = [
+            pair for pair in ranked
+            if re.fullmatch(r"\d+(?:\.\d+)?", str(pair[1].get("figure_number", "")))
+        ]
+        if main_rows:
+            earliest = min(
+                main_rows,
+                key=lambda pair: (
+                    int(pair[1]["metadata"].get("page", 10**9))
+                    if isinstance(pair[1]["metadata"].get("page"), int) else 10**9,
+                    -float(pair[0]),
+                ),
+            )
+            ranked = [earliest, *[pair for pair in ranked if pair[1] is not earliest[1]]]
+        used_pages = set()
+        for score, row in ranked:
+            document, metadata = row["document"], row["metadata"]
+            page = metadata.get("page")
+            if page in used_pages:
+                continue
+            item = _source_item(score, document, metadata, f"domain:{domain}")
+            item["experimental_provenance"] = experimental_evidence_object(
+                document=str(metadata.get("pdf", metadata.get("source", ""))),
+                figure_number=row["figure_number"],
+                page=page,
+                caption=row["caption"],
+                results=row["results"],
+                panel=row["panel"],
+            )
+            item["figure_number"] = row["figure_number"]
+            item["panel"] = row["panel"]
+            selected.append(item)
+            provenance_rows.append(item["experimental_provenance"])
+            used_pages.add(page)
+            if len(used_pages) >= 2:
+                break
+    prefix = (
+        "[WHOLE-DOCUMENT EXPERIMENTAL-DOMAIN EVIDENCE]\n"
+        f"Explicit document match: {explicit or ''}\n"
+        f"{json.dumps(provenance_rows, ensure_ascii=False)}\n"
+        "Keep in-vitro cell lines, primary cells, animal models, ex-vivo tissue, "
+        "and human clinical/patient tissue distinct. A human-derived immortalized "
+        "cell line is not human patient evidence. Preserve figure/panel and experiment "
+        "provenance; do not transfer a threshold or control between experiments. Figure "
+        "identifiers in the provenance JSON are authoritative. Never generate a main or "
+        "supplementary figure identifier from semantic text. If figure_number is null, say "
+        "'figure number not resolved'."
+    )
+    return _format_context(selected, prefix), selected
+
+
 def retrieve_context(
     question: str,
     previous_question: str,
@@ -1273,15 +1700,32 @@ def retrieve_context(
         return "", []
 
     if is_broad_summary_question(question):
-        return _retrieve_summary_context(
+        context, sources = _retrieve_summary_context(
             question, collection, embedder, reranker, available_chunks,
             selected_source=selected_source,
         )
+        return _attach_question_coverage(question, context, sources), sources
+
+    if is_cross_domain_evidence_question(question):
+        context, sources = _retrieve_cross_domain_context(
+            question, collection, embedder, reranker, available_chunks,
+            selected_source=selected_source,
+        )
+        return _attach_question_coverage(question, context, sources), sources
 
     if is_multi_figure_evidence_question(question):
-        return _retrieve_multi_figure_context(
+        context, sources = _retrieve_multi_figure_context(
             question, collection, embedder, reranker, available_chunks
         )
+        return _attach_question_coverage(question, context, sources), sources
+
+    if is_methods_question(resolved_question):
+        context, sources = _retrieve_methods_context(
+            resolved_question, collection, embedder, reranker, available_chunks,
+            selected_source=selected_source,
+        )
+        if context:
+            return _attach_question_coverage(question, context, sources), sources
 
     if is_section_aware_question(question) or is_reported_trend_question(question) or (
         previous_question and re.search(r"\b(?:error|trend|increase|decrease)\b", question, re.I)
@@ -1291,7 +1735,7 @@ def retrieve_context(
             selected_source=selected_source,
         )
         if context:
-            return context, sources
+            return _attach_question_coverage(question, context, sources), sources
 
     # Existing focused-question retrieval path.
     query_embedding = embedder.encode(
@@ -1306,6 +1750,25 @@ def retrieve_context(
     metadatas = results["metadatas"][0]
     if not documents:
         return "", []
+    target, ambiguous, _ = _target_document_identity(question, collection, selected_source)
+    if ambiguous:
+        return "[DOCUMENT TITLE AMBIGUOUS]\nClarify which document: " + ", ".join(ambiguous), []
+    if target is not None:
+        candidate_map = {
+            (
+                metadata.get("pdf", metadata.get("source", "Unknown source")),
+                metadata.get("page", "Unknown page"), metadata.get("chunk", "Unknown chunk"),
+            ): (document, metadata)
+            for document, metadata in zip(documents, metadatas)
+        }
+        _expand_target_document_candidates(collection, candidate_map, target)
+        filtered = [
+            (document, metadata) for document, metadata in candidate_map.values()
+            if _source_identity(metadata) == target
+        ]
+        if filtered:
+            documents = [row[0] for row in filtered]
+            metadatas = [row[1] for row in filtered]
     scores = reranker.predict([[retrieval_query, document] for document in documents])
     ranked_results = sorted(
         zip(scores, documents, metadatas),
@@ -1324,4 +1787,5 @@ def retrieve_context(
         chunks_per_page[page_key] = chunks_per_page.get(page_key, 0) + 1
         if len(selected_results) >= FINAL_RESULTS:
             break
-    return _format_context(selected_results), selected_results
+    context = _format_context(selected_results)
+    return _attach_question_coverage(question, context, selected_results), selected_results

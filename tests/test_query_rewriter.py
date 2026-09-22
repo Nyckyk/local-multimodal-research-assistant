@@ -55,6 +55,16 @@ class QueryRewriterTests(unittest.TestCase):
                     rewriter.rewrite_question(question, HISTORY), question
                 )
 
+    def test_sample_followup_prefers_prior_human_cohort_over_incidental_samples(self):
+        question = "Why did they impose that circularity threshold for these samples?"
+        history = [
+            {"role": "user", "content": "Explain the human NAFLD cohort and sample inclusion."},
+            {"role": "assistant", "content": "The plot compares a score in two sections corresponding to samples."},
+        ]
+        rewritten = rewriter.rewrite_question(question, history)
+        self.assertIn("human NAFLD samples", rewritten)
+        self.assertNotIn("score in two sections", rewritten)
+
 
 if __name__ == "__main__":
     unittest.main()

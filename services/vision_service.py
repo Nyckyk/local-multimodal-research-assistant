@@ -599,6 +599,16 @@ Return exactly one JSON object and no prose:
 Do not emit placeholder text. Return an empty items list if nothing is readable.
 """
 
+
+def _recovery_regional_prompt(position: str) -> str:
+    """Build a neutral, source-locked transcription prompt for a retry crop."""
+    transcription_task = (
+        "Transcribe every visible item label in this crop. Treat each separate "
+        "coloured label box as a possible item. Do not infer missing text and "
+        "do not use outside knowledge."
+    )
+    return _regional_prompt(transcription_task, position)
+
 def _response_text(response) -> str:
     answer = response["message"].get("content", "").strip()
     if not answer:
@@ -755,6 +765,22 @@ def parse_regional_response(raw_response: str, expected_position: str) -> dict:
     return result
 
 
+def parse_recovery_regional_response(raw_response: str, source_position: str) -> dict:
+    """Validate retry transcription while retaining deterministic crop identity."""
+    try:
+        result = json.loads(raw_response)
+    except (json.JSONDecodeError, TypeError) as error:
+        raise StructuredVisionError("A recovery response was not valid JSON.") from error
+    if not isinstance(result, dict) or set(result) not in ({"items"}, {"region", "items"}):
+        raise StructuredVisionError("A recovery response has an invalid schema.")
+    # Reuse the regional item validator, but provide the known source region
+    # ourselves. The model is responsible only for pixel transcription.
+    return parse_regional_response(
+        json.dumps({"region": source_position, "items": result["items"]}),
+        source_position,
+    )
+
+
 def _call_regional_model(image_path: Path, question: str, position: str) -> dict:
     response = ollama.chat(
         model=VISION_MODEL,
@@ -767,6 +793,20 @@ def _call_regional_model(image_path: Path, question: str, position: str) -> dict
         options={"temperature": 0, "num_ctx": 8192, "num_predict": 900},
     )
     return parse_regional_response(_response_text(response), position)
+
+
+def _call_recovery_regional_model(image_path: Path, position: str) -> dict:
+    response = ollama.chat(
+        model=VISION_MODEL,
+        messages=[{
+            "role": "user",
+            "content": _recovery_regional_prompt(position),
+            "images": [str(image_path)],
+        }],
+        format="json",
+        options={"temperature": 0, "num_ctx": 8192, "num_predict": 900},
+    )
+    return parse_recovery_regional_response(_response_text(response), position)
 
 
 def _call_verification_model(image_paths: list[Path], labels: list[str]) -> list[dict]:
@@ -1205,6 +1245,30 @@ def reconcile_spatial_results(
             evidence.append(detection)
 
     _discard_partial_label_fragments(observations)
+    # A cropped word can be incorrectly marked fully visible. A unique full
+    # reading in an overlapping crop at the same location confirms a fragment;
+    # document candidates are supporting evidence, not a prerequisite.
+    candidate_keys = {_normalise_item(candidate["label"]) for candidate in candidates}
+    for key in list(observations):
+        if key in candidate_keys:
+            continue
+        expansions = [other for other in observations
+                      if other.startswith(key + " ") or other.endswith(" " + key)]
+        if len(expansions) != 1:
+            continue
+        full_record = observations[expansions[0]]
+        confirmed = any(
+            full["fully_visible"] and full["confidence"] >= 0.5
+            and (expansions[0] in candidate_keys or (
+                full["region"] != partial["region"]
+                and abs(full["page_y"] - partial["page_y"]) <= figure_clip.height * 0.08
+            ))
+            for group, evidence in observations[key]["groups"].items()
+            for partial in evidence
+            for full in full_record["groups"].get(group, [])
+        )
+        if confirmed:
+            del observations[key]
     final = {"primary": [], "antagonistic": [], "integrative": [], "uncertain": []}
     sources = {}
     confidences = {}
@@ -1224,6 +1288,10 @@ def reconcile_spatial_results(
         if (
             key in ambiguous_items
             or not ranked
+            or not any(
+                detection["fully_visible"] and detection["confidence"] >= 0.5
+                for evidence in record["groups"].values() for detection in evidence
+            )
             or (len(ranked) > 1 and ranked[0][1] - ranked[1][1] < 0.08)
         ):
             final["uncertain"].append(record["label"])
@@ -1303,6 +1371,38 @@ def _rect_coordinates(rect: fitz.Rect) -> dict:
     return {name: round(getattr(rect, name), 2) for name in ("x0", "y0", "x1", "y1")}
 
 
+def grounded_figure_counts(caption: str) -> dict:
+    """Read explicit cardinal counts, without treating group counts as item counts."""
+    words = "one two three four five six seven eight nine ten eleven twelve".split()
+    numbers = {word: index + 1 for index, word in enumerate(words)}
+    pattern = r"\b(" + "|".join(numbers) + r"|\d+)\s+(hallmarks?|items?|labels?|panels?|groups?|categories)\b"
+    found = {}
+    for match in re.finditer(pattern, caption, re.I):
+        token, noun = match.groups()
+        count = numbers.get(token.lower(), int(token) if token.isdigit() else 0)
+        kind = "groups" if noun.lower() in {"group", "groups", "categories"} else (
+            "panels" if noun.lower().startswith("panel") else "items"
+        )
+        if 0 < count <= 100:
+            found.setdefault(kind, set()).add(count)
+    return {kind: next(iter(counts)) for kind, counts in found.items() if len(counts) == 1}
+
+
+def grouped_completeness(result: dict, overview: dict, expected: dict) -> dict:
+    labels = {_normalise_item(label) for values in result.values() for label in values}
+    groups = {heading["name"] for heading in overview["headings"] if heading["name"] != "unknown"}
+    observed = {"items": len(labels), "groups": len(groups)}
+    shortfalls = {
+        kind: count - observed[kind] for kind, count in expected.items()
+        if kind in observed and observed[kind] < count
+    }
+    excess = {kind: observed[kind] - count for kind, count in expected.items()
+              if kind in observed and observed[kind] > count}
+    return {"expected": expected, "observed": observed, "shortfalls": shortfalls,
+            "excess": excess,
+            "status": "incomplete" if shortfalls or excess else "complete" if expected else "unspecified"}
+
+
 def _analyse_grouped_figure(
     page: fitz.Page,
     question: str,
@@ -1366,13 +1466,72 @@ def _analyse_grouped_figure(
                 source_page,
                 candidate_text,
             )
+            caption = _target_caption(page, question)
+            expected = grounded_figure_counts(caption[1] if caption else "")
+            completeness = grouped_completeness(result, overview, expected)
+            retry_errors = []
+            if completeness["status"] == "incomplete":
+                # A sparse lower band is a useful search priority, not an
+                # assumption that all groups must have the same item count.
+                target = min(headings, key=lambda h: (
+                    len(result.get(h["name"], [])), -h["page_y"]
+                ))
+                ordered = sorted(headings, key=lambda h: h["page_y"])
+                index = ordered.index(target)
+                start = figure_clip.y0 if index == 0 else (
+                    ordered[index - 1]["page_y"] + target["page_y"]
+                ) / 2 - figure_clip.height * 0.08
+                end = figure_clip.y1 if index == len(ordered) - 1 else (
+                    target["page_y"] + ordered[index + 1]["page_y"]
+                ) / 2 + figure_clip.height * 0.08
+                retry_clip = fitz.Rect(figure_clip.x0, max(figure_clip.y0, start),
+                                       figure_clip.x1, min(figure_clip.y1, end))
+                position = "bottom" if index == len(ordered) - 1 else "top" if index == 0 else "middle"
+                retry_path = _render_page_image(
+                    page, 3.0, retry_clip,
+                    debug_folder / f"{position}_completeness_retry.png" if debug_folder else None,
+                )
+                image_paths.append(retry_path)
+                if save_crops and debug_info is not None:
+                    debug_info["crops"].append({"name": f"{position}_completeness_retry",
+                        "path": str(retry_path), "coordinates": _rect_coordinates(retry_clip)})
+                try:
+                    retry = _call_recovery_regional_model(retry_path, position)
+                    recovered = reconcile_spatial_results(
+                        overview, [*regional, retry], [*clips[1:], retry_clip], figure_clip,
+                        combined_evidence, source_page, candidate_text,
+                    )
+                    recovered_result, recovered_assignments, recovered_detections, recovered_headings = recovered
+                    old_labels = {_normalise_item(label) for values in result.values() for label in values}
+                    new_labels = {_normalise_item(label) for values in recovered_result.values() for label in values}
+                    if old_labels.issubset(new_labels):
+                        result, assignments, detections, headings = recovered
+                    else:
+                        retry_errors.append("Retry discarded prior detections; retained original result.")
+                except Exception as error:
+                    retry_errors.append(str(error))
+                completeness = grouped_completeness(result, overview, expected)
+                completeness["targeted_retry"] = position
+                completeness["retry_errors"] = retry_errors
             if debug_info is not None:
                 debug_info["overview_headings"] = headings
                 debug_info["detections"] = detections
                 debug_info["assignments"] = assignments
                 debug_info["normalized_json"] = result
-                debug_info["final_answer_path"] = "validated_structured_vision"
-            return format_structured_answer(result, question)
+                debug_info["completeness"] = completeness
+                debug_info["final_answer_path"] = (
+                    "incomplete_structured_vision" if completeness["status"] == "incomplete"
+                    else "validated_structured_vision"
+                )
+            answer = format_structured_answer(result, question)
+            if completeness["status"] == "incomplete":
+                details = ", ".join(
+                    f"{completeness['observed'][kind]} of {expected[kind]} {kind}"
+                    for kind in {**completeness["shortfalls"], **completeness["excess"]}
+                )
+                answer = (f"**Incomplete visual extraction: recovered {details}.** "
+                          "The remaining content could not be verified visually; this is not a complete grouping.\n\n" + answer)
+            return answer
         except Exception as error:
             last_error = error
         finally:
@@ -1744,6 +1903,7 @@ def analyse_pdf_page(
     question: str,
     debug_info: dict | None = None,
     text_evidence: str = "",
+    visual_type_override: str | None = None,
 ) -> str:
     """Analyse one PDF page locally, with structured grouping when useful."""
     if not pdf_path.exists():
@@ -1757,7 +1917,7 @@ def analyse_pdf_page(
             )
         page = document.load_page(page_number - 1)
         page_text = page.get_text("text")
-        visual_type = detect_visual_type(question, page_text)
+        visual_type = visual_type_override or detect_visual_type(question, page_text)
         analysis_text_evidence = text_evidence
         if re.search(r"\bboundary conditions?\b", question, re.I):
             associated = _associated_boundary_text(document, page_number - 1)
@@ -1773,7 +1933,7 @@ def analyse_pdf_page(
         # Graphs and tables must be dispatched before the legacy grouping
         # keyword check because their legends/rows commonly contain "groups".
         # Non-grouping diagrams use their own relationship schema as well.
-        if visual_type in {"graph", "table"} or (
+        if visual_type in {"graph", "table", "mixed_figure"} or (
             visual_type in DIAGRAM_TYPES and not _is_grouping_question(question)
         ):
             return _analyse_typed_page(

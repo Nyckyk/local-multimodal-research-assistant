@@ -11,6 +11,71 @@ sys.modules.setdefault("ollama", types.SimpleNamespace(chat=lambda **kwargs: Non
 structured = importlib.import_module("services.structured_vision")
 
 
+def test_explicit_panel_identity_normalization():
+    for raw, expected in [("a", "a"), ("(a)", "a"), ("(a) Sample 10", "a"),
+                          ("Panel a", "a"), ("A", "a"), ("(b)", "b")]:
+        panel = {"panel": raw, "group": "existing group"}
+        structured.normalize_panel_identity(panel)
+        assert panel["panel"] == expected
+        assert panel["group"] == "existing group"
+        if raw == "(a) Sample 10":
+            assert panel["panel_title"] == "Sample 10"
+    for raw in ["Sample 10", "arbitrary text", "Panel alpha"]:
+        panel = {"panel": raw}
+        structured.normalize_panel_identity(panel)
+        assert panel["panel"] == raw
+
+
+def test_magnitude_tie_never_becomes_input_order():
+    panels = [{"panel": "a", "group": "One", "graph_kind": "magnitude", "approximate_curve_level": 115},
+              {"panel": "c", "group": "Two", "graph_kind": "magnitude", "approximate_curve_level": 115}]
+    assert structured._comparison_expectations(panels)[0] == []
+
+
+def magnitude_record(panel, group, values, relative=False, model_identity=None):
+    task = {"source_panel": panel, "source_group": group,
+            "y_min": 0, "y_max": 100, "y_scale": "linear"}
+    payload = {"panel": model_identity, "group": model_identity, "readings": [
+        {"x": x, "y": None if relative else value,
+         "vertical_position": value if relative else None, "readability": True, "confidence": .9}
+        for x, value in zip([100, 1000], values)]}
+    return structured._source_magnitude_readings(task, payload, [100, 1000])
+
+
+def test_magnitude_source_identity_survives_missing_or_duplicate_model_identity():
+    records = [magnitude_record("a", "One", [60, 50]),
+               magnitude_record("c", "Two", [30, 20], model_identity="One"),
+               magnitude_record("e", "Three", [90, 80], model_identity="One")]
+    assert [r["source_panel"] for r in records] == ["a", "c", "e"]
+    assert [r["source_group"] for r in records] == ["One", "Two", "Three"]
+    assert structured.magnitude_reading_order(records) == ["Three", "One", "Two"]
+
+
+def test_shared_relative_readings_rank_only_when_consistent():
+    records = [magnitude_record("x", "First", [.6, .5], True),
+               magnitude_record("y", "Second", [.3, .2], True),
+               magnitude_record("z", "Third", [.9, .8], True)]
+    assert structured.magnitude_reading_order(records) == ["Third", "First", "Second"]
+    tied = [magnitude_record("x", "First", [60, 50]), magnitude_record("y", "Second", [60, 50])]
+    assert structured.magnitude_reading_order(tied) == []
+    conflicting = [magnitude_record("x", "First", [60, 20]), magnitude_record("y", "Second", [30, 50])]
+    assert structured.magnitude_reading_order(conflicting) == []
+
+
+def test_unreadable_magnitude_retry_stays_uncertain(tmp_path):
+    from PIL import Image
+    path = tmp_path / "panel.png"
+    Image.new("RGB", (100, 100)).save(path)
+    panels = [{"panel": "a", "group": "One", "graph_kind": "magnitude", "approximate_curve_level": 115,
+               "y_axis": {"scale": "linear"}}]
+    axis = json.dumps({"x_min": 10, "x_max": 10000, "y_min": 0, "y_max": 140, "confidence": .9})
+    with patch.object(structured, "_call_model", side_effect=[axis, '{"readings": []}', '{"readings": []}']) as call:
+        _, errors = structured.verify_magnitude_levels([path], panels, [["a"]])
+    assert call.call_count == 3
+    assert errors
+    assert panels[0]["approximate_curve_level"] is None
+
+
 def axis(label, unit, scale="linear", ticks=None, multiplier=None):
     return {
         "label": label,
@@ -1212,7 +1277,9 @@ class StructuredVisionTests(unittest.TestCase):
             structured,
             "_call_model_images",
             return_value=json.dumps(comparison_result),
-        ):
+        ), patch.object(
+            structured, "verify_magnitude_levels", return_value=([], [])
+        ) as magnitude_verify:
             answer = structured.analyse_compact_multi_panel_graph(
                 [Path("ab.png"), Path("cd.png"), Path("ef.png")],
                 [["a", "b"], ["c", "d"], ["e", "f"]],
@@ -1220,6 +1287,7 @@ class StructuredVisionTests(unittest.TestCase):
                 "Compare Figure 9",
                 debug_info=debug,
             )
+        magnitude_verify.assert_called_once()
         self.assertEqual(len(debug["validated_json"]["panels"]), 6)
         self.assertEqual(
             debug["validated_json"]["comparisons"]["magnitude_order_high_to_low"],
@@ -1241,6 +1309,115 @@ class StructuredVisionTests(unittest.TestCase):
         self.assertEqual(magnitude_labels, {structured._normal_name("|Zfat|")})
         self.assertEqual(debug["final_answer_path"], "validated_typed_vision")
         self.assertIn("Group 3 > Group 1 > Group 2", answer)
+
+    def test_compact_bare_numeric_group_ids_are_canonicalized(self):
+        pairs = [
+            compact_pair("a", "b", "1", 102, 0.3),
+            compact_pair("c", "d", "2", 80, 0.95),
+            compact_pair("e", "f", "3", 110, 0.4),
+        ]
+        comparison_result = {
+            "magnitude_order_high_to_low": ["Group 3", "Group 1", "Group 2"],
+            "greatest_phase_complexity_group": "Group 2",
+            "x_axis": {"label": "Frequency", "unit": "Hz", "scale": "log"},
+            "magnitude_y_axis": {"label": "|Zfat|", "unit": "Ω", "scale": "linear"},
+            "confidence": 0.93,
+            "uncertain": [],
+        }
+        debug = {}
+        with patch.object(
+            structured, "_call_model",
+            side_effect=[json.dumps(value) for value in pairs],
+        ), patch.object(
+            structured, "_call_model_images",
+            return_value=json.dumps(comparison_result),
+        ), patch.object(
+            structured, "verify_magnitude_levels", return_value=([], [])
+        ) as magnitude_verify:
+            structured.analyse_compact_multi_panel_graph(
+                [Path("ab.png"), Path("cd.png"), Path("ef.png")],
+                [["a", "b"], ["c", "d"], ["e", "f"]],
+                "9", "Compare Figure 9", debug_info=debug,
+            )
+        magnitude_verify.assert_called_once()
+        value = debug["validated_json"]
+        self.assertEqual(
+            [value["panels"][index]["group"] for index in range(0, 6, 2)],
+            ["Group 1", "Group 2", "Group 3"],
+        )
+        self.assertEqual(
+            value["comparisons"]["greatest_phase_complexity_group"], "Group 2"
+        )
+        self.assertEqual(debug["final_answer_path"], "validated_typed_vision")
+
+    def test_compact_db_and_signed_phase_axes_are_linear_coordinates(self):
+        value = compact_pair("a", "b", "Group 1", 100, 0.3)
+        value["panels"][0]["y_axis"] = {
+            "label": "|Z|dB (Ω)", "unit": "Ω", "scale": "log",
+        }
+        value["panels"][1]["y_axis"] = {
+            "label": "Phase", "unit": "°", "scale": "log",
+        }
+        validated = structured.validate_compact_panel_response(value, ["a", "b"])
+        self.assertEqual(
+            [panel["y_axis"]["scale"] for panel in validated["panels"]],
+            ["linear", "linear"],
+        )
+
+    def test_mixed_magnitude_scales_normalize_after_shared_db_label_merge(self):
+        pairs = [
+            compact_pair("a", "b", "Group 1", 102, 0.3),
+            compact_pair("c", "d", "Group 2", 80, 0.95),
+            compact_pair("e", "f", "Group 3", 110, 0.4),
+        ]
+        pairs[2]["panels"][0]["y_axis"] = {
+            "label": "|Z|", "unit": "Ω", "scale": "log",
+        }
+        comparison = {
+            "magnitude_order_high_to_low": ["Group 3", "Group 1", "Group 2"],
+            "greatest_phase_complexity_group": "Group 2",
+            "x_axis": {"label": "Frequency", "unit": "Hz", "scale": "log"},
+            "magnitude_y_axis": {
+                "label": "|Zfat|_{dB}", "unit": "Ω", "scale": "log",
+            },
+            "confidence": 0.93,
+            "uncertain": [],
+        }
+        debug = {}
+        with patch.object(
+            structured, "_call_model",
+            side_effect=[json.dumps(value) for value in pairs],
+        ), patch.object(
+            structured, "_call_model_images", return_value=json.dumps(comparison),
+        ), patch.object(
+            structured, "verify_magnitude_levels", return_value=([], []),
+        ):
+            structured.analyse_compact_multi_panel_graph(
+                [Path("ab.png"), Path("cd.png"), Path("ef.png")],
+                [["a", "b"], ["c", "d"], ["e", "f"]],
+                "9", "Compare Figure 9", debug_info=debug,
+            )
+        value = debug["validated_json"]
+        magnitude_panels = [
+            panel for panel in value["panels"]
+            if panel["graph_kind"] == "magnitude"
+        ]
+        self.assertTrue(all(
+            panel["x_axis"]["scale"] == "log" for panel in value["panels"]
+        ))
+        self.assertTrue(all(
+            panel["y_axis"]["scale"] == "linear" for panel in magnitude_panels
+        ))
+        self.assertEqual(
+            value["comparisons"]["magnitude_y_axis"]["scale"], "linear"
+        )
+        self.assertEqual(
+            value["comparisons"]["magnitude_order_high_to_low"],
+            ["Group 3", "Group 1", "Group 2"],
+        )
+        self.assertEqual(
+            value["comparisons"]["greatest_phase_complexity_group"], "Group 2"
+        )
 
     def test_fat_impedance_axis_variants_normalize_but_generic_z_does_not(self):
         variants = [

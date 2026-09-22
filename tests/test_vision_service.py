@@ -51,6 +51,102 @@ def item(label, y, fully=True, confidence=0.95):
 
 
 class VisionPipelineTests(unittest.TestCase):
+    def test_grounded_counts_distinguish_items_groups_and_panels(self):
+        self.assertEqual(vision.grounded_figure_counts(
+            "Nine hallmarks in three categories; six panels."),
+            {"items": 9, "groups": 3, "panels": 6})
+        self.assertEqual(vision.grounded_figure_counts("Several hallmarks."), {})
+
+    def _completeness_run(self, caption, retry_items):
+        page = unittest.mock.MagicMock()
+        page.get_text.return_value = ""
+        regions = [regional("top", [item(f"Alpha {i}", .3) for i in range(4)]),
+                   regional("middle", [item(f"Beta {i}", .45) for i in range(3)]),
+                   regional("bottom", [item("Gamma first", .8)])]
+        debug = {}
+        with patch.object(vision, "_detect_figure_clip", return_value=self.figure), patch.object(
+            vision, "_target_caption", return_value=(self.figure, caption)
+        ), patch.object(vision, "_render_page_image", return_value=Path("missing_test_crop.png")), patch.object(
+            vision, "_call_overview_model", return_value=overview()
+        ), patch.object(vision, "_call_regional_model", side_effect=regions) as call, patch.object(
+            vision, "_call_recovery_regional_model", return_value=regional("bottom", retry_items)
+        ) as recovery_call:
+            answer = vision._analyse_grouped_figure(page, "Group the labels", debug)
+        return answer, debug, call.call_count, recovery_call
+
+    def test_caption_count_shortfall_retries_and_recovers(self):
+        answer, debug, calls, recovery = self._completeness_run("Nine hallmarks in three categories.",
+            [item("Gamma second", .8)])
+        self.assertEqual(calls, 3)
+        recovery.assert_called_once_with(Path("missing_test_crop.png"), "bottom")
+        self.assertEqual(debug["completeness"]["observed"]["items"], 9)
+        self.assertEqual(debug["final_answer_path"], "validated_structured_vision")
+        self.assertIn("Gamma first", answer)
+        self.assertIn("Gamma second", answer)
+
+    def test_unreadable_missing_item_stays_incomplete(self):
+        answer, debug, calls, recovery = self._completeness_run("Nine hallmarks.", [])
+        self.assertEqual(calls, 3)
+        recovery.assert_called_once()
+        self.assertEqual(debug["completeness"]["observed"]["items"], 8)
+        self.assertEqual(debug["final_answer_path"], "incomplete_structured_vision")
+        self.assertIn("not a complete grouping", answer)
+
+    def test_absent_caption_count_preserves_existing_path(self):
+        _, debug, calls, recovery = self._completeness_run("Grouped labels.", [])
+        self.assertEqual(calls, 3)
+        recovery.assert_not_called()
+        self.assertEqual(debug["final_answer_path"], "validated_structured_vision")
+
+    def test_recovery_prompt_is_neutral_and_source_region_is_pipeline_owned(self):
+        prompt = vision._recovery_regional_prompt("bottom")
+        self.assertNotIn("which hallmarks are classified", prompt.casefold())
+        self.assertIn("transcribe every visible item label", prompt.casefold())
+        parsed = vision.parse_recovery_regional_response(
+            json.dumps({"items": [item("Readable label", .75)]}), "bottom"
+        )
+        self.assertEqual(parsed["region"], "bottom")
+        self.assertEqual(parsed["items"][0]["label"], "Readable label")
+
+    def test_unreadable_recovery_response_does_not_invent_an_item(self):
+        parsed = vision.parse_recovery_regional_response(
+            json.dumps({"items": []}), "bottom"
+        )
+        self.assertEqual(parsed, {"region": "bottom", "items": []})
+
+    def test_visible_fragment_requires_document_and_full_visual_confirmation(self):
+        regions = [regional("top", []),
+                   regional("middle", [item("Mitochondrial", .45),
+                                       item("Mitochondrial dysfunction", .5)]),
+                   regional("bottom", [])]
+        result, _, _, _ = vision.reconcile_spatial_results(
+            overview(), regions, self.clips, self.figure,
+            "The antagonistic hallmarks are Mitochondrial dysfunction and Cellular senescence.")
+        self.assertEqual(result["antagonistic"], ["Mitochondrial dysfunction"])
+
+    def test_excess_count_cannot_validate(self):
+        result = {"primary": [f"Label {i}" for i in range(10)],
+                  "antagonistic": [], "integrative": [], "uncertain": []}
+        self.assertEqual(vision.grouped_completeness(result, overview(), {"items": 9})["status"],
+                         "incomplete")
+
+    def test_overlapping_visual_fragment_without_document_candidate(self):
+        regions = [regional("top", [item("Mitochondrial", .83)]),
+                   regional("middle", [item("Mitochondrial dysfunction", .5)]),
+                   regional("bottom", [])]
+        result, _, _, _ = vision.reconcile_spatial_results(
+            overview(), regions, self.clips, self.figure)
+        self.assertEqual(result["antagonistic"], ["Mitochondrial dysfunction"])
+
+    def test_distant_partial_label_is_not_collapsed(self):
+        regions = [regional("top", [item("Marker", .1)]),
+                   regional("middle", [item("Marker alpha", .5)]),
+                   regional("bottom", [])]
+        result, _, _, _ = vision.reconcile_spatial_results(
+            overview(), regions, self.clips, self.figure)
+        self.assertIn("Marker", result["primary"])
+        self.assertIn("Marker alpha", result["antagonistic"])
+
     def setUp(self):
         self.figure = Rect(0, 0, 100, 100)
         self.clips = [Rect(0, 0, 100, 56), Rect(0, 22, 100, 82), Rect(0, 44, 100, 100)]

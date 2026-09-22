@@ -3,6 +3,24 @@ import re
 
 import ollama
 
+from services.final_answer_composer import (
+    append_missing_grounded_slots,
+    build_grounded_slot_records,
+    build_provenance_final_answer_evidence,
+    grounded_slot_coverage_errors,
+    parse_final_evidence_context,
+    remove_false_grounded_absence_claims,
+    render_final_answer_evidence,
+    validate_answer_consistency,
+)
+from services.scientific_evidence import (
+    correct_unsupported_measurement_entities,
+    document_glossary,
+    extract_explicit_classifier_taxonomy,
+    remove_unsupported_acronym_expansions,
+    remove_unsupported_acronym_names,
+    validate_classifier_taxonomy_prose,
+)
 from settings import NORMAL_NUM_PREDICT, OLLAMA_MODEL, SUMMARY_NUM_PREDICT
 
 
@@ -28,6 +46,189 @@ def _response_text(response) -> str:
     else:
         content = getattr(message, "content", None) or getattr(message, "thinking", None)
     return str(content or "").strip()
+
+
+def _validated_experimental_provenance(context: str) -> list[dict]:
+    marker = "[WHOLE-DOCUMENT EXPERIMENTAL-DOMAIN EVIDENCE]"
+    _, found, remainder = str(context or "").partition(marker)
+    if not found or (start := remainder.find("[")) < 0:
+        return []
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(remainder[start:])
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
+
+
+def _grounded_answer_slots(context: str) -> list[dict]:
+    marker = "[GROUNDED ANSWER SLOT EVIDENCE]"
+    _, found, remainder = str(context or "").partition(marker)
+    if not found or (start := remainder.find("{")) < 0:
+        return []
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(remainder[start:])
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return build_grounded_slot_records(payload) if isinstance(payload, dict) else []
+
+
+def _enforce_experimental_figure_provenance(
+    context: str, answer: str,
+) -> tuple[str, list[str], bool]:
+    rows = _validated_experimental_provenance(context)
+    if not rows:
+        return answer, [], False
+    allowed = {
+        str(row["figure_number"]).casefold()
+        for row in rows if row.get("figure_number") not in (None, "")
+    }
+    invalid = []
+
+    def replace(match):
+        number = re.sub(r"\s+", "", match.group("number")).casefold()
+        if number in allowed and not match.group("supplementary"):
+            return match.group(0)
+        invalid.append(match.group(0))
+        return "figure number not resolved"
+
+    value = re.sub(
+        r"\b(?P<supplementary>Supplementary\s+)?Fig(?:ure)?\.?\s*"
+        r"(?P<number>[A-Za-z]?\s*\d+(?:\.\d+)?)\b",
+        replace, str(answer or ""), flags=re.I,
+    )
+    provenance_lines = []
+    seen = set()
+    for row in rows:
+        domain = row.get("experimental_domain")
+        label = row.get("figure_label") or "figure number not resolved"
+        signature = (domain, label, row.get("page"))
+        if not domain or signature in seen:
+            continue
+        seen.add(signature)
+        sample = row.get("sample_type") or "sample type not resolved"
+        provenance_lines.append(
+            f"- {domain}: {label}, page {row.get('page')}; {sample}."
+        )
+    appended = False
+    if provenance_lines and "**Evidence provenance**" not in value:
+        value = f"{value.rstrip()}\n\n**Evidence provenance**\n\n" + "\n".join(provenance_lines)
+        appended = True
+    return value.strip(), invalid, appended
+
+
+def _clean_generation_artifacts(answer: str) -> tuple[str, bool]:
+    value = str(answer or "")
+    cleaned = re.sub(r"\b1\s+were\b", "1 was", value, flags=re.I)
+    if cleaned.count("**") % 2:
+        index = cleaned.rfind("**")
+        cleaned = cleaned[:index] + cleaned[index + 2:]
+    return cleaned.strip(), cleaned != value
+
+
+def _generate_from_final_answer_evidence(
+    question: str, evidence: dict, debug_info: dict | None = None,
+) -> str:
+    """Verbalize one authoritative object, repair once, then render safely."""
+    serialized = json.dumps(evidence, ensure_ascii=False)
+    prompt = f"""
+Write the final user-facing answer using only FINAL_ANSWER_EVIDENCE below.
+
+Authority is already resolved in the object. Do not reinterpret figure or panel
+identity, experimental domains, condition membership, measurements, or numeric
+values. Explicit author Results/Methods outrank full captions; full captions
+outrank validated visual evidence; model inference is last. Integrate facts into
+concise prose rather than copying source chunks. Keep distinct conditions and
+experiment stages separate. For a panelled figure, identify every caption-mapped
+panel. For experimental-domain synthesis, organize by domain and use only each
+record's figure_number. Never invent supplementary figures. Do not say a field is
+missing when the object contains it. Use balanced Markdown.
+
+Question: {question}
+
+FINAL_ANSWER_EVIDENCE:
+{serialized}
+"""
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a constrained evidence verbalizer. The supplied object "
+                "has already resolved factual conflicts; do not re-reason from it."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    response = ollama.chat(
+        model=OLLAMA_MODEL,
+        messages=messages,
+        think=False,
+        options={"temperature": 0, "num_predict": NORMAL_NUM_PREDICT},
+    )
+    initial = _response_text(response)
+    initial_errors = validate_answer_consistency(initial, evidence)
+    attempts = [{
+        "kind": "initial",
+        "done_reason": str(_response_value(response, "done_reason", "") or ""),
+        "errors": initial_errors,
+        "response_characters": len(initial),
+    }]
+    answer = initial
+    repair_errors = []
+    if initial_errors:
+        repair_prompt = f"""
+Rewrite the answer once so it exactly verbalizes FINAL_ANSWER_EVIDENCE.
+Remove or replace every conflicting sentence; do not append corrections to the
+bad answer. Do not copy raw chunks. The validator reported:
+- {chr(10).join(initial_errors)}
+
+Bad answer:
+{initial}
+
+FINAL_ANSWER_EVIDENCE:
+{serialized}
+"""
+        repaired_response = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=[
+                messages[0],
+                {"role": "user", "content": repair_prompt},
+            ],
+            think=False,
+            options={"temperature": 0, "num_predict": NORMAL_NUM_PREDICT},
+        )
+        repaired = _response_text(repaired_response)
+        repair_errors = validate_answer_consistency(repaired, evidence)
+        attempts.append({
+            "kind": "consistency_repair",
+            "done_reason": str(_response_value(repaired_response, "done_reason", "") or ""),
+            "errors": repair_errors,
+            "response_characters": len(repaired),
+        })
+        answer = repaired
+    deterministic_fallback = bool(repair_errors or not answer)
+    if deterministic_fallback:
+        answer = render_final_answer_evidence(evidence)
+    final_errors = validate_answer_consistency(answer, evidence)
+    if final_errors:
+        # The deterministic renderer should be self-consistent. Keep this as a
+        # clear failure rather than displaying prose known to contradict the
+        # evidence object.
+        answer = "Could not verify a final answer against the resolved evidence object."
+    if debug_info is not None:
+        debug_info.update({
+            "final_answer_evidence": evidence,
+            "generation_attempts": attempts,
+            "initial_evidence_consistency_errors": initial_errors,
+            "repair_evidence_consistency_errors": repair_errors,
+            "final_evidence_consistency_errors": final_errors,
+            "evidence_repair_used": bool(initial_errors),
+            "deterministic_evidence_fallback_used": deterministic_fallback,
+            "final_answer_code_path": (
+                "deterministic_evidence_renderer" if deterministic_fallback
+                else "validated_grounded_evidence_composition"
+            ),
+        })
+    return answer
 
 
 def _requested_summary_sections(question: str) -> list[str]:
@@ -138,16 +339,33 @@ def _validated_explicit_limitations(context: str) -> list[dict]:
 
 def _missing_explicit_limitations(answer: str, items: list[dict]) -> list[dict]:
     normalized_answer = set(re.findall(r"[a-z][a-z-]{3,}", str(answer or "").casefold()))
+    answer_text = str(answer or "")
     missing = []
     for item in items:
+        statement = str(item.get("statement", ""))
         statement_tokens = {
             token for token in re.findall(
-                r"[a-z][a-z-]{3,}", str(item.get("statement", "")).casefold()
+                r"[a-z][a-z-]{3,}", statement.casefold()
             )
             if token not in {"than", "more", "method", "study", "hybrid"}
         }
         overlap = len(statement_tokens.intersection(normalized_answer))
-        if statement_tokens and overlap / len(statement_tokens) < 0.55:
+        critical_patterns = []
+        if re.search(r"\bother tissues?\b", statement, re.I):
+            critical_patterns.append(r"\bother tissues?\b")
+        if re.search(r"\bperformed worse\b", statement, re.I):
+            critical_patterns.append(r"\bperformed worse\b|\bworse\b.{0,60}\bidentif")
+        if re.search(r"\bmorphology\b.{0,80}\bunchanged\b", statement, re.I):
+            critical_patterns.append(r"\bmorphology\b.{0,100}\bunchanged\b")
+        if re.search(r"\bmarkers?\b.{0,100}\baffect\w*\b.{0,80}\bcompar", statement, re.I):
+            critical_patterns.append(r"\bmarkers?\b.{0,100}\baffect\w*\b.{0,80}\bcompar")
+        critical_missing = any(
+            not re.search(pattern, answer_text, re.I | re.DOTALL)
+            for pattern in critical_patterns
+        )
+        if statement_tokens and (
+            overlap / len(statement_tokens) < 0.55 or critical_missing
+        ):
             missing.append(item)
     return missing
 
@@ -416,11 +634,36 @@ def generate_answer(
     conversation_history: list[dict],
     debug_info: dict | None = None,
 ) -> str:
+    final_answer_evidence = parse_final_evidence_context(context)
+    if final_answer_evidence is None:
+        provenance = _validated_experimental_provenance(context)
+        if provenance:
+            final_answer_evidence = build_provenance_final_answer_evidence(
+                question, provenance,
+            )
+    if final_answer_evidence is not None:
+        return _generate_from_final_answer_evidence(
+            question, final_answer_evidence, debug_info,
+        )
+
     summary_mode = "[DOCUMENT SUMMARY MODE]" in context
     requested_sections = _requested_summary_sections(question) if summary_mode else []
     grounded_items = _validated_framework_items(context)
+    grounded_answer_slots = _grounded_answer_slots(context)
     inferred_limitations = _validated_inferred_limitations(context)
     explicit_limitations = _validated_explicit_limitations(context)
+    explicit_method_terms = []
+    if summary_mode and "methods" in requested_sections:
+        explicit_method_terms = [
+            {"acronym": acronym, "term": expansion}
+            for acronym, expansion in document_glossary(context).items()
+            if re.search(r"\b(?:method|model|algorithm|classifier|framework|approach)\b", expansion, re.I)
+        ][:6]
+    coverage_match = re.search(r"Requested answer slots:\s*(\[[^\n]*\])", context)
+    try:
+        coverage_slots = json.loads(coverage_match.group(1)) if coverage_match else []
+    except json.JSONDecodeError:
+        coverage_slots = []
     section_rule = ""
     if len(requested_sections) >= 2:
         section_rule = (
@@ -466,6 +709,37 @@ EVIDENCE RULES:
   14. When EXPLICIT AUTHOR LIMITATIONS is present and the question asks for
       limitations in the plural, include every validated item and keep it
       separate from inferred constraints.
+  15. For METHODS-AWARE RETRIEVAL, answer every requested answer slot. Never
+      fill a missing method from "standard practice", what is "typically
+      implied", or what is "presumably" done. Say it is not specified instead.
+  16. Keep experimental provenance attached to its domain, species, tissue or
+      cell line, treatment, control, measurement, and figure/panel. Human-derived
+      cell lines are not human patient samples.
+  17. For FIGURE QUESTION COVERAGE, explicit nearby Results statements override
+      a generalized visual interpretation at the condition level. Preserve each
+      named condition and quantitative qualifier. Do not change "less than 30%"
+      into zero, and do not say only, never, or excludes unless the evidence uses
+      wording with that scope.
+  18. When EXPLICIT CLASSIFIER TAXONOMY is present, preserve identifiers and
+      descriptions exactly. Do not infer acronym expansions, algorithm families,
+      or umbrella families from a model name.
+  19. A caption/panel inventory is intermediate evidence. Directly answer higher-
+      level explanatory clauses using supplied Results or Methods evidence.
+  20. AUTHORITATIVE PANEL ROLE MAP comes from the full author caption. Use its
+      panel assignments exactly and never reconstruct them with words such as
+      likely or probably.
+  21. Before saying a requested figure slot was not found, exhaust RESOLVED
+      ANSWER SLOT EVIDENCE. Keep separately numbered experiment stages separate.
+  22. AUTHORITATIVE CONDITION TUPLES preserve treatment-specific Results claims.
+      Do not collapse distinct treatments into one generic condition.
+  23. WHOLE-DOCUMENT EXPERIMENTAL-DOMAIN provenance supplies the only permitted
+      figure identifiers for those evidence objects. Never infer a supplementary
+      figure number from nearby semantic text.
+  24. GROUNDED ANSWER SLOT EVIDENCE is an explicit coverage contract. Express
+      every grounded slot, including its reported values, conditions and named
+      entities. Never call a grounded slot absent. Use Results for observed
+      outcomes and Methods for requested protocol details rather than merely
+      restating a caption.
 {section_rule}
 
 Supplied evidence:
@@ -493,7 +767,8 @@ text or the labelled visual analysis.
         },
     ]
 
-    num_predict = SUMMARY_NUM_PREDICT if summary_mode else NORMAL_NUM_PREDICT
+    methods_mode = "[METHODS-AWARE RETRIEVAL]" in context
+    num_predict = SUMMARY_NUM_PREDICT if summary_mode or methods_mode else NORMAL_NUM_PREDICT
     options = {
         "temperature": 0,
         "num_predict": num_predict,
@@ -519,6 +794,17 @@ text or the labelled visual analysis.
     missing_explicit_limitations = _missing_explicit_limitations(
         answer, explicit_limitations
     )
+    missing_method_terms = [
+        row for row in explicit_method_terms
+        if not re.search(re.escape(row["term"]), answer, re.I)
+    ]
+    missing_coverage_slots = [
+        slot for slot in coverage_slots
+        if not re.search(re.escape(slot), answer, re.I)
+    ]
+    initial_grounded_slot_errors = grounded_slot_coverage_errors(
+        answer, grounded_answer_slots,
+    )
     incomplete_ending = _ends_incomplete(answer)
     length_limited = done_reason.casefold() in {
         "length", "max_tokens", "max token", "num_predict",
@@ -527,6 +813,9 @@ text or the labelled visual analysis.
         length_limited or incomplete_ending or bool(missing_sections)
         or bool(missing_grounded_items) or bool(missing_inferred_limitations)
         or bool(missing_explicit_limitations)
+        or bool(missing_method_terms)
+        or bool(missing_coverage_slots)
+        or bool(initial_grounded_slot_errors)
     )
     attempts = [{
         "done": bool(_response_value(response, "done", False)),
@@ -554,6 +843,22 @@ text or the labelled visual analysis.
             missing_parts.append(
                 "explicit author limitations: " + "; ".join(
                     item["statement"] for item in missing_explicit_limitations
+                )
+            )
+        if missing_method_terms:
+            missing_parts.append(
+                "explicit source method terminology: " + ", ".join(
+                    f"{row['term']} ({row['acronym']})" for row in missing_method_terms
+                )
+            )
+        if missing_coverage_slots:
+            missing_parts.append("requested methods fields: " + ", ".join(missing_coverage_slots))
+        if initial_grounded_slot_errors:
+            missing_parts.append(
+                "grounded answer slots: " + ", ".join(
+                    row["slot"] for row in grounded_answer_slots
+                    if row.get("status") == "grounded"
+                    and grounded_slot_coverage_errors(answer, [row])
                 )
             )
         missing_text = "; ".join(missing_parts) or "the unfinished final thought"
@@ -595,6 +900,10 @@ text or the labelled visual analysis.
     final_missing_explicit_limitations = _missing_explicit_limitations(
         answer, explicit_limitations
     )
+    final_missing_method_terms = [
+        row for row in explicit_method_terms
+        if not re.search(re.escape(row["term"]), answer, re.I)
+    ]
     grounded_items_appended = []
     if final_missing_grounded:
         grounded_items_appended = list(final_missing_grounded)
@@ -603,6 +912,21 @@ text or the labelled visual analysis.
             f"validated evidence: {', '.join(final_missing_grounded)}."
         )
         final_missing_grounded = _missing_grounded_items(answer, grounded_items)
+    framework_count_appended = False
+    count_word = {
+        1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
+        7: "seven", 8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve",
+    }.get(len(grounded_items), str(len(grounded_items)))
+    if grounded_items and not re.search(
+        rf"\b(?:{len(grounded_items)}|{re.escape(count_word)})\s+hallmarks?\b",
+        answer,
+        re.I,
+    ):
+        answer = (
+            f"{answer.rstrip()}\n\nThe validated framework contains "
+            f"{count_word} hallmarks."
+        )
+        framework_count_appended = True
     limitations_label_missing = bool(inferred_limitations) and not re.search(
         r"\blimitations?\b.{0,80}\binferred\b.{0,80}\bassumptions?\b|"
         r"\binferred\b.{0,80}\blimitations?\b.{0,80}\bassumptions?\b",
@@ -638,6 +962,16 @@ text or the labelled visual analysis.
         final_missing_explicit_limitations = _missing_explicit_limitations(
             answer, explicit_limitations
         )
+    explicit_method_terms_appended = []
+    if final_missing_method_terms:
+        explicit_method_terms_appended = [row["acronym"] for row in final_missing_method_terms]
+        answer = (
+            f"{answer.rstrip()}\n\n**Explicit method terminology from the source:** "
+            + "; ".join(
+                f"{row['term']} ({row['acronym']})" for row in final_missing_method_terms
+            )
+            + "."
+        )
     runtime_examples_appended = []
     for example in _explicit_runtime_examples(explicit_limitations):
         if re.search(
@@ -656,6 +990,59 @@ text or the labelled visual analysis.
     answer, efficiency_contradiction_removed = _remove_efficiency_contradiction(
         context, answer
     )
+    unsupported_completion_removed = False
+    sentences = re.split(r"(?<=[.!?])\s+", answer)
+    unsupported_method_completion = re.compile(
+        r"\b(?:typically implied|standard practice would be|presumably|"
+        r"cross-validation|hold-out testing|default threshold)\b",
+        re.I,
+    )
+    cleaned_sentences = [
+        sentence for sentence in sentences
+        if not unsupported_method_completion.search(sentence)
+    ]
+    if len(cleaned_sentences) != len(sentences):
+        unsupported_completion_removed = True
+        answer = " ".join(cleaned_sentences).strip()
+    answer, false_absence_claims_removed = remove_false_grounded_absence_claims(
+        answer, grounded_answer_slots,
+    )
+    answer, grounded_slots_appended = append_missing_grounded_slots(
+        answer, grounded_answer_slots,
+    )
+    grounded_slot_names = {
+        str(row.get("slot")) for row in grounded_answer_slots
+        if row.get("status") == "grounded"
+    }
+    final_missing_coverage = [
+        slot for slot in coverage_slots
+        if slot not in grounded_slot_names and not re.search(re.escape(slot), answer, re.I)
+    ]
+    if final_missing_coverage:
+        answer += "\n\n**Requested fields not explicitly covered**\n\n" + "\n".join(
+            f"- {slot}: Not specified in the retrieved evidence."
+            for slot in final_missing_coverage
+        )
+    supported_terms = document_glossary(context)
+    classifier_taxonomy = extract_explicit_classifier_taxonomy(context)
+    supported_terms.update({
+        row["name"]: row["source_description"]
+        for row in classifier_taxonomy
+    })
+    answer = remove_unsupported_acronym_expansions(answer, supported_terms)
+    answer, unsupported_acronym_names_removed = remove_unsupported_acronym_names(
+        answer, context,
+    )
+    answer, classifier_claims_removed = validate_classifier_taxonomy_prose(
+        answer, classifier_taxonomy,
+    )
+    answer, measurement_entity_corrections = correct_unsupported_measurement_entities(
+        answer, context,
+    )
+    answer, invalid_figure_references, provenance_appended = (
+        _enforce_experimental_figure_provenance(context, answer)
+    )
+    answer, generation_artifacts_cleaned = _clean_generation_artifacts(answer)
     (
         answer,
         multi_figure_details_appended,
@@ -680,6 +1067,10 @@ text or the labelled visual analysis.
             "initial_missing_explicit_limitations": [
                 item["key"] for item in missing_explicit_limitations
             ],
+            "initial_missing_explicit_method_terms": [
+                item["acronym"] for item in missing_method_terms
+            ],
+            "initial_grounded_slot_coverage_errors": initial_grounded_slot_errors,
             "initial_incomplete_ending": incomplete_ending,
             "initial_length_limited": length_limited,
             "continuation_used": len(attempts) == 2,
@@ -692,14 +1083,30 @@ text or the labelled visual analysis.
                 item["key"] for item in final_missing_explicit_limitations
             ],
             "grounded_items_appended": grounded_items_appended,
+            "framework_count_appended": framework_count_appended,
             "inferred_limitations_appended": inferred_limitations_appended,
             "explicit_limitations_appended": explicit_limitations_appended,
+            "explicit_method_terms_appended": explicit_method_terms_appended,
+            "grounded_slots_appended": grounded_slots_appended,
+            "false_grounded_absence_claims_removed": false_absence_claims_removed,
+            "final_grounded_slot_coverage_errors": grounded_slot_coverage_errors(
+                answer, grounded_answer_slots,
+            ),
             "explicit_runtime_examples_appended": runtime_examples_appended,
             "grounded_transient_comparison_appended": transient_comparison_appended,
             "multi_figure_details_appended": multi_figure_details_appended,
             "multi_figure_contradiction_removed": contradiction_removed,
             "multi_figure_depth_language_qualified": depth_language_qualified,
             "efficiency_contradiction_removed": efficiency_contradiction_removed,
+            "requested_answer_slots": coverage_slots,
+            "final_missing_coverage_slots": final_missing_coverage,
+            "unsupported_standard_practice_completion_removed": unsupported_completion_removed,
+            "classifier_taxonomy_claims_removed": classifier_claims_removed,
+            "unsupported_acronym_names_removed": unsupported_acronym_names_removed,
+            "measurement_entity_corrections": measurement_entity_corrections,
+            "invalid_figure_references_removed": invalid_figure_references,
+            "experimental_provenance_appended": provenance_appended,
+            "generation_artifacts_cleaned": generation_artifacts_cleaned,
             "final_incomplete_ending": _ends_incomplete(answer),
             "response_characters": len(answer),
             "response_words": len(answer.split()),

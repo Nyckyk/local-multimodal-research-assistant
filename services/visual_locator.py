@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from services.document_matching import explicit_document_matches
+from services.scientific_evidence import extract_caption_panels
 from services.structured_vision import detect_visual_type
 from services.visual_index import flatten_visual_targets
 from services.visual_reference_parser import (
@@ -38,6 +39,9 @@ class VisualResolution:
     target_number: str | None = None
     panel: str | None = None
     caption: str = ""
+    full_caption: str = ""
+    short_caption: str = ""
+    caption_page_number: int | None = None
     nearby_text: str = ""
     visual_type: str | None = None
     confidence: float = 0.0
@@ -93,6 +97,18 @@ def _unique_caption_coverage(question: str, captions: list[str]) -> list[float]:
         / len(question_tokens)
         for tokens in caption_tokens
     ]
+
+
+def _caption_phrase_hits(question: str, caption: str) -> int:
+    words = [
+        token.casefold() for token in re.findall(r"[A-Za-z0-9]+", question)
+        if token.casefold() not in _STOPWORDS
+    ]
+    caption_key = " ".join(re.findall(r"[a-z0-9]+", str(caption or "").casefold()))
+    return sum(
+        f"{first} {second}" in caption_key
+        for first, second in zip(words, words[1:])
+    )
 
 
 def _embedding_relevance(question: str, captions: list[str], embedder=None) -> list[float]:
@@ -205,6 +221,12 @@ def choose_visual_type(
         return None
     if reference.target_type == "table":
         return "table"
+    panel_types = {
+        row["visual_type"] for row in extract_caption_panels(caption)
+        if row.get("visual_type") not in {None, "other"}
+    }
+    if len(panel_types) >= 2:
+        return "mixed_figure"
     detected = detect_visual_type(question, caption)
     return detected or "labelled_diagram"
 
@@ -354,6 +376,7 @@ def resolve_visual_target(
             "caption_relevance_score": caption_score,
             "lexical_relevance_score": lexical_score,
             "unique_caption_coverage": unique_score,
+            "caption_phrase_hits": _caption_phrase_hits(question, candidate.get("caption", "")),
         })
     scored.sort(key=lambda row: (-row["rank_score"], row["pdf_name"].casefold(), row["page_number"]))
     top = scored[0]
@@ -394,6 +417,10 @@ def resolve_visual_target(
                 > second.get("lexical_relevance_score", 0.0) + 0.10
             )
         )
+        or (
+            top.get("caption_phrase_hits", 0) > 0
+            and (second is None or second.get("caption_phrase_hits", 0) == 0)
+        )
     )
     if (
         second
@@ -425,7 +452,7 @@ def resolve_visual_target(
             candidates=public_candidates,
             reference=reference.to_dict(),
         )
-    visual_type = choose_visual_type(reference, question, top.get("caption", ""))
+    visual_type = choose_visual_type(reference, question, top.get("full_caption", top.get("caption", "")))
     return VisualResolution(
         status="resolved",
         pdf_path=top["pdf_path"],
@@ -435,6 +462,9 @@ def resolve_visual_target(
         target_number=reference.target_number,
         panel=reference.panel,
         caption=top.get("caption", ""),
+        full_caption=top.get("full_caption", top.get("caption", "")),
+        short_caption=top.get("short_caption", top.get("caption", "")),
+        caption_page_number=top.get("caption_page_number", top.get("page_number")),
         nearby_text=top.get("nearby_text", ""),
         visual_type=visual_type,
         confidence=round(top["score"], 3),
