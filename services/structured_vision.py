@@ -1554,6 +1554,18 @@ def normalize_panel_identity(panel: dict) -> None:
         panel["panel"] = match.group(1).lower()
 
 
+def normalize_compact_group_identity(value) -> str:
+    """Canonicalize explicit compact-graph group IDs without guessing names."""
+    text = str(value or "").strip()
+    prefixed = re.search(r"\bgroup\s*([A-Za-z0-9]+)\b", text, re.IGNORECASE)
+    if prefixed:
+        return f"Group {prefixed.group(1)}"
+    # Compact panel crops often show only a numeric group marker. Restrict the
+    # shorthand to digits so arbitrary titles are never silently reclassified.
+    bare = re.fullmatch(r"\(?([0-9]+)\)?", text)
+    return f"Group {bare.group(1)}" if bare else text
+
+
 def validate_graph(value: dict, evidence_text: str = "") -> dict:
     _require_keys(
         value,
@@ -2320,6 +2332,36 @@ def _validate_compact_axis(axis: dict, panel: str, name: str) -> None:
         raise StructuredOutputError(f"Compact panel {panel} {name}-axis scale is invalid.")
 
 
+def normalize_compact_axis_scale(axis: dict, graph_kind: str = "") -> None:
+    """Correct transformed-value scale labels unless ticks prove a log axis."""
+    if not isinstance(axis, dict):
+        return
+    descriptor = " ".join((
+        str(graph_kind),
+        str(axis.get("label", "")),
+        str(axis.get("unit", "")),
+    )).casefold()
+    # Decibels are already logarithmically transformed values plotted on a
+    # linear coordinate axis. Preserve a true log coordinate only when optional
+    # tick evidence explicitly establishes powers-of-ten spacing; a model's
+    # bare scale label is not independent visual evidence. Signed phase angles
+    # likewise cannot use a logarithmic coordinate axis because negative ticks
+    # are visible.
+    tick_scale = infer_axis_scale(
+        axis.get("tick_labels", []), axis.get("scientific_multiplier")
+    )
+    if (("db" in descriptor and tick_scale != "log")
+            or "phase" in descriptor or "°" in descriptor):
+        axis["scale"] = "linear"
+
+
+def normalize_compact_y_axis_scale(panel: dict) -> None:
+    """Normalize one compact panel's y-axis after all label merges."""
+    normalize_compact_axis_scale(
+        panel.get("y_axis"), str(panel.get("graph_kind", ""))
+    )
+
+
 def validate_compact_panel_response(value: dict, expected_panels: list[str]) -> dict:
     _require_keys(value, {"panels", "uncertain_values"}, "Compact graph response")
     if not isinstance(value["panels"], list) or not isinstance(value["uncertain_values"], list):
@@ -2339,9 +2381,8 @@ def validate_compact_panel_response(value: dict, expected_panels: list[str]) -> 
         normalize_panel_identity(panel)
         panel_id = str(panel["panel"])
         panel["panel"] = panel_id
-        group_match = re.search(r"\bgroup\s*([A-Za-z0-9]+)\b", str(panel["group"]), re.I)
-        if group_match:
-            panel["group"] = f"Group {group_match.group(1)}"
+        panel["group"] = normalize_compact_group_identity(panel["group"])
+        normalize_compact_y_axis_scale(panel)
         observed.append(panel_id)
         _validate_compact_axis(panel["x_axis"], panel_id, "x")
         _validate_compact_axis(panel["y_axis"], panel_id, "y")
@@ -2541,6 +2582,13 @@ def validate_compact_comparison(value: dict, panels: list[dict]) -> dict:
     )
     if not isinstance(value["magnitude_order_high_to_low"], list) or not isinstance(value["uncertain"], list):
         raise StructuredOutputError("Compact graph comparison lists are invalid.")
+    value["magnitude_order_high_to_low"] = [
+        normalize_compact_group_identity(group)
+        for group in value["magnitude_order_high_to_low"]
+    ]
+    value["greatest_phase_complexity_group"] = normalize_compact_group_identity(
+        value["greatest_phase_complexity_group"]
+    )
     _validate_compact_axis(value["x_axis"], "merged", "x")
     _validate_compact_axis(value["magnitude_y_axis"], "merged", "magnitude-y")
     expected_order, expected_complexity = _comparison_expectations(panels)
@@ -2750,7 +2798,15 @@ def analyse_compact_multi_panel_graph(
     try:
         comparison_candidate = parse_json_response(comparison_raw)
         expected_order, _ = _comparison_expectations(panels)
-        if (not expected_order or comparison_candidate.get("magnitude_order_high_to_low") != expected_order
+        magnitude_panel_count = sum(
+            "magnitude" in str(panel["graph_kind"]).lower() for panel in panels
+        )
+        # A redundant whole-figure comparison agreeing with coarse per-panel
+        # estimates is not independent visual confirmation. For multiple
+        # magnitude panels, always bind shared-x rereads to their source crops
+        # before accepting a strict order.
+        if (magnitude_panel_count > 1 or not expected_order
+                or comparison_candidate.get("magnitude_order_high_to_low") != expected_order
                 or not isinstance(comparison_candidate.get("confidence"), (int, float))
                 or comparison_candidate["confidence"] < 0.7):
             readings, uncertainty = verify_magnitude_levels(image_paths, panels, panel_groups, debug_info)
@@ -2780,20 +2836,13 @@ def analyse_compact_multi_panel_graph(
                 axis_label_image_paths, evidence_text
             )
             magnitude_axis["label"] = corrected_label
+        normalize_compact_axis_scale(magnitude_axis, "magnitude")
         if (
             isinstance(comparison_candidate.get("confidence"), (int, float))
             and comparison_candidate["confidence"] >= 0.7
             and isinstance(comparison_candidate.get("x_axis"), dict)
             and isinstance(comparison_candidate.get("magnitude_y_axis"), dict)
         ):
-            x_scale = _consensus_panel_scale(panels, "x_axis")
-            magnitude_scale = _consensus_panel_scale(
-                panels, "y_axis", "magnitude"
-            )
-            if x_scale != "unknown":
-                comparison_candidate["x_axis"]["scale"] = x_scale
-            if magnitude_scale != "unknown":
-                comparison_candidate["magnitude_y_axis"]["scale"] = magnitude_scale
             for panel in panels:
                 panel["x_axis"] = _merge_shared_axis_reading(
                     panel["x_axis"], comparison_candidate["x_axis"]
@@ -2803,6 +2852,18 @@ def analyse_compact_multi_panel_graph(
                         panel["y_axis"],
                         comparison_candidate["magnitude_y_axis"],
                     )
+                    normalize_compact_y_axis_scale(panel)
+            x_scale = _consensus_panel_scale(panels, "x_axis")
+            magnitude_scale = _consensus_panel_scale(
+                panels, "y_axis", "magnitude"
+            )
+            if x_scale != "unknown":
+                comparison_candidate["x_axis"]["scale"] = x_scale
+            if magnitude_scale != "unknown":
+                comparison_candidate["magnitude_y_axis"]["scale"] = magnitude_scale
+            normalize_compact_axis_scale(
+                comparison_candidate["magnitude_y_axis"], "magnitude"
+            )
         comparison = validate_compact_comparison(comparison_candidate, panels)
     except StructuredOutputError as error:
         if debug_info is not None:

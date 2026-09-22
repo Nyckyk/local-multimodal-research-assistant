@@ -599,6 +599,16 @@ Return exactly one JSON object and no prose:
 Do not emit placeholder text. Return an empty items list if nothing is readable.
 """
 
+
+def _recovery_regional_prompt(position: str) -> str:
+    """Build a neutral, source-locked transcription prompt for a retry crop."""
+    transcription_task = (
+        "Transcribe every visible item label in this crop. Treat each separate "
+        "coloured label box as a possible item. Do not infer missing text and "
+        "do not use outside knowledge."
+    )
+    return _regional_prompt(transcription_task, position)
+
 def _response_text(response) -> str:
     answer = response["message"].get("content", "").strip()
     if not answer:
@@ -755,6 +765,22 @@ def parse_regional_response(raw_response: str, expected_position: str) -> dict:
     return result
 
 
+def parse_recovery_regional_response(raw_response: str, source_position: str) -> dict:
+    """Validate retry transcription while retaining deterministic crop identity."""
+    try:
+        result = json.loads(raw_response)
+    except (json.JSONDecodeError, TypeError) as error:
+        raise StructuredVisionError("A recovery response was not valid JSON.") from error
+    if not isinstance(result, dict) or set(result) not in ({"items"}, {"region", "items"}):
+        raise StructuredVisionError("A recovery response has an invalid schema.")
+    # Reuse the regional item validator, but provide the known source region
+    # ourselves. The model is responsible only for pixel transcription.
+    return parse_regional_response(
+        json.dumps({"region": source_position, "items": result["items"]}),
+        source_position,
+    )
+
+
 def _call_regional_model(image_path: Path, question: str, position: str) -> dict:
     response = ollama.chat(
         model=VISION_MODEL,
@@ -767,6 +793,20 @@ def _call_regional_model(image_path: Path, question: str, position: str) -> dict
         options={"temperature": 0, "num_ctx": 8192, "num_predict": 900},
     )
     return parse_regional_response(_response_text(response), position)
+
+
+def _call_recovery_regional_model(image_path: Path, position: str) -> dict:
+    response = ollama.chat(
+        model=VISION_MODEL,
+        messages=[{
+            "role": "user",
+            "content": _recovery_regional_prompt(position),
+            "images": [str(image_path)],
+        }],
+        format="json",
+        options={"temperature": 0, "num_ctx": 8192, "num_predict": 900},
+    )
+    return parse_recovery_regional_response(_response_text(response), position)
 
 
 def _call_verification_model(image_paths: list[Path], labels: list[str]) -> list[dict]:
@@ -1456,11 +1496,7 @@ def _analyse_grouped_figure(
                     debug_info["crops"].append({"name": f"{position}_completeness_retry",
                         "path": str(retry_path), "coordinates": _rect_coordinates(retry_clip)})
                 try:
-                    retry = _call_regional_model(retry_path, question +
-                        "\nCompleteness reinspection: return EVERY visible item label in this region, "
-                        "including labels near the lower and side edges. Read pixels independently. "
-                        "Do not invent labels to meet a count. Keep partially readable labels uncertain "
-                        "using fully_visible=false and low confidence; omit wholly unreadable labels.", position)
+                    retry = _call_recovery_regional_model(retry_path, position)
                     recovered = reconcile_spatial_results(
                         overview, [*regional, retry], [*clips[1:], retry_clip], figure_clip,
                         combined_evidence, source_page, candidate_text,

@@ -68,30 +68,51 @@ class VisionPipelineTests(unittest.TestCase):
             vision, "_target_caption", return_value=(self.figure, caption)
         ), patch.object(vision, "_render_page_image", return_value=Path("missing_test_crop.png")), patch.object(
             vision, "_call_overview_model", return_value=overview()
-        ), patch.object(vision, "_call_regional_model", side_effect=[*regions, regional("bottom", retry_items)]) as call:
+        ), patch.object(vision, "_call_regional_model", side_effect=regions) as call, patch.object(
+            vision, "_call_recovery_regional_model", return_value=regional("bottom", retry_items)
+        ) as recovery_call:
             answer = vision._analyse_grouped_figure(page, "Group the labels", debug)
-        return answer, debug, call.call_count
+        return answer, debug, call.call_count, recovery_call
 
     def test_caption_count_shortfall_retries_and_recovers(self):
-        answer, debug, calls = self._completeness_run("Nine hallmarks in three categories.",
+        answer, debug, calls, recovery = self._completeness_run("Nine hallmarks in three categories.",
             [item("Gamma second", .8)])
-        self.assertEqual(calls, 4)
+        self.assertEqual(calls, 3)
+        recovery.assert_called_once_with(Path("missing_test_crop.png"), "bottom")
         self.assertEqual(debug["completeness"]["observed"]["items"], 9)
         self.assertEqual(debug["final_answer_path"], "validated_structured_vision")
         self.assertIn("Gamma first", answer)
         self.assertIn("Gamma second", answer)
 
     def test_unreadable_missing_item_stays_incomplete(self):
-        answer, debug, calls = self._completeness_run("Nine hallmarks.", [])
-        self.assertEqual(calls, 4)
+        answer, debug, calls, recovery = self._completeness_run("Nine hallmarks.", [])
+        self.assertEqual(calls, 3)
+        recovery.assert_called_once()
         self.assertEqual(debug["completeness"]["observed"]["items"], 8)
         self.assertEqual(debug["final_answer_path"], "incomplete_structured_vision")
         self.assertIn("not a complete grouping", answer)
 
     def test_absent_caption_count_preserves_existing_path(self):
-        _, debug, calls = self._completeness_run("Grouped labels.", [])
+        _, debug, calls, recovery = self._completeness_run("Grouped labels.", [])
         self.assertEqual(calls, 3)
+        recovery.assert_not_called()
         self.assertEqual(debug["final_answer_path"], "validated_structured_vision")
+
+    def test_recovery_prompt_is_neutral_and_source_region_is_pipeline_owned(self):
+        prompt = vision._recovery_regional_prompt("bottom")
+        self.assertNotIn("which hallmarks are classified", prompt.casefold())
+        self.assertIn("transcribe every visible item label", prompt.casefold())
+        parsed = vision.parse_recovery_regional_response(
+            json.dumps({"items": [item("Readable label", .75)]}), "bottom"
+        )
+        self.assertEqual(parsed["region"], "bottom")
+        self.assertEqual(parsed["items"][0]["label"], "Readable label")
+
+    def test_unreadable_recovery_response_does_not_invent_an_item(self):
+        parsed = vision.parse_recovery_regional_response(
+            json.dumps({"items": []}), "bottom"
+        )
+        self.assertEqual(parsed, {"region": "bottom", "items": []})
 
     def test_visible_fragment_requires_document_and_full_visual_confirmation(self):
         regions = [regional("top", []),
