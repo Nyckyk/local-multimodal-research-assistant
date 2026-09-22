@@ -6,6 +6,7 @@ import unicodedata
 from copy import deepcopy
 from html import unescape
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import fitz
 import ollama
@@ -1535,6 +1536,24 @@ def _add_nyquist_scale_comparison(value: dict) -> None:
     value["comparisons"].append(comparison)
 
 
+def normalize_panel_identity(panel: dict) -> None:
+    """Canonicalize explicit panel markers without guessing from arbitrary titles."""
+    raw = str(panel.get("panel", "")).strip()
+    match = re.fullmatch(r"([A-Za-z]|\d+)", raw)
+    if not match:
+        match = re.fullmatch(r"(?:\(([A-Za-z]|\d+)\)|[Pp]anel\s+([A-Za-z]|\d+)\b)\s*[:.\-]?\s*(.*)", raw)
+        if match:
+            identifier = match.group(1) or match.group(2)
+            title = match.group(3).strip()
+            if title:
+                panel.setdefault("panel_title", title)
+                if not panel.get("group"):
+                    panel["group"] = title
+            panel["panel"] = identifier.lower()
+    else:
+        panel["panel"] = match.group(1).lower()
+
+
 def validate_graph(value: dict, evidence_text: str = "") -> dict:
     _require_keys(
         value,
@@ -1557,6 +1576,7 @@ def validate_graph(value: dict, evidence_text: str = "") -> dict:
             },
             "Graph panel",
         )
+        normalize_panel_identity(panel)
         if not panel.get("group"):
             combined_identity = re.fullmatch(
                 r"\s*\(?([A-Za-z0-9]+)\)?\s+(.+?)\s*",
@@ -2316,7 +2336,8 @@ def validate_compact_panel_response(value: dict, expected_panels: list[str]) -> 
             },
             "Compact graph panel",
         )
-        panel_id = re.sub(r"[^a-z0-9]+", "", str(panel["panel"]).lower())
+        normalize_panel_identity(panel)
+        panel_id = str(panel["panel"])
         panel["panel"] = panel_id
         group_match = re.search(r"\bgroup\s*([A-Za-z0-9]+)\b", str(panel["group"]), re.I)
         if group_match:
@@ -2351,6 +2372,15 @@ def _comparison_expectations(panels: list[dict]) -> tuple[list[str], str | None]
     ]
     magnitude.sort(key=lambda panel: panel["approximate_curve_level"], reverse=True)
     order = [str(panel["group"]) for panel in magnitude]
+    verified = [p for p in panels if "magnitude" in str(p["graph_kind"]).lower()
+                and p.get("magnitude_verification")]
+    if verified:
+        order = magnitude_reading_order([p["magnitude_verification"] for p in verified])
+    # A stable sort is not visual evidence for a strict order between ties.
+    if not verified and any(math.isclose(a["approximate_curve_level"], b["approximate_curve_level"],
+                        rel_tol=0.01, abs_tol=1e-6)
+           for a, b in zip(magnitude, magnitude[1:])):
+        order = []
     phase = [
         panel for panel in panels
         if "phase" in str(panel["graph_kind"]).lower()
@@ -2360,6 +2390,144 @@ def _comparison_expectations(panels: list[dict]) -> tuple[list[str], str | None]
         if phase else None
     )
     return order, most_complex
+
+
+def _finite_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def magnitude_reading_order(records: list[dict]) -> list[str]:
+    """Require at least two agreeing comparisons for every pair, with no reversal."""
+    if len(records) < 2 or len({r["source_panel"] for r in records}) != len(records):
+        return []
+    wins = {r["source_panel"]: 0 for r in records}
+    for index, left in enumerate(records):
+        for right in records[index + 1:]:
+            a = {r["x"]: r for r in left["readings"]}
+            b = {r["x"]: r for r in right["readings"]}
+            signs = []
+            for x in a.keys() & b.keys():
+                ra, rb = a[x], b[x]
+                if not all(r["readability"] and r["confidence"] >= .7 for r in (ra, rb)):
+                    continue
+                ya, yb = ra["calibrated_y"], rb["calibrated_y"]
+                tolerance = .01 * max(abs(ya), abs(yb), 1)
+                if abs(ya - yb) > tolerance:
+                    signs.append(1 if ya > yb else -1)
+            if len(signs) < 2 or len(set(signs)) != 1:
+                return []
+            winner = left if signs[0] > 0 else right
+            wins[winner["source_panel"]] += 1
+    if sorted(wins.values()) != list(range(len(records))):
+        return []
+    return [r["source_group"] for r in sorted(records, key=lambda r: wins[r["source_panel"]], reverse=True)]
+
+
+def _source_magnitude_readings(task: dict, payload: dict, shared_x: list[float]) -> dict:
+    rows = payload.get("readings", [])
+    if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+        raise StructuredOutputError("Magnitude readings must be objects.")
+    by_x = {r.get("x"): r for r in rows}
+    if len(by_x) != len(rows) or set(by_x) != set(shared_x):
+        raise StructuredOutputError("Magnitude readings must cover each shared x exactly once.")
+    validated = []
+    for x in shared_x:
+        row = by_x[x]
+        confidence = row.get("confidence")
+        if row.get("readability") is not True or not _finite_number(confidence) or not .7 <= confidence <= 1:
+            raise StructuredOutputError("Magnitude reading is not sufficiently readable.")
+        y, position = row.get("y"), row.get("vertical_position")
+        if not _finite_number(y):
+            if not _finite_number(position) or not 0 <= position <= 1:
+                raise StructuredOutputError("Magnitude requires y or a readable vertical position.")
+            lo, hi = task["y_min"], task["y_max"]
+            y = (10 ** (math.log10(lo) + position * math.log10(hi / lo))
+                 if task["y_scale"] == "log" else lo + position * (hi - lo))
+        if not task["y_min"] <= y <= task["y_max"]:
+            raise StructuredOutputError("Magnitude reading lies outside its own y axis.")
+        validated.append({"x": x, "y": row.get("y"), "vertical_position": position,
+                          "calibrated_y": y, "readability": True, "confidence": confidence})
+    # Ignore all model-provided panel/group identities: this is one known crop.
+    return {"source_panel": task["source_panel"], "source_group": task["source_group"],
+            "readings": validated}
+
+
+def verify_magnitude_levels(image_paths: list[Path], panels: list[dict],
+                            panel_groups: list[list[str]], debug_info=None) -> tuple[list[str], list[str]]:
+    from PIL import Image
+    magnitude = {p["panel"]: p for p in panels if "magnitude" in str(p["graph_kind"]).lower()}
+    raw_attempts, errors, tasks = [], [], []
+    with TemporaryDirectory(prefix="magnitude_reread_") as temporary:
+        folder = Path((debug_info or {}).get("crop_folder") or temporary)
+        for path, source_ids in zip(image_paths, panel_groups):
+            for index, source_id in enumerate(source_ids):
+                if source_id not in magnitude:
+                    continue
+                panel = magnitude[source_id]
+                output = folder / f"magnitude_{source_id}.png"
+                with Image.open(path) as image:
+                    box = (round(image.width * index / len(source_ids)), 0,
+                           round(image.width * (index + 1) / len(source_ids)), image.height)
+                    image.crop(box).save(output)
+                tasks.append({"source_panel": source_id, "source_group": panel["group"],
+                              "crop_path": str(output), "source_image": str(path), "crop_box": box,
+                              "y_scale": panel["y_axis"]["scale"]})
+        if {t["source_panel"] for t in tasks} != set(magnitude) or len(tasks) != len(magnitude):
+            raise StructuredOutputError("Magnitude source crop mapping is incomplete or duplicated.")
+        try:
+            for task in tasks:
+                raw = _call_model(Path(task["crop_path"]),
+                    'Read only the numeric axis bounds of this single plot. Return JSON with '
+                    'x_min, x_max, y_min, y_max, confidence. Include multipliers. '
+                    'Use actual numbers for visible ticks; confidence is your estimated reliability '
+                    'between 0 and 1. Use null if unreadable. Do not identify groups.', 220)
+                raw_attempts.append(raw)
+                axis = parse_json_response(raw)
+                if not all(_finite_number(axis.get(k)) for k in ("x_min", "x_max", "y_min", "y_max", "confidence")) or not .7 <= axis["confidence"] <= 1:
+                    raise StructuredOutputError("Magnitude axis calibration is unreadable.")
+                if not 0 < axis["x_min"] < axis["x_max"] or not axis["y_min"] < axis["y_max"]:
+                    raise StructuredOutputError("Magnitude axis bounds are invalid.")
+                task.update({k: axis[k] for k in ("x_min", "x_max", "y_min", "y_max")})
+            lo, hi = max(t["x_min"] for t in tasks), min(t["x_max"] for t in tasks)
+            # Use the first two fully shared decade ticks, avoiding extrapolation.
+            shared_x = [float(10 ** exponent) for exponent in range(math.ceil(math.log10(lo)),
+                        math.floor(math.log10(hi)) + 1)][:2] if lo < hi else []
+            if len(shared_x) < 2:
+                raise StructuredOutputError("Insufficient shared log-frequency ticks.")
+            for attempt in range(2):
+                records = []
+                try:
+                    for task in tasks:
+                        raw = _call_model(Path(task["crop_path"]),
+                            f'Read this single magnitude plot at x values {json.dumps(shared_x)}. '
+                            'At each x read the centre of the actual visible curves, not the axis limits. '
+                            'Return JSON {"readings": [objects with x, y, vertical_position, readability, confidence]}. '
+                            'Each x must appear exactly once. y is a numeric curve reading or null. '
+                            'If y is hard to read, give vertical_position from 0 (plot bottom) to 1 (plot top). '
+                            'readability is true only for visible curves. confidence is your actual estimated '
+                            'reliability from 0 to 1, not a placeholder. No panel or group identification is needed.'
+                            + (' Reinspect ticks carefully; the previous readings were inconsistent.' if attempt else ''), 400)
+                        raw_attempts.append(raw)
+                        records.append(_source_magnitude_readings(task, parse_json_response(raw), shared_x))
+                    if not magnitude_reading_order(records):
+                        raise StructuredOutputError("Shared-x readings are tied or contradictory.")
+                    for record in records:
+                        panel = magnitude[record["source_panel"]]
+                        panel["magnitude_verification"] = record
+                        panel["approximate_curve_level"] = sum(r["calibrated_y"] for r in record["readings"]) / len(shared_x)
+                    if debug_info is not None:
+                        debug_info["magnitude_reread_tasks"] = tasks
+                        debug_info["magnitude_shared_x"] = shared_x
+                    return raw_attempts, []
+                except (StructuredOutputError, KeyError, TypeError, ValueError) as error:
+                    errors.append(str(error))
+        except (StructuredOutputError, KeyError, TypeError, ValueError) as error:
+            errors.append(str(error))
+        if debug_info is not None:
+            debug_info["magnitude_reread_tasks"] = tasks
+    for panel in magnitude.values():
+        panel["approximate_curve_level"] = None
+    return raw_attempts, ["Magnitude ordering could not be verified from readable common-x curve samples.", *errors]
 
 
 def validate_compact_comparison(value: dict, panels: list[dict]) -> dict:
@@ -2376,6 +2544,8 @@ def validate_compact_comparison(value: dict, panels: list[dict]) -> dict:
     _validate_compact_axis(value["x_axis"], "merged", "x")
     _validate_compact_axis(value["magnitude_y_axis"], "merged", "magnitude-y")
     expected_order, expected_complexity = _comparison_expectations(panels)
+    if not expected_order and len([p for p in panels if "magnitude" in str(p["graph_kind"]).lower()]) > 1 and not value["uncertain"]:
+        raise StructuredOutputError("Indistinguishable magnitude levels require explicit uncertainty.")
     if value["magnitude_order_high_to_low"] != expected_order:
         raise StructuredOutputError(
             "Compact comparison contradicts independently estimated curve levels."
@@ -2579,6 +2749,16 @@ def analyse_compact_multi_panel_graph(
     axis_label_retry_raw = ""
     try:
         comparison_candidate = parse_json_response(comparison_raw)
+        expected_order, _ = _comparison_expectations(panels)
+        if (not expected_order or comparison_candidate.get("magnitude_order_high_to_low") != expected_order
+                or not isinstance(comparison_candidate.get("confidence"), (int, float))
+                or comparison_candidate["confidence"] < 0.7):
+            readings, uncertainty = verify_magnitude_levels(image_paths, panels, panel_groups, debug_info)
+            comparison_candidate["magnitude_order_high_to_low"] = _comparison_expectations(panels)[0]
+            comparison_candidate.setdefault("uncertain", []).extend(uncertainty)
+            if debug_info is not None:
+                debug_info["raw_magnitude_verification"] = readings
+                debug_info["magnitude_verification_errors"] = uncertainty
         magnitude_axis = comparison_candidate.get("magnitude_y_axis")
         original_magnitude_label = (
             magnitude_axis.get("label", "") if isinstance(magnitude_axis, dict) else ""

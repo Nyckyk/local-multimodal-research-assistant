@@ -11,6 +11,71 @@ sys.modules.setdefault("ollama", types.SimpleNamespace(chat=lambda **kwargs: Non
 structured = importlib.import_module("services.structured_vision")
 
 
+def test_explicit_panel_identity_normalization():
+    for raw, expected in [("a", "a"), ("(a)", "a"), ("(a) Sample 10", "a"),
+                          ("Panel a", "a"), ("A", "a"), ("(b)", "b")]:
+        panel = {"panel": raw, "group": "existing group"}
+        structured.normalize_panel_identity(panel)
+        assert panel["panel"] == expected
+        assert panel["group"] == "existing group"
+        if raw == "(a) Sample 10":
+            assert panel["panel_title"] == "Sample 10"
+    for raw in ["Sample 10", "arbitrary text", "Panel alpha"]:
+        panel = {"panel": raw}
+        structured.normalize_panel_identity(panel)
+        assert panel["panel"] == raw
+
+
+def test_magnitude_tie_never_becomes_input_order():
+    panels = [{"panel": "a", "group": "One", "graph_kind": "magnitude", "approximate_curve_level": 115},
+              {"panel": "c", "group": "Two", "graph_kind": "magnitude", "approximate_curve_level": 115}]
+    assert structured._comparison_expectations(panels)[0] == []
+
+
+def magnitude_record(panel, group, values, relative=False, model_identity=None):
+    task = {"source_panel": panel, "source_group": group,
+            "y_min": 0, "y_max": 100, "y_scale": "linear"}
+    payload = {"panel": model_identity, "group": model_identity, "readings": [
+        {"x": x, "y": None if relative else value,
+         "vertical_position": value if relative else None, "readability": True, "confidence": .9}
+        for x, value in zip([100, 1000], values)]}
+    return structured._source_magnitude_readings(task, payload, [100, 1000])
+
+
+def test_magnitude_source_identity_survives_missing_or_duplicate_model_identity():
+    records = [magnitude_record("a", "One", [60, 50]),
+               magnitude_record("c", "Two", [30, 20], model_identity="One"),
+               magnitude_record("e", "Three", [90, 80], model_identity="One")]
+    assert [r["source_panel"] for r in records] == ["a", "c", "e"]
+    assert [r["source_group"] for r in records] == ["One", "Two", "Three"]
+    assert structured.magnitude_reading_order(records) == ["Three", "One", "Two"]
+
+
+def test_shared_relative_readings_rank_only_when_consistent():
+    records = [magnitude_record("x", "First", [.6, .5], True),
+               magnitude_record("y", "Second", [.3, .2], True),
+               magnitude_record("z", "Third", [.9, .8], True)]
+    assert structured.magnitude_reading_order(records) == ["Third", "First", "Second"]
+    tied = [magnitude_record("x", "First", [60, 50]), magnitude_record("y", "Second", [60, 50])]
+    assert structured.magnitude_reading_order(tied) == []
+    conflicting = [magnitude_record("x", "First", [60, 20]), magnitude_record("y", "Second", [30, 50])]
+    assert structured.magnitude_reading_order(conflicting) == []
+
+
+def test_unreadable_magnitude_retry_stays_uncertain(tmp_path):
+    from PIL import Image
+    path = tmp_path / "panel.png"
+    Image.new("RGB", (100, 100)).save(path)
+    panels = [{"panel": "a", "group": "One", "graph_kind": "magnitude", "approximate_curve_level": 115,
+               "y_axis": {"scale": "linear"}}]
+    axis = json.dumps({"x_min": 10, "x_max": 10000, "y_min": 0, "y_max": 140, "confidence": .9})
+    with patch.object(structured, "_call_model", side_effect=[axis, '{"readings": []}', '{"readings": []}']) as call:
+        _, errors = structured.verify_magnitude_levels([path], panels, [["a"]])
+    assert call.call_count == 3
+    assert errors
+    assert panels[0]["approximate_curve_level"] is None
+
+
 def axis(label, unit, scale="linear", ticks=None, multiplier=None):
     return {
         "label": label,
