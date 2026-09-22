@@ -178,35 +178,27 @@ The comparison is based on visual evidence rather than hard-coded scientific val
 
 ## Screenshots
 
-Final interface screenshots can be added to the `assets/` directory using:
-
-```text
-assets/
-├── research-assistant-home.png
-├── text-rag-answer.png
-├── figure-analysis.png
-└── scientific-graph-analysis.png
-```
-
-Once added, they can be displayed here:
-
-<!--
 ### Main Interface
 
-![Research Assistant interface](assets/research-assistant-home.png)
+![Local Research Assistant interface](assets/research-assistant-home.png)
 
 ### Text RAG
+
+The assistant retrieves relevant evidence from indexed research papers and generates a grounded response.
 
 ![Text RAG answer](assets/text-rag-answer.png)
 
 ### Multimodal Figure Analysis
 
-![Scientific figure analysis](assets/figure-analysis.png)
+The system automatically resolves Figure 6, analyses its visual grouping, validates the expected number of elements, and recovers all nine hallmarks.
+
+![Figure 6 multimodal analysis](assets/figure6-analysis.png)
 
 ### Scientific Graph Analysis
 
-![Scientific graph analysis](assets/scientific-graph-analysis.png)
--->
+The multimodal graph pipeline preserves panel identities and compares magnitude curves using shared-frequency visual evidence.
+
+![Figure 9 scientific graph analysis](assets/figure9-graph-analysis.png)
 
 ## Technology Stack
 
